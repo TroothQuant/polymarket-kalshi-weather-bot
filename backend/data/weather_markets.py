@@ -63,22 +63,31 @@ class WeatherMarket:
 
 def _parse_weather_market_title(title: str) -> Optional[dict]:
     """
-    Parse a weather market title to extract city, threshold, metric, date.
+    Parse a weather market title into (city, threshold, metric, direction, date).
 
-    Handles patterns like:
-    - "Will the high temperature in New York exceed 75°F on March 5?"
-    - "NYC high temperature above 80°F on March 10, 2026"
-    - "Chicago daily high over 60°F on March 3"
-    - "Will Miami's low be above 65°F on March 7?"
-    - "Temperature in Denver above 70°F on March 5, 2026"
+    Polymarket daily-temp events host 11 mutually-exclusive bucket conditions
+    per event: nine internal ranges plus one low-edge ("X°F or below") and one
+    high-edge ("X°F or higher"). The threshold-style signal model used by this
+    bot only fits the two edge buckets — internal ranges are rejected here.
+
+    Live question shapes observed 2026-05-15:
+      - Range  (SKIP): "...be between 66-67°F on May 15?"
+      - Low    (KEEP): "...be 55°F or below on May 15?"   → direction="below"
+      - High   (KEEP): "...be 74°F or higher on May 15?"  → direction="above"
+    Variants tolerated defensively: "or lower"/"or less" (low),
+      "or above"/"more than"/"above " (high).
     """
     title_lower = title.lower()
 
-    # Must be temperature-related
+    # 1. Reject internal range buckets — these don't fit a single-threshold model.
+    if re.search(r'\d+\s*-\s*\d+\s*°?\s*f', title_lower) or "between" in title_lower:
+        return None
+
+    # 2. Must be temperature-related.
     if not any(kw in title_lower for kw in ["temperature", "temp", "°f", "degrees", "high", "low"]):
         return None
 
-    # Extract city
+    # 3. Extract city from the question text.
     city_key = None
     city_name = None
     for alias, key in sorted(CITY_ALIASES.items(), key=lambda x: -len(x[0])):
@@ -91,7 +100,24 @@ def _parse_weather_market_title(title: str) -> Optional[dict]:
     if not city_key:
         return None
 
-    # Extract threshold temperature
+    # 4. Classify edge type — direction comes from the bucket phrasing, not
+    #    from substring-matching "low" (which also matches "below").
+    LOW_EDGE = re.compile(r'°?\s*f?\s*or\s+(below|lower|less)\b', re.IGNORECASE)
+    HIGH_EDGE = re.compile(
+        r'(°?\s*f?\s*or\s+(higher|above|more|greater)\b'
+        r'|\babove\s+\d+\s*°?\s*f'
+        r'|\bmore\s+than\s+\d+\s*°?\s*f)',
+        re.IGNORECASE,
+    )
+    if LOW_EDGE.search(title_lower):
+        direction = "below"
+    elif HIGH_EDGE.search(title_lower):
+        direction = "above"
+    else:
+        logger.warning(f"weather parser: unrecognised bucket pattern, skipping: {title!r}")
+        return None
+
+    # 5. Threshold temperature — first integer followed by an optional °F.
     temp_match = re.search(r'(\d+)\s*°?\s*f', title_lower)
     if not temp_match:
         temp_match = re.search(r'(\d+)\s*degrees', title_lower)
@@ -99,17 +125,15 @@ def _parse_weather_market_title(title: str) -> Optional[dict]:
         return None
     threshold_f = float(temp_match.group(1))
 
-    # Determine metric (high vs low)
-    metric = "high"  # default
-    if "low" in title_lower:
+    # 6. Metric: derive from "highest"/"lowest" phrase in title to avoid the
+    #    "below" → contains-"low" substring bug. Daily-high events always
+    #    contain "highest temperature".
+    if "lowest temperature" in title_lower:
         metric = "low"
+    else:
+        metric = "high"
 
-    # Determine direction
-    direction = "above"  # default
-    if any(kw in title_lower for kw in ["below", "under", "less than", "drop below"]):
-        direction = "below"
-
-    # Extract date
+    # 7. Date.
     target_date = _extract_date(title_lower)
     if not target_date:
         return None

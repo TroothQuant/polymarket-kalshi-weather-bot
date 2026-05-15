@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     KELLY_FRACTION: float = 0.15  # Fractional Kelly
 
     # BTC 5-min specific settings
+    BTC_ENABLED: bool = True  # Master switch for the BTC 5-min strategy
     SCAN_INTERVAL_SECONDS: int = 60  # Scan every minute
     SETTLEMENT_INTERVAL_SECONDS: int = 120  # Check settlements every 2 min
     BTC_PRICE_SOURCE: str = "coinbase"
