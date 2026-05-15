@@ -231,14 +231,21 @@ async def weather_scan_and_trade_job():
                 return
 
             trades_executed = 0
+            # Per-day dedup: only one trade per market_ticker per UTC day,
+            # regardless of settled status. Prevents re-buys when the
+            # settlement layer misfires (see settlement.py for the matching fix).
+            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
-                # Check if we already have a trade for this market
                 existing = db.query(Trade).filter(
                     Trade.market_ticker == signal.market.market_id,
-                    Trade.settled == False,
+                    Trade.timestamp >= today_start,
                 ).first()
 
                 if existing:
+                    log_event(
+                        "info",
+                        f"Already traded {signal.market.market_id} today, skipping",
+                    )
                     continue
 
                 trade_size = min(signal.suggested_size, settings.WEATHER_MAX_TRADE_SIZE)

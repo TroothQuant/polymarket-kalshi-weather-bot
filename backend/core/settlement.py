@@ -34,8 +34,21 @@ async def fetch_polymarket_resolution(market_id: str, event_slug: Optional[str] 
                 if events:
                     event = events[0] if isinstance(events, list) else events
                     markets = event.get("markets", [])
-                    if markets:
-                        return _parse_market_resolution(markets[0])
+                    # Find the specific condition matching market_id, not markets[0].
+                    # markets[0] for a NegRisk weather event is always the lowest-temp
+                    # bucket (e.g. "55°F or below"), which resolves to NO early in the
+                    # day and would falsely settle every other bucket's trades.
+                    target = next(
+                        (m for m in markets if str(m.get("id")) == str(market_id)),
+                        None,
+                    )
+                    if target is None:
+                        logger.warning(
+                            f"Market {market_id} not found in event {event_slug} "
+                            f"(event has {len(markets)} conditions); treating as unresolved."
+                        )
+                        return False, None
+                    return _parse_market_resolution(target)
 
             # Fallback: try market ID directly
             url = f"https://gamma-api.polymarket.com/markets/{market_id}"
