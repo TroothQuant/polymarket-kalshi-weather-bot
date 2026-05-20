@@ -75,13 +75,31 @@ async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTrad
     #    cumulative thresholds; use the existing direction + threshold_f
     #    fields exactly as before.
     strike_type = (getattr(market, "strike_type", None) or "").lower() or None
+    # Kalshi resolves on TRUNCATED integer temperatures, so each market's
+    # nominal floor/cap pair is broader than it looks in continuous space.
+    # Confirmed 2026-05-20 via inspect_kalshi_coverage_gap_2026-05-20.py +
+    # rules_primary text:
+    #   between(floor=89, cap=90) -> "89° to 90°" -> integers {89, 90}
+    #     -> continuous [89, 91)  -> probability_high_between(floor, cap+1)
+    #   greater(floor=96)         -> "97° or above" -> integer >= 97
+    #     -> continuous h >= 97   -> probability_high_above(floor+1)
+    #   less(cap=89)              -> "88° or below" -> integer <= 88
+    #     -> continuous h < 89    -> probability_high_below(cap)  (no shift)
+    # Without these shifts the model under-counts every bucket by exactly
+    # one integer of probability mass; coverage sums to ~0.65 instead of
+    # ~1.0 and NO-side edges are systematically inflated.
+    is_kalshi = (getattr(market, "platform", "") == "kalshi")
+    cap_shift = 1.0 if is_kalshi else 0.0   # 'between' cap extension
+    floor_shift = 1.0 if is_kalshi else 0.0  # 'greater' floor extension
     if strike_type and market.metric == "high":
         if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
             model_yes_prob = forecast.probability_high_between(
-                market.floor_strike, market.cap_strike
+                market.floor_strike, market.cap_strike + cap_shift
             )
         elif strike_type == "greater" and market.floor_strike is not None:
-            model_yes_prob = forecast.probability_high_above(market.floor_strike)
+            model_yes_prob = forecast.probability_high_above(
+                market.floor_strike + floor_shift
+            )
         elif strike_type == "less" and market.cap_strike is not None:
             model_yes_prob = forecast.probability_high_below(market.cap_strike)
         else:
@@ -94,10 +112,12 @@ async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTrad
     elif strike_type and market.metric == "low":
         if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
             model_yes_prob = forecast.probability_low_between(
-                market.floor_strike, market.cap_strike
+                market.floor_strike, market.cap_strike + cap_shift
             )
         elif strike_type == "greater" and market.floor_strike is not None:
-            model_yes_prob = forecast.probability_low_above(market.floor_strike)
+            model_yes_prob = forecast.probability_low_above(
+                market.floor_strike + floor_shift
+            )
         elif strike_type == "less" and market.cap_strike is not None:
             model_yes_prob = forecast.probability_low_below(market.cap_strike)
         else:
