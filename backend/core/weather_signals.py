@@ -73,7 +73,11 @@ async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTrad
     # Clip extreme probabilities (ensemble can be unanimous but don't bet 100%)
     model_yes_prob = max(0.05, min(0.95, model_yes_prob))
 
-    market_yes_prob = market.yes_price
+    # Audit 2026-05-19 HIGH #15: use the implied midpoint probability for
+    # edge math (matters on Kalshi where yes_ask + no_ask > 1). Falls back
+    # to yes_price for Polymarket where outcomePrices already IS the implied
+    # probability.
+    market_yes_prob = market.implied_or_yes()
 
     # Use existing edge calculation (treats yes=up, no=down)
     edge, direction_raw = calculate_edge(model_yes_prob, market_yes_prob)
@@ -210,9 +214,12 @@ def _persist_weather_signals(signals: list):
     db = SessionLocal()
     try:
         for signal in to_save:
-            # Dedup: skip if already logged for this market
+            # Audit 2026-05-19 HIGH #13: see signals.py:_persist_signals
+            # for rationale. Same composite-dedup pattern.
             existing = db.query(Signal).filter(
                 Signal.market_ticker == signal.market.market_id,
+                Signal.direction == signal.direction,
+                Signal.market_price == round(signal.market_probability, 2),
                 Signal.timestamp >= signal.timestamp.replace(second=0, microsecond=0),
             ).first()
             if existing:

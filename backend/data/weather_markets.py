@@ -55,10 +55,27 @@ class WeatherMarket:
     threshold_f: float       # Temperature threshold in Fahrenheit
     metric: str              # "high" or "low"
     direction: str           # "above" or "below"
-    yes_price: float         # Price of YES outcome (0-1)
-    no_price: float          # Price of NO outcome (0-1)
+    yes_price: float         # Price the bot would PAY to buy YES (the ask)
+    no_price: float          # Price the bot would PAY to buy NO  (the ask)
     volume: float = 0.0
     closed: bool = False
+    # Audit 2026-05-19 HIGH #15: separate fields for fill-side asks
+    # (yes_price / no_price above) and implied midpoint probability used for
+    # edge math. On Polymarket the two are the same — outcomePrices is the
+    # implied probability. On Kalshi yes_ask + no_ask typically sum > 1, so
+    # using yes_ask alone biases the edge calc; we set implied_yes_prob to
+    # (yes_ask + (1 - no_ask)) / 2 instead. Default = yes_price for backward
+    # compatibility with existing Polymarket call sites.
+    implied_yes_prob: float = -1.0  # sentinel; resolved on access via .implied_or_yes()
+
+    def implied_or_yes(self) -> float:
+        """Return the implied YES probability for edge math.
+
+        Falls back to yes_price when implied_yes_prob wasn't set explicitly,
+        which is the correct Polymarket behavior (outcomePrices already IS
+        the implied probability).
+        """
+        return self.implied_yes_prob if self.implied_yes_prob >= 0 else self.yes_price
 
 
 def _parse_weather_market_title(title: str) -> Optional[dict]:

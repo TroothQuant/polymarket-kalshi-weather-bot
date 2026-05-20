@@ -56,3 +56,11 @@ logs/
 htmlcov/
 .pytest_cache/
 *.pem
+
+# Secrets directory (Kalshi private key, etc.)
+secrets/
+
+# SQLite backup snapshots (operational artifacts, not source)
+*.db.bak_*
+data/backups/*.db.pre_*
+data/backups/*.db.bak_*

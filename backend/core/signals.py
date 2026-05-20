@@ -342,9 +342,18 @@ def _persist_signals(signals: list):
     db = SessionLocal()
     try:
         for signal in to_save:
-            # Dedup: skip if we already logged this signal for this market window
+            # Audit 2026-05-19 HIGH #13: previously dedup-ed on
+            # (ticker, timestamp >= minute_boundary), which suppressed two
+            # legitimate signals firing in the same calendar minute. The
+            # bot then ACTED on both (the for-loop continues even after
+            # the dedup skip) without persisting them, breaking calibration
+            # accuracy. New composite key: (ticker, direction, market_price
+            # quantized to 0.01). Genuine price moves mid-minute insert;
+            # identical re-fires within the minute are still suppressed.
             existing = db.query(Signal).filter(
                 Signal.market_ticker == signal.market.market_id,
+                Signal.direction == signal.direction,
+                Signal.market_price == round(signal.market_probability, 2),
                 Signal.timestamp >= signal.timestamp.replace(second=0, microsecond=0),
             ).first()
             if existing:

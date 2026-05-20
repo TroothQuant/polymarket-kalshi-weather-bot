@@ -1,17 +1,25 @@
 """FastAPI backend for BTC 5-min trading bot dashboard."""
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from typing import List, Optional
 import asyncio
 import json
+import logging
 import os
+
+# Audit 2026-05-19 HIGH #11: every `except Exception` in this module used to
+# silently swallow real errors and return [] or None. The dashboard would
+# show zeros with no clue why. logger.exception() on these surfaces the
+# stack trace to bot.log; the endpoint still returns its safe-default value
+# so the dashboard keeps rendering, but the root cause is now visible.
+logger = logging.getLogger("backend.api.main")
 
 from backend.config import settings
 from backend.models.database import (
     get_db, init_db, SessionLocal,
-    Signal, Trade, BotState, AILog, ScanLog
+    Signal, Trade, BotState, AILog, ScanLog, PnlSnapshot
 )
 from backend.core.signals import scan_for_signals, TradingSignal
 from backend.data.btc_markets import fetch_active_btc_markets, BtcMarket
@@ -25,13 +33,43 @@ app = FastAPI(
     version="3.0.0"
 )
 
+# Audit 2026-05-19 CRITICAL #2: restrict CORS to known local origins.
+# Origins are parsed from settings.API_ALLOWED_ORIGINS (comma-separated).
+_allowed_origins = [
+    o.strip()
+    for o in (settings.API_ALLOWED_ORIGINS or "").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allowed_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+# Audit 2026-05-19 CRITICAL #2: optional bearer-token guard on mutating POSTs.
+# When settings.API_AUTH_TOKEN is set, every endpoint that uses
+# Depends(require_auth_token) requires `Authorization: Bearer <token>`.
+# When the token is unset (paper-only local default), this is a no-op so
+# the dashboard keeps working without configuration changes.
+async def require_auth_token(authorization: Optional[str] = Header(default=None)):
+    token = settings.API_AUTH_TOKEN
+    if not token:
+        # Auth not configured -- act like a no-op. Safe because the host
+        # binding (settings.API_HOST = 127.0.0.1 by default) already blocks
+        # off-host access.
+        return None
+    expected = f"Bearer {token}"
+    if authorization != expected:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing or invalid bearer token. "
+                   "Set Authorization: Bearer <API_AUTH_TOKEN> on this request.",
+        )
+    return None
 
 
 # WebSocket connection manager
@@ -52,7 +90,9 @@ class ConnectionManager:
             try:
                 await connection.send_json(message)
             except Exception:
-                pass
+                # Per-client send failure (closed socket etc) — disconnect
+                # cleanly rather than spamming the log.
+                logger.debug("WS broadcast to one client failed", exc_info=True)
 
 
 ws_manager = ConnectionManager()
@@ -136,6 +176,14 @@ class BotStats(BaseModel):
     total_pnl: float
     is_running: bool
     last_run: Optional[datetime]
+    # Audit 2026-05-19 HIGH #9: previously win_rate was
+    # winning_trades / total_trades, which counted stop_loss trades against
+    # the bot. Now win_rate excludes stop_loss settlements (the trade was
+    # closed before reaching the model's actual prediction outcome), and we
+    # expose stop_loss_count + stop_loss_rate so the operator can see what
+    # fraction of trades hit the safety rail.
+    stop_loss_count: int = 0
+    stop_loss_rate: float = 0.0
 
 
 class CalibrationBucket(BaseModel):
@@ -300,7 +348,16 @@ async def get_stats(db: Session = Depends(get_db)):
     if not state:
         raise HTTPException(status_code=404, detail="Bot state not initialized")
 
-    win_rate = state.winning_trades / state.total_trades if state.total_trades > 0 else 0
+    # Audit 2026-05-19 HIGH #9: compute win_rate over trades that actually
+    # resolved to a market outcome (win/loss), excluding stop_loss settlements
+    # which closed the position before the prediction was tested. Expose
+    # stop_loss_count + stop_loss_rate as their own metric.
+    stop_loss_count = db.query(Trade).filter(Trade.result == "stop_loss").count()
+    resolved_count = db.query(Trade).filter(Trade.result.in_(["win", "loss"])).count()
+    settled_count = stop_loss_count + resolved_count
+
+    win_rate = state.winning_trades / resolved_count if resolved_count > 0 else 0.0
+    stop_loss_rate = stop_loss_count / settled_count if settled_count > 0 else 0.0
 
     return BotStats(
         bankroll=state.bankroll,
@@ -309,7 +366,9 @@ async def get_stats(db: Session = Depends(get_db)):
         win_rate=win_rate,
         total_pnl=state.total_pnl,
         is_running=state.is_running,
-        last_run=state.last_run
+        last_run=state.last_run,
+        stop_loss_count=stop_loss_count,
+        stop_loss_rate=stop_loss_rate,
     )
 
 
@@ -331,6 +390,7 @@ async def get_btc_price():
             last_updated=btc.last_updated
         )
     except Exception:
+        logger.exception("GET /api/btc/price failed")
         return None
 
 
@@ -356,6 +416,7 @@ async def get_btc_windows():
             for m in markets
         ]
     except Exception:
+        logger.exception("GET /api/btc/windows failed")
         return []
 
 
@@ -366,6 +427,7 @@ async def get_signals():
         signals = await scan_for_signals()
         return [_signal_to_response(s) for s in signals]
     except Exception:
+        logger.exception("GET /api/signals failed")
         return []
 
 
@@ -377,6 +439,7 @@ async def get_actionable_signals():
         actionable = [s for s in signals if s.passes_threshold]
         return [_signal_to_response(s) for s in actionable]
     except Exception:
+        logger.exception("GET /api/signals/actionable failed")
         return []
 
 
@@ -453,7 +516,11 @@ async def get_equity_curve(db: Session = Depends(get_db)):
 
 
 @app.post("/api/simulate-trade")
-async def simulate_trade(signal_ticker: str, db: Session = Depends(get_db)):
+async def simulate_trade(
+    signal_ticker: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_auth_token),
+):
     from backend.core.scheduler import log_event
 
     signals = await scan_for_signals()
@@ -489,7 +556,10 @@ async def simulate_trade(signal_ticker: str, db: Session = Depends(get_db)):
 
 
 @app.post("/api/run-scan")
-async def run_scan(db: Session = Depends(get_db)):
+async def run_scan(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_auth_token),
+):
     from backend.core.scheduler import run_manual_scan, log_event
 
     state = db.query(BotState).first()
@@ -519,6 +589,7 @@ async def run_scan(db: Session = Depends(get_db)):
             result["weather_signals"] = len(wx_signals)
             result["weather_actionable"] = len(wx_actionable)
         except Exception:
+            logger.exception("Manual scan: weather sub-scan failed")
             result["weather_signals"] = 0
             result["weather_actionable"] = 0
 
@@ -526,7 +597,10 @@ async def run_scan(db: Session = Depends(get_db)):
 
 
 @app.post("/api/settle-trades")
-async def settle_trades_endpoint(db: Session = Depends(get_db)):
+async def settle_trades_endpoint(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_auth_token),
+):
     from backend.core.settlement import settle_pending_trades, update_bot_state_with_settlements
     from backend.core.scheduler import log_event
 
@@ -647,6 +721,7 @@ async def get_kalshi_status():
             "balance": balance_data,
         }
     except Exception as e:
+        logger.exception("GET /api/kalshi/status: balance probe failed")
         return {
             "connected": False,
             "error": str(e),
@@ -686,6 +761,7 @@ async def get_weather_forecasts():
 
         return forecasts
     except Exception:
+        logger.exception("GET /api/weather/forecasts failed")
         return []
 
 
@@ -710,7 +786,7 @@ async def get_weather_markets():
                     kalshi_markets = await fetch_kalshi_weather_markets(city_keys)
                     markets.extend(kalshi_markets)
             except Exception:
-                pass
+                logger.exception("Kalshi market fetch failed in /api/weather/markets")
 
         return [
             WeatherMarketResponse(
@@ -731,6 +807,7 @@ async def get_weather_markets():
             for m in markets
         ]
     except Exception:
+        logger.exception("GET /api/weather/markets failed")
         return []
 
 
@@ -746,6 +823,7 @@ async def get_weather_signals():
         signals = await scan_for_weather_signals()
         return [_weather_signal_to_response(s) for s in signals]
     except Exception:
+        logger.exception("GET /api/weather/signals failed")
         return []
 
 
@@ -786,9 +864,210 @@ async def get_events(limit: int = 50):
     ]
 
 
+# ── Live-pricing cache for open positions ──────────────────────────────
+# Caches Gamma /markets/<id> lookups for 60s. Keyed by market_ticker.
+# Each entry: (cached_at_ts, yes_price, no_price)
+_PRICE_CACHE: dict = {}
+_PRICE_CACHE_TTL = 60.0  # seconds
+
+
+async def _get_market_prices(market_ticker: str) -> Optional[tuple]:
+    """Return (yes_price, no_price) for a Polymarket market_id, cached 60s.
+
+    Uses Gamma's outcomePrices field. Returns None on fetch error.
+    """
+    import time as _t
+    import httpx as _httpx
+
+    now = _t.time()
+    cached = _PRICE_CACHE.get(market_ticker)
+    if cached and (now - cached[0]) < _PRICE_CACHE_TTL:
+        return (cached[1], cached[2])
+
+    url = f"https://gamma-api.polymarket.com/markets/{market_ticker}"
+    try:
+        async with _httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        outcome_prices_raw = data.get("outcomePrices")
+        if isinstance(outcome_prices_raw, str):
+            # comes back as JSON-encoded string sometimes: '["0.625","0.375"]'
+            import json as _json
+            try:
+                outcome_prices_raw = _json.loads(outcome_prices_raw)
+            except (ValueError, TypeError):
+                return None
+        if not isinstance(outcome_prices_raw, list) or len(outcome_prices_raw) < 2:
+            return None
+        yes_p = float(outcome_prices_raw[0])
+        no_p = float(outcome_prices_raw[1])
+        _PRICE_CACHE[market_ticker] = (now, yes_p, no_p)
+        return (yes_p, no_p)
+    except (_httpx.RequestError, _httpx.HTTPError, ValueError, TypeError):
+        return None
+
+
+def _resolution_overdue_hours(ticker: str, platform: str) -> Optional[float]:
+    """Hours past expected resolution for a weather ticker.
+
+    Returns None if we can't parse the resolution date out of the ticker
+    (e.g. legacy non-conforming ticker). Returns a positive float for
+    markets past the expected end of their resolution day, negative for
+    markets still in the future. Used by the dashboard to surface
+    genuinely stuck pending positions (Polymarket / UMA reporting lag)
+    without false-flagging same-day open positions.
+
+    Added 2026-05-20 to make trades #7 and #9 (4 days stuck behind UMA)
+    visible at a glance.
+    """
+    if not ticker:
+        return None
+    try:
+        # Polymarket weather tickers: numeric market IDs -- can't infer date
+        # from the ticker directly. Caller will fall back to None.
+        if not ticker.startswith("KX"):
+            return None
+        # Kalshi tickers: KXHIGHNY-26MAY20-T96
+        import re
+        m = re.match(r"^[A-Z]+-(\d{2})([A-Z]{3})(\d{2})-", ticker)
+        if not m:
+            return None
+        MONTH = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                 "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+        yy, mon, dd = int(m.group(1)), MONTH.get(m.group(2)), int(m.group(3))
+        if mon is None:
+            return None
+        # Resolution typically reported a few hours after end-of-day UTC.
+        # Anchor 23:59 UTC; consumers can decide what "overdue" means.
+        from datetime import datetime as _dt
+        resolution_anchor = _dt(2000 + yy, mon, dd, 23, 59)
+        delta = _dt.utcnow() - resolution_anchor
+        return delta.total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+@app.get("/api/positions-detail")
+async def get_positions_detail(db: Session = Depends(get_db)):
+    """Pending weather positions with current prices and unrealized P&L."""
+    pending = db.query(Trade).filter(
+        Trade.settled == False,
+        Trade.market_type == "weather",
+    ).order_by(Trade.timestamp.desc()).all()
+
+    out = []
+    for t in pending:
+        # Share-purchase math (Polymarket binary): a `size` of $X buys X/p
+        # shares at $1 face value, costing $X to enter. This matches what the
+        # bot will actually realize at settlement once `calculate_pnl()` was
+        # migrated on 2026-05-19 to mirror real Polymarket payouts (was a
+        # fictional CFD model that under-counted P&L by a factor of 1/entry).
+        shares = (t.size / t.entry_price) if (t.entry_price and t.entry_price > 0) else 0.0
+
+        current_price = None
+        unrealized_pnl = None
+        unrealized_pct = None
+
+        prices = await _get_market_prices(str(t.market_ticker)) if t.market_ticker else None
+        if prices is not None:
+            yes_p, no_p = prices
+            # direction is "yes" or "no" — pick the matching outcome's price
+            direction = (t.direction or "").lower()
+            if direction == "yes":
+                current_price = yes_p
+            elif direction == "no":
+                current_price = no_p
+            if current_price is not None and t.entry_price and t.size:
+                unrealized_pnl = shares * (current_price - t.entry_price)
+                # % return on stake (capital at risk). Matches how a trader thinks
+                # about ROI: +100% = doubled the stake, -100% = lost it all.
+                unrealized_pct = unrealized_pnl / float(t.size)
+
+        # Stuck-position surface (HIGH-priority follow-up 2026-05-20):
+        # compute hours-past-resolution for Kalshi-style tickers so the
+        # dashboard can flag positions waiting on a platform settlement.
+        # severity buckets: "fresh" <0, "stale" 0-24h, "stuck" 24-72h,
+        # "very_stuck" >72h. Polymarket tickers don't carry a parseable
+        # date so they default to None and the UI leaves the badge off.
+        overdue_h = _resolution_overdue_hours(str(t.market_ticker or ""), t.platform)
+        if overdue_h is None:
+            stuck_severity = None
+        elif overdue_h < 0:
+            stuck_severity = "fresh"
+        elif overdue_h < 24:
+            stuck_severity = "stale"
+        elif overdue_h < 72:
+            stuck_severity = "stuck"
+        else:
+            stuck_severity = "very_stuck"
+
+        out.append({
+            "id": t.id,
+            "market_ticker": t.market_ticker,
+            "platform": t.platform,
+            "event_slug": t.event_slug,
+            "direction": t.direction,
+            "size_usd": t.size,
+            "shares": shares,
+            "entry_price": t.entry_price,
+            "current_price": current_price,
+            "unrealized_pnl": unrealized_pnl,
+            "unrealized_pct": unrealized_pct,
+            "edge_at_entry": t.edge_at_entry,
+            "timestamp": t.timestamp.isoformat() if t.timestamp else None,
+            # Operational visibility — populated for tickers we can parse
+            # a resolution date out of (Kalshi today; Polymarket can be
+            # added later if we capture end_date at trade-entry time).
+            "hours_overdue": overdue_h,
+            "stuck_severity": stuck_severity,
+        })
+    return {"positions": out, "cache_ttl_s": _PRICE_CACHE_TTL}
+
+
+@app.get("/api/snapshots")
+async def get_pnl_snapshots(since: str = "24h", db: Session = Depends(get_db)):
+    """Time series of weather-bot P&L snapshots for the dashboard chart.
+
+    `since`: 24h, 7d, all
+    Returns rows with: ts (unix), bankroll, exposure, realized_pnl, pending_count.
+    """
+    s = (since or "24h").lower().strip()
+    if s == "all":
+        cutoff = datetime(1970, 1, 1)
+    elif s.endswith("h"):
+        cutoff = datetime.utcnow() - timedelta(hours=int(s[:-1]))
+    elif s.endswith("d"):
+        cutoff = datetime.utcnow() - timedelta(days=int(s[:-1]))
+    else:
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+
+    rows = db.query(PnlSnapshot).filter(PnlSnapshot.timestamp >= cutoff).order_by(PnlSnapshot.timestamp).all()
+    return {
+        "snapshots": [
+            {
+                "ts": int(r.timestamp.replace(tzinfo=None).timestamp())
+                      if hasattr(r.timestamp, "replace") else 0,
+                "bankroll": r.bankroll,
+                "exposure": r.exposure,
+                "realized_pnl": r.realized_pnl,
+                "pending_count": r.pending_count,
+                "settled_count": r.settled_count,
+                "is_running": bool(r.is_running),
+            }
+            for r in rows
+        ],
+        "since": since,
+    }
+
+
 # Bot control
 @app.post("/api/bot/start")
-async def start_bot(db: Session = Depends(get_db)):
+async def start_bot(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_auth_token),
+):
     from backend.core.scheduler import start_scheduler, log_event, is_scheduler_running
 
     state = db.query(BotState).first()
@@ -804,7 +1083,10 @@ async def start_bot(db: Session = Depends(get_db)):
 
 
 @app.post("/api/bot/stop")
-async def stop_bot(db: Session = Depends(get_db)):
+async def stop_bot(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_auth_token),
+):
     from backend.core.scheduler import log_event
 
     state = db.query(BotState).first()
@@ -817,7 +1099,10 @@ async def stop_bot(db: Session = Depends(get_db)):
 
 
 @app.post("/api/bot/reset")
-async def reset_bot(db: Session = Depends(get_db)):
+async def reset_bot(
+    db: Session = Depends(get_db),
+    _: None = Depends(require_auth_token),
+):
     from backend.core.scheduler import log_event
 
     try:
@@ -878,7 +1163,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
                 last_updated=datetime.utcnow(),
             )
     except Exception:
-        pass
+        logger.exception("Dashboard: BTC microstructure fetch failed")
     if not btc_price_data:
         try:
             btc = await fetch_crypto_price("BTC")
@@ -892,7 +1177,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
                     last_updated=btc.last_updated
                 )
         except Exception:
-            pass
+            logger.exception("Dashboard: BTC fallback price fetch failed")
 
     # Fetch windows
     windows = []
@@ -915,7 +1200,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
             for m in markets
         ]
     except Exception:
-        pass
+        logger.exception("Dashboard: BTC windows fetch failed")
 
     # Signals — return ALL signals, mark which are actionable
     signals = []
@@ -923,7 +1208,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
         raw_signals = await scan_for_signals()
         signals = [_signal_to_response(s, actionable=s.passes_threshold) for s in raw_signals]
     except Exception:
-        pass
+        logger.exception("Dashboard: signals scan failed")
 
     # Recent trades
     trades = db.query(Trade).order_by(Trade.timestamp.desc()).limit(50).all()
@@ -989,7 +1274,7 @@ async def get_dashboard(db: Session = Depends(get_db)):
                         ensemble_agreement=forecast.ensemble_agreement,
                     ))
         except Exception:
-            pass
+            logger.exception("Dashboard: weather signals/forecasts fetch failed")
 
     return DashboardData(
         stats=stats,
@@ -1020,16 +1305,20 @@ async def websocket_events(websocket: WebSocket):
         for event in get_recent_events(20):
             await websocket.send_json(event)
 
-        last_event_count = len(get_recent_events(200))
+        # Audit 2026-05-19 HIGH #10: track by monotonic seq instead of
+        # len-delta. The old approach re-pushed the entire 200-event buffer
+        # every poll once the deque saturated (~50KB per client per 2s).
+        recent = get_recent_events(200)
+        last_seen_seq = recent[-1]["seq"] if recent else 0
         while True:
             await asyncio.sleep(2)
 
             current_events = get_recent_events(200)
-            if len(current_events) > last_event_count:
-                new_events = current_events[last_event_count - len(current_events):]
-                for event in new_events:
-                    await websocket.send_json(event)
-                last_event_count = len(current_events)
+            new_events = [e for e in current_events if e.get("seq", 0) > last_seen_seq]
+            for event in new_events:
+                await websocket.send_json(event)
+            if new_events:
+                last_seen_seq = new_events[-1]["seq"]
 
             await websocket.send_json({
                 "type": "heartbeat",
@@ -1044,4 +1333,9 @@ async def websocket_events(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    # Audit 2026-05-19 CRITICAL #2: bind to settings.API_HOST (default
+    # 127.0.0.1) so the mutating endpoints are not reachable from the LAN.
+    # PORT env var still wins if set for Railway/Heroku-style deploys.
+    bind_host = os.getenv("HOST", settings.API_HOST)
+    bind_port = int(os.getenv("PORT", str(settings.API_PORT)))
+    uvicorn.run(app, host=bind_host, port=bind_port)

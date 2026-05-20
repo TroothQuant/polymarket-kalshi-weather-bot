@@ -1,6 +1,6 @@
 """Background scheduler for BTC 5-min autonomous trading."""
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -8,7 +8,7 @@ from sqlalchemy import func
 import logging
 
 from backend.config import settings
-from backend.models.database import SessionLocal, Trade, BotState, Signal
+from backend.models.database import SessionLocal, Trade, BotState, Signal, PnlSnapshot
 from backend.core.signals import scan_for_signals
 
 logging.basicConfig(level=logging.INFO)
@@ -21,11 +21,26 @@ scheduler: Optional[AsyncIOScheduler] = None
 event_log: List[dict] = []
 MAX_LOG_SIZE = 200
 
+# Audit 2026-05-19 HIGH #10: monotonic sequence number on every event so the
+# WS endpoint can slice on `event["seq"] > last_seen_seq` instead of the
+# old len-delta heuristic, which re-pushed the entire 200-event buffer on
+# every poll once the deque saturated.
+_event_seq = 0
+
 
 def log_event(event_type: str, message: str, data: dict = None):
-    """Log an event for terminal display."""
+    """Log an event for terminal display.
+
+    Timestamps are tz-aware UTC ("...+00:00") so the dashboard's
+    `new Date(...).toLocaleTimeString()` converts correctly to the
+    viewer's local time. Naive `utcnow().isoformat()` was being parsed
+    as LOCAL time by the browser, displaying UTC hours.
+    """
+    global _event_seq
+    _event_seq += 1
     event = {
-        "timestamp": datetime.utcnow().isoformat(),
+        "seq": _event_seq,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "type": event_type,
         "message": message,
         "data": data or {}
@@ -218,7 +233,12 @@ async def weather_scan_and_trade_job():
 
             MAX_TRADES_PER_SCAN = 3
             MIN_TRADE_SIZE = 10
-            MAX_WEATHER_ALLOCATION = 500.0  # Max total exposure to weather markets
+            # Max total exposure to weather markets (configurable via .env or
+            # WEATHER_MAX_ALLOCATION_USD in config.py). Bumped from $500 →
+            # $1500 on 2026-05-19 after Kalshi rollout expanded the universe
+            # from 5 → 65 markets/cycle and the bot started seeing 60+
+            # actionable signals per scan.
+            MAX_WEATHER_ALLOCATION = settings.WEATHER_MAX_ALLOCATION_USD
 
             # Check weather allocation limit
             weather_pending = db.query(func.coalesce(func.sum(Trade.size), 0.0)).filter(
@@ -231,20 +251,24 @@ async def weather_scan_and_trade_job():
                 return
 
             trades_executed = 0
-            # Per-day dedup: only one trade per market_ticker per UTC day,
-            # regardless of settled status. Prevents re-buys when the
-            # settlement layer misfires (see settlement.py for the matching fix).
-            today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            # Per-market dedup (2026-05-19 fix): one trade per market_ticker for
+            # its lifetime, regardless of UTC-day boundaries. Each weather ticker
+            # is unique per (city, resolution date), so a trade for ticker X is by
+            # definition a trade for that single resolution. The old `today_start`
+            # filter let a market be re-entered across day boundaries, producing
+            # the 2265993/2274465/2274497 dupes observed on 2026-05-15..17 and the
+            # 2274497 opposite-direction re-entry. Also blocks re-buy of an already-
+            # settled market on later days (which makes no sense for daily resolution).
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
                 existing = db.query(Trade).filter(
                     Trade.market_ticker == signal.market.market_id,
-                    Trade.timestamp >= today_start,
                 ).first()
 
                 if existing:
                     log_event(
                         "info",
-                        f"Already traded {signal.market.market_id} today, skipping",
+                        f"Already traded {signal.market.market_id} "
+                        f"(trade #{existing.id}, settled={existing.settled}); skipping",
                     )
                     continue
 
@@ -260,9 +284,11 @@ async def weather_scan_and_trade_job():
 
                 entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
 
+                # Use the signal's platform so Kalshi trades save as "kalshi"
+                # (was hardcoded to "polymarket" before the Kalshi rollout 2026-05-19).
                 trade = Trade(
                     market_ticker=signal.market.market_id,
-                    platform="polymarket",
+                    platform=getattr(signal.market, "platform", "polymarket"),
                     event_slug=signal.market.slug,
                     market_type="weather",
                     direction=signal.direction,
@@ -285,6 +311,12 @@ async def weather_scan_and_trade_job():
                 if matching_signal:
                     matching_signal.executed = True
                     trade.signal_id = matching_signal.id
+
+                # Deduct the stake from bankroll at entry (migrated 2026-05-19
+                # to share-purchase cash flow). The full stake `size` is locked
+                # up in shares now; bankroll holds only cash. Settlement adds
+                # back `size + pnl` (= payout).
+                state.bankroll -= trade_size
 
                 state.total_trades += 1
                 trades_executed += 1
@@ -369,23 +401,120 @@ async def settlement_job():
         logger.exception("Error in settlement_job")
 
 
+async def weather_stop_loss_job():
+    """
+    Background job (added 2026-05-19): check open weather positions for
+    mark-to-market loss exceeding settings.WEATHER_STOP_LOSS_FRACTION of the
+    position's max-possible-loss. Closes positions early at the current mark
+    rather than riding to settlement.
+    """
+    if not settings.WEATHER_STOP_LOSS_ENABLED:
+        return
+
+    try:
+        from backend.core.settlement import (
+            close_weather_trades_at_stop_loss,
+            update_bot_state_with_settlements,
+        )
+
+        db = SessionLocal()
+        try:
+            stopped = await close_weather_trades_at_stop_loss(
+                db, fraction=settings.WEATHER_STOP_LOSS_FRACTION
+            )
+            if stopped:
+                await update_bot_state_with_settlements(db, stopped)
+                total_pnl = sum(t.pnl or 0.0 for t in stopped)
+                log_event(
+                    "trade",
+                    f"Stop-loss closed {len(stopped)} weather position(s), realized ${total_pnl:+.2f}",
+                    {"count": len(stopped), "pnl": total_pnl},
+                )
+        finally:
+            db.close()
+    except Exception as e:
+        log_event("error", f"Stop-loss error: {e}")
+        logger.exception("Error in weather_stop_loss_job")
+
+
+_last_snapshot_prune_ts = 0.0
+
+
 async def heartbeat_job():
-    """Periodic heartbeat. Runs every minute."""
+    """Periodic heartbeat. Runs every minute. Also writes a PnL snapshot."""
+    global _last_snapshot_prune_ts
     db = None
     try:
         db = SessionLocal()
         state = db.query(BotState).first()
-        pending = db.query(Trade).filter(Trade.settled == False).count()
+        pending = db.query(Trade).filter(
+            Trade.settled == False,
+            Trade.market_type == "weather",
+        ).count()
 
         if state is None:
             log_event("warning", "Heartbeat: Bot state not initialized")
             return
+
+        # Audit 2026-05-19 HIGH #28: write state.last_run on every heartbeat
+        # so the dashboard's "Last scan" label reflects the bot's actual
+        # liveness. Previously `state.last_run` was only set when a scan
+        # found actionable signals -- the dashboard would show "5h ago" while
+        # the bot was scanning normally every cycle.
+        state.last_run = datetime.utcnow()
+
+        # Audit 2026-05-19 HIGH #12: prune PnlSnapshot rows older than 30
+        # days at most once per hour. Heartbeat writes ~1440 rows/day; left
+        # unbounded the dashboard's `since=24h` queries table-scan more and
+        # more over time. Cheap modulo gate keeps overhead negligible.
+        import time as _time
+        now = _time.time()
+        if now - _last_snapshot_prune_ts > 3600:
+            try:
+                cutoff = datetime.utcnow() - timedelta(days=30)
+                deleted = db.query(PnlSnapshot).filter(
+                    PnlSnapshot.timestamp < cutoff
+                ).delete(synchronize_session=False)
+                db.commit()
+                _last_snapshot_prune_ts = now
+                if deleted:
+                    log_event("info", f"Pruned {deleted} PnlSnapshot rows older than 30d")
+            except Exception:
+                logger.exception("PnlSnapshot retention prune failed")
 
         log_event("data", f"Heartbeat: {pending} pending trades, bankroll: ${state.bankroll:.2f}", {
             "pending_trades": pending,
             "bankroll": state.bankroll,
             "is_running": state.is_running
         })
+
+        # Write a snapshot row for dashboard charting. Cheap; swallow errors.
+        try:
+            from sqlalchemy import func as _f
+            exposure = db.query(_f.coalesce(_f.sum(Trade.size), 0.0)).filter(
+                Trade.settled == False,
+                Trade.market_type == "weather",
+            ).scalar() or 0.0
+            realized = db.query(_f.coalesce(_f.sum(Trade.pnl), 0.0)).filter(
+                Trade.settled == True,
+                Trade.market_type == "weather",
+            ).scalar() or 0.0
+            settled = db.query(Trade).filter(
+                Trade.settled == True,
+                Trade.market_type == "weather",
+            ).count()
+
+            db.add(PnlSnapshot(
+                bankroll=float(state.bankroll),
+                exposure=float(exposure),
+                realized_pnl=float(realized),
+                pending_count=int(pending),
+                settled_count=int(settled),
+                is_running=bool(state.is_running),
+            ))
+            db.commit()
+        except Exception as snap_err:
+            log_event("warning", f"PnL snapshot insert failed: {snap_err}")
     except Exception as e:
         log_event("warning", f"Heartbeat failed: {str(e)}")
     finally:
@@ -446,6 +575,17 @@ def start_scheduler():
             replace_existing=True,
             max_instances=1,
         )
+
+        # Stop-loss check (added 2026-05-19): mark-to-market open weather
+        # positions and close any down ≥ WEATHER_STOP_LOSS_FRACTION of max loss.
+        if settings.WEATHER_STOP_LOSS_ENABLED:
+            scheduler.add_job(
+                weather_stop_loss_job,
+                IntervalTrigger(seconds=settings.WEATHER_STOP_LOSS_INTERVAL_SECONDS),
+                id="weather_stop_loss",
+                replace_existing=True,
+                max_instances=1,
+            )
 
     scheduler.start()
     log_event("success", "Trading scheduler started", {

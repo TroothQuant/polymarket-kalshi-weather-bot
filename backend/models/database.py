@@ -146,6 +146,20 @@ class ScanLog(Base):
     error = Column(String, nullable=True)
 
 
+class PnlSnapshot(Base):
+    """Periodic P&L snapshot, written each heartbeat for dashboard charting."""
+    __tablename__ = "pnl_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    bankroll = Column(Float, nullable=False)
+    exposure = Column(Float, nullable=False)        # sum of size across open weather positions
+    realized_pnl = Column(Float, nullable=False)    # cumulative settled P&L
+    pending_count = Column(Integer, nullable=False)  # open weather positions
+    settled_count = Column(Integer, nullable=False)  # closed weather positions
+    is_running = Column(Boolean, default=True)
+
+
 def init_db():
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
