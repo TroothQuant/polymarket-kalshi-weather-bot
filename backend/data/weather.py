@@ -89,6 +89,18 @@ class EnsembleForecast:
         """Fraction of ensemble members with daily high below threshold."""
         return 1.0 - self.probability_high_above(threshold_f)
 
+    def probability_high_between(self, floor_f: float, cap_f: float) -> float:
+        """Fraction of ensemble members with daily high in [floor, cap).
+
+        Added 2026-05-20 for Kalshi narrow-bucket markets, which are
+        "high is in this 1-2°F range" rather than cumulative thresholds.
+        Half-open interval matches Kalshi's bucket convention.
+        """
+        if not self.member_highs:
+            return 0.5
+        count = sum(1 for h in self.member_highs if floor_f <= h < cap_f)
+        return count / len(self.member_highs)
+
     def probability_low_above(self, threshold_f: float) -> float:
         """Fraction of ensemble members with daily low above threshold."""
         if not self.member_lows:
@@ -99,6 +111,13 @@ class EnsembleForecast:
     def probability_low_below(self, threshold_f: float) -> float:
         """Fraction of ensemble members with daily low below threshold."""
         return 1.0 - self.probability_low_above(threshold_f)
+
+    def probability_low_between(self, floor_f: float, cap_f: float) -> float:
+        """Fraction of ensemble members with daily low in [floor, cap)."""
+        if not self.member_lows:
+            return 0.5
+        count = sum(1 for l in self.member_lows if floor_f <= l < cap_f)
+        return count / len(self.member_lows)
 
     @property
     def ensemble_agreement(self) -> float:

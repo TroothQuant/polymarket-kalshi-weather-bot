@@ -52,13 +52,27 @@ class WeatherMarket:
     city_key: str
     city_name: str
     target_date: date
-    threshold_f: float       # Temperature threshold in Fahrenheit
+    threshold_f: float       # Temperature threshold in Fahrenheit (legacy field, kept for Polymarket)
     metric: str              # "high" or "low"
-    direction: str           # "above" or "below"
+    direction: str           # "above" or "below" (legacy field, kept for Polymarket)
     yes_price: float         # Price the bot would PAY to buy YES (the ask)
     no_price: float          # Price the bot would PAY to buy NO  (the ask)
     volume: float = 0.0
     closed: bool = False
+    # Kalshi bucket-semantics fields (2026-05-20 — diagnostic in
+    # scripts/inspect_kalshi_bucket_semantics_2026-05-20.py confirmed
+    # Kalshi's KXHIGH series uses narrow point-buckets, not cumulative
+    # "above X" markets — e.g. KXHIGHNY-26MAY20-B89.5 asks "will NYC high
+    # land in 89-90°F", not "will it exceed 89.5°F"). Populating these
+    # fields tells weather_signals.py to use the right probability calc:
+    #   strike_type='between' -> probability_high_between(floor, cap)
+    #   strike_type='greater' -> probability_high_above(floor)
+    #   strike_type='less'    -> probability_high_below(cap)
+    # When strike_type is None the legacy `direction`+`threshold_f` path
+    # is used (Polymarket markets behave that way).
+    strike_type: Optional[str] = None       # "greater" | "less" | "between" | None
+    floor_strike: Optional[float] = None    # lower bound (greater + between)
+    cap_strike: Optional[float] = None      # upper bound (less + between)
     # Audit 2026-05-19 HIGH #15: separate fields for fill-side asks
     # (yes_price / no_price above) and implied midpoint probability used for
     # edge math. On Polymarket the two are the same — outcomePrices is the

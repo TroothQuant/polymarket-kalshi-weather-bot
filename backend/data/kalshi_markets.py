@@ -210,6 +210,22 @@ async def fetch_kalshi_weather_markets(
                         m.get("volume_fp") or m.get("volume_24h_fp") or m.get("volume")
                     )
 
+                    # Bucket-semantics fields (2026-05-20). Kalshi tells us
+                    # explicitly via strike_type whether the market is a
+                    # narrow bucket or a cumulative tail. Diagnostic at
+                    # scripts/inspect_kalshi_bucket_semantics_2026-05-20.py
+                    # confirmed B-prefix tickers are 'between' buckets and
+                    # T-prefix tickers are 'greater' or 'less' tails.
+                    strike_type = (m.get("strike_type") or "").lower() or None
+                    floor_strike = _parse_dollars(m.get("floor_strike"))
+                    cap_strike = _parse_dollars(m.get("cap_strike"))
+                    # _parse_dollars returns 0.0 on missing — coerce to None
+                    # so weather_signals.py can detect "not provided".
+                    if not floor_strike:
+                        floor_strike = None
+                    if not cap_strike:
+                        cap_strike = None
+
                     markets.append(WeatherMarket(
                         slug=ticker,
                         market_id=ticker,
@@ -225,6 +241,9 @@ async def fetch_kalshi_weather_markets(
                         no_price=no_price,
                         volume=volume,
                         implied_yes_prob=implied_yes_prob,
+                        strike_type=strike_type,
+                        floor_strike=floor_strike,
+                        cap_strike=cap_strike,
                     ))
 
                 # Handle pagination

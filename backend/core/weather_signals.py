@@ -58,17 +58,65 @@ async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTrad
     if not forecast or not forecast.member_highs:
         return None
 
-    # Calculate model probability based on market's question
-    if market.metric == "high":
-        if market.direction == "above":
-            model_yes_prob = forecast.probability_high_above(market.threshold_f)
+    # Calculate model probability based on market's actual question.
+    #
+    # Two semantics in play:
+    #
+    # 1. Kalshi bucket-aware path (2026-05-20). When the market loader
+    #    populated strike_type/floor_strike/cap_strike, the market is asking
+    #    one of three questions:
+    #      "between"  -> P(high in [floor, cap))           narrow bucket
+    #      "greater"  -> P(high > floor)                   upper tail
+    #      "less"     -> P(high < cap)                     lower tail
+    #    Mixing these up was the bug: the bot was computing P(high > X) on
+    #    narrow-bucket markets and reporting fictional 88-94% edges.
+    #
+    # 2. Polymarket / legacy path (no strike_type). Markets are
+    #    cumulative thresholds; use the existing direction + threshold_f
+    #    fields exactly as before.
+    strike_type = (getattr(market, "strike_type", None) or "").lower() or None
+    if strike_type and market.metric == "high":
+        if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
+            model_yes_prob = forecast.probability_high_between(
+                market.floor_strike, market.cap_strike
+            )
+        elif strike_type == "greater" and market.floor_strike is not None:
+            model_yes_prob = forecast.probability_high_above(market.floor_strike)
+        elif strike_type == "less" and market.cap_strike is not None:
+            model_yes_prob = forecast.probability_high_below(market.cap_strike)
         else:
-            model_yes_prob = forecast.probability_high_below(market.threshold_f)
-    else:  # "low"
-        if market.direction == "above":
-            model_yes_prob = forecast.probability_low_above(market.threshold_f)
+            # Unknown strike_type or missing bounds — fall back to the
+            # legacy direction-based path rather than fabricate a number.
+            if market.direction == "above":
+                model_yes_prob = forecast.probability_high_above(market.threshold_f)
+            else:
+                model_yes_prob = forecast.probability_high_below(market.threshold_f)
+    elif strike_type and market.metric == "low":
+        if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
+            model_yes_prob = forecast.probability_low_between(
+                market.floor_strike, market.cap_strike
+            )
+        elif strike_type == "greater" and market.floor_strike is not None:
+            model_yes_prob = forecast.probability_low_above(market.floor_strike)
+        elif strike_type == "less" and market.cap_strike is not None:
+            model_yes_prob = forecast.probability_low_below(market.cap_strike)
         else:
-            model_yes_prob = forecast.probability_low_below(market.threshold_f)
+            if market.direction == "above":
+                model_yes_prob = forecast.probability_low_above(market.threshold_f)
+            else:
+                model_yes_prob = forecast.probability_low_below(market.threshold_f)
+    else:
+        # Legacy / Polymarket path: cumulative threshold by direction.
+        if market.metric == "high":
+            if market.direction == "above":
+                model_yes_prob = forecast.probability_high_above(market.threshold_f)
+            else:
+                model_yes_prob = forecast.probability_high_below(market.threshold_f)
+        else:  # "low"
+            if market.direction == "above":
+                model_yes_prob = forecast.probability_low_above(market.threshold_f)
+            else:
+                model_yes_prob = forecast.probability_low_below(market.threshold_f)
 
     # Clip extreme probabilities (ensemble can be unanimous but don't bet 100%)
     model_yes_prob = max(0.05, min(0.95, model_yes_prob))
