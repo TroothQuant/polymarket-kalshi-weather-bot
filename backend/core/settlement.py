@@ -370,13 +370,69 @@ async def settle_pending_trades(db: Session) -> List[Trade]:
     return settled_trades
 
 
+async def _fetch_kalshi_mark(market_ticker: str) -> Optional[Tuple[float, float]]:
+    """Return (yes_price, no_price) for an open Kalshi market or None.
+
+    Mirrors the entry-time parser in kalshi_markets.py (HIGH-priority
+    parity fix 2026-05-20): reads yes_ask_dollars / no_ask_dollars with
+    bid + last_price fallbacks, returns None if the market is finalized
+    or has no usable quote. Until this function existed the stop-loss
+    job had no live mark for Kalshi positions and silently skipped them.
+    """
+    try:
+        from backend.data.kalshi_client import KalshiClient, kalshi_credentials_present
+    except Exception:
+        return None
+    if not kalshi_credentials_present():
+        return None
+    try:
+        client = KalshiClient()
+        data = await client.get_market(market_ticker)
+        market = data.get("market", data) or {}
+    except Exception as e:
+        logger.debug(f"Kalshi mark fetch failed for {market_ticker}: {e}")
+        return None
+
+    # Don't return a mark for finalized markets — they belong to the
+    # settlement path, not the stop-loss path.
+    status = (market.get("status") or "").lower()
+    if status in ("finalized", "determined", "settled"):
+        return None
+
+    def _pd(v):
+        if v in (None, ""):
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    yes_p = _pd(market.get("yes_ask_dollars"))
+    no_p = _pd(market.get("no_ask_dollars"))
+    if yes_p is None or yes_p <= 0:
+        yes_p = _pd(market.get("last_price_dollars")) or _pd(market.get("yes_bid_dollars"))
+    if no_p is None or no_p <= 0:
+        no_bid = _pd(market.get("no_bid_dollars"))
+        if no_bid:
+            no_p = no_bid
+    if yes_p is None or no_p is None or yes_p <= 0 or no_p <= 0:
+        return None
+    return (yes_p, no_p)
+
+
 async def fetch_current_weather_mark(market_ticker: str, event_slug: Optional[str] = None) -> Optional[Tuple[float, float]]:
     """
     Fetch the current YES and NO prices for a still-open weather market.
     Returns (yes_price, no_price) or None if unavailable / market closed.
 
     Used by the stop-loss job to mark-to-market open weather positions.
+    Dispatches by ticker shape: KX-prefixed tickers go to Kalshi, anything
+    else uses the Polymarket Gamma path.
     """
+    # Kalshi parity fix (2026-05-20): route KX tickers to their own mark
+    # fetcher so the stop-loss job protects Kalshi positions too.
+    if isinstance(market_ticker, str) and market_ticker.startswith("KX"):
+        return await _fetch_kalshi_mark(market_ticker)
 
     def _extract(target: dict) -> Optional[Tuple[float, float]]:
         if target.get("closed", False):

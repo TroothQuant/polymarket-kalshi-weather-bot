@@ -17,7 +17,15 @@ class Settings(BaseSettings):
     # Kalshi API
     KALSHI_API_KEY_ID: Optional[str] = None
     KALSHI_PRIVATE_KEY_PATH: Optional[str] = None
+    # KALSHI_ENABLED gates scanning + market discovery (we want to see
+    # Kalshi signals even if we're not trading them yet).
     KALSHI_ENABLED: bool = True
+    # KALSHI_TRADING_ENABLED gates *trade execution* on Kalshi. Default
+    # False as of 2026-05-20 because the Kalshi platform integration is
+    # not yet at full parity with Polymarket — bucket semantics need
+    # re-verification before we let the bot place more entries. Scans
+    # and signal logging continue regardless.
+    KALSHI_TRADING_ENABLED: bool = False
 
     # AI API Keys
     GROQ_API_KEY: Optional[str] = None

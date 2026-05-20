@@ -260,6 +260,23 @@ async def weather_scan_and_trade_job():
             # 2274497 opposite-direction re-entry. Also blocks re-buy of an already-
             # settled market on later days (which makes no sense for daily resolution).
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
+                # Kalshi trade kill-switch (2026-05-20): the Kalshi platform
+                # integration is currently incomplete — bucket semantics
+                # need re-verification and the live-mark / stop-loss path
+                # was missing until today's parity patches. Until we've
+                # explicitly cleared Kalshi for trade execution, signals
+                # still SCAN and LOG but trades are gated behind
+                # KALSHI_TRADING_ENABLED. Polymarket trading is unaffected.
+                platform = getattr(signal.market, "platform", "polymarket")
+                if platform == "kalshi" and not getattr(settings, "KALSHI_TRADING_ENABLED", False):
+                    log_event(
+                        "info",
+                        f"Kalshi trading disabled — skipping {signal.market.market_id} "
+                        f"(edge {signal.edge:.0%}); set KALSHI_TRADING_ENABLED=true "
+                        f"in .env to re-enable after parity verification."
+                    )
+                    continue
+
                 existing = db.query(Trade).filter(
                     Trade.market_ticker == signal.market.market_id,
                 ).first()

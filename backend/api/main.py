@@ -872,9 +872,18 @@ _PRICE_CACHE_TTL = 60.0  # seconds
 
 
 async def _get_market_prices(market_ticker: str) -> Optional[tuple]:
-    """Return (yes_price, no_price) for a Polymarket market_id, cached 60s.
+    """Return (yes_price, no_price) for an open position, cached 60s.
 
-    Uses Gamma's outcomePrices field. Returns None on fetch error.
+    Dispatches by ticker shape:
+      - KX-prefixed -> Kalshi /markets/{ticker} (reads *_dollars decimal
+        strings; HIGH-priority parity fix 2026-05-20 — until today this
+        function only knew Polymarket, so every Kalshi position showed
+        blank current_price / unrealized on the dashboard and the
+        stop-loss job had no live mark to compare against).
+      - otherwise   -> Polymarket Gamma /markets/<id> (numeric market_id),
+        reads outcomePrices.
+
+    Returns None on fetch error or unknown ticker shape.
     """
     import time as _t
     import httpx as _httpx
@@ -884,6 +893,47 @@ async def _get_market_prices(market_ticker: str) -> Optional[tuple]:
     if cached and (now - cached[0]) < _PRICE_CACHE_TTL:
         return (cached[1], cached[2])
 
+    # Kalshi branch
+    if isinstance(market_ticker, str) and market_ticker.startswith("KX"):
+        try:
+            from backend.data.kalshi_client import KalshiClient, kalshi_credentials_present
+        except Exception:
+            return None
+        if not kalshi_credentials_present():
+            return None
+        try:
+            client = KalshiClient()
+            data = await client.get_market(market_ticker)
+            market = data.get("market", data) or {}
+        except Exception:
+            logger.debug(f"Kalshi mark fetch failed for {market_ticker}", exc_info=True)
+            return None
+
+        def _pd(v):
+            if v in (None, ""):
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        # Ask side first (what we'd pay to enter today), with bid + last_price
+        # fallbacks. Matches the entry-time parser in kalshi_markets.py so
+        # mark and entry use the same notion of "fair current price".
+        yes_p = _pd(market.get("yes_ask_dollars"))
+        no_p = _pd(market.get("no_ask_dollars"))
+        if yes_p is None or yes_p <= 0:
+            yes_p = _pd(market.get("last_price_dollars")) or _pd(market.get("yes_bid_dollars"))
+        if no_p is None or no_p <= 0:
+            no_bid = _pd(market.get("no_bid_dollars"))
+            if no_bid:
+                no_p = no_bid
+        if yes_p is None or no_p is None or yes_p <= 0 or no_p <= 0:
+            return None
+        _PRICE_CACHE[market_ticker] = (now, yes_p, no_p)
+        return (yes_p, no_p)
+
+    # Polymarket branch (original behavior)
     url = f"https://gamma-api.polymarket.com/markets/{market_ticker}"
     try:
         async with _httpx.AsyncClient(timeout=5.0) as client:
