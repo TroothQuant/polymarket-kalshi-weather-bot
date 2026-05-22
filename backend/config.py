@@ -21,10 +21,28 @@ class Settings(BaseSettings):
     # Kalshi signals even if we're not trading them yet).
     KALSHI_ENABLED: bool = True
     # KALSHI_TRADING_ENABLED gates *trade execution* on Kalshi. Default
-    # False as of 2026-05-20 because the Kalshi platform integration is
-    # not yet at full parity with Polymarket — bucket semantics need
-    # re-verification before we let the bot place more entries. Scans
-    # and signal logging continue regardless.
+    # False. The original kill-switch went in 2026-05-20 for bucket-semantics
+    # (since fixed in 073216e) and truncation rounding (fixed in 419734a).
+    #
+    # Reconfirmed False 2026-05-22 after running
+    # scripts/kalshi_eod_calibration_2026-05-20.py against the May 20 + 21
+    # resolutions: model picked the winning bucket 0/10 cities across both
+    # days. Three failure modes:
+    #   1. Wrong tail direction — model placed 95% confidence on the opposite
+    #      half of the distribution from where the actual high landed.
+    #   2. Right region, wrong bucket — winning bucket appears in the model's
+    #      top-3 but isn't the singular peak; bot bets NO against the peak,
+    #      which is also the winner.
+    #   3. Right bucket, clipped floor — winning bucket sits at the 0.05
+    #      probability clip (line ~152 in weather_signals.py) while the
+    #      model bets heavily against it.
+    #
+    # Gating fixes (from yesterday's Trade #1 deep dive, now data-supported):
+    # ensemble std calibration factor, max-edge-under-uncertainty cap,
+    # historical backtest harness. Re-run kalshi_eod_calibration after each
+    # ships; flip this to True only when the model picks the winning bucket
+    # across ≥ 7 of the 10-day rolling window. Scans and signal logging
+    # continue regardless.
     KALSHI_TRADING_ENABLED: bool = False
 
     # AI API Keys
@@ -79,6 +97,21 @@ class Settings(BaseSettings):
     WEATHER_SETTLEMENT_INTERVAL_SECONDS: int = 1800  # 30 min
     WEATHER_MIN_EDGE_THRESHOLD: float = 0.08  # 8% — weather has more signal than 5-min BTC
     WEATHER_MAX_ENTRY_PRICE: float = 0.70
+    # WEATHER_MIN_ENTRY_PRICE (added 2026-05-22): refuse to enter on either
+    # side when the asked-side price is below this floor. Lifetime DB scan
+    # at the time of introduction (n=25 settled weather trades):
+    #   entry < 0.10: n=12, wins=0, losses=1, stops=10, void=1, P&L=-$554.09
+    #   0.10-0.25:    n=2,  wins=0, losses=1, stops=1,  void=0, P&L=-$144.28
+    #   0.25-0.50:    n=1,  wins=1, losses=0, stops=0,  void=0, P&L=+$86.29
+    #   0.50-0.75:    n=10, wins=7, losses=0, stops=3,  void=0, P&L=+$311.40
+    # Long-tail entries (< $0.10) have NEVER won — the GFS ensemble's
+    # 95% probability concentration on long-tail buckets is calibration-
+    # broken (see KALSHI_TRADING_ENABLED comment above). This filter applies
+    # to BOTH platforms because the same model feeds both; 3 of the 14
+    # lifetime stop-loss trades are Polymarket long-tails (#2, #6, #12),
+    # not just Kalshi. The cap is per-direction: a $0.05 NO buy and a
+    # $0.05 YES buy are equally suspect.
+    WEATHER_MIN_ENTRY_PRICE: float = 0.10
     WEATHER_MAX_TRADE_SIZE: float = 100.0
     WEATHER_MAX_ALLOCATION_USD: float = 1500.0  # Max combined open weather exposure (was hardcoded $500 in scheduler; bumped 2026-05-19 after Kalshi expanded the universe 13x)
     WEATHER_CITIES: str = "nyc,chicago,miami,los_angeles,denver"

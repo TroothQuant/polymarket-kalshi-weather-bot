@@ -161,10 +161,19 @@ async def generate_weather_signal(
     edge, direction_raw = calculate_edge(model_yes_prob, market_yes_prob)
     direction = "yes" if direction_raw == "up" else "no"
 
-    # Entry price filter
+    # Entry price filter — applied symmetrically:
+    #   too high (> WEATHER_MAX_ENTRY_PRICE): paying too much for asymmetric upside.
+    #   too low  (< WEATHER_MIN_ENTRY_PRICE): long-tail bucket where the GFS
+    #     ensemble's confident calls have been catastrophically wrong
+    #     (lifetime: entry<$0.10 trades 0-W / 10-stop / 1-loss / 1-void,
+    #     -$554 P&L). Added 2026-05-22 — see config.py.
+    # Edge is zeroed (not the signal dropped) so the row still persists for
+    # post-hoc calibration analysis.
     entry_price = market.yes_price if direction == "yes" else market.no_price
     if entry_price > settings.WEATHER_MAX_ENTRY_PRICE:
-        edge = 0.0  # Zero out but still return for UI visibility
+        edge = 0.0
+    elif entry_price < settings.WEATHER_MIN_ENTRY_PRICE:
+        edge = 0.0
 
     # Confidence = ensemble agreement (how one-sided the members are)
     if market.metric == "high":
@@ -204,6 +213,8 @@ async def generate_weather_signal(
     filter_notes = []
     if entry_price > settings.WEATHER_MAX_ENTRY_PRICE:
         filter_notes.append(f"entry {entry_price:.0%} > {settings.WEATHER_MAX_ENTRY_PRICE:.0%}")
+    if entry_price < settings.WEATHER_MIN_ENTRY_PRICE:
+        filter_notes.append(f"entry {entry_price:.0%} < {settings.WEATHER_MIN_ENTRY_PRICE:.0%} (long-tail)")
     filter_note = f" [{', '.join(filter_notes)}]" if filter_notes else ""
 
     reasoning = (
