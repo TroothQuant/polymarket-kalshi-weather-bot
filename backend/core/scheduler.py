@@ -251,6 +251,34 @@ async def weather_scan_and_trade_job():
                 return
 
             trades_executed = 0
+            # Kalshi kill-switch budget-starvation fix (2026-05-21): when
+            # KALSHI_TRADING_ENABLED=False, filter Kalshi signals OUT of the
+            # actionable list BEFORE applying MAX_TRADES_PER_SCAN. Otherwise
+            # the top-of-list Kalshi signals (which dominate by edge due to
+            # long-tail entry inflation — edges of 0.85-0.93 vs Polymarket's
+            # typical 0.30-0.65) burn through all 3 slots via `continue` and
+            # the bot never falls through to actually-executable Polymarket
+            # signals lower in the sort. Bug observed 2026-05-19→2026-05-21:
+            # bot generated 60+ actionable signals/cycle for 48 hours but
+            # opened zero new Polymarket positions (last new trade: #14 on
+            # 2026-05-19 17:55) while Chicago 2309247 at +65.5% edge sat
+            # un-traded.
+            kalshi_trading_enabled = getattr(settings, "KALSHI_TRADING_ENABLED", False)
+            if not kalshi_trading_enabled:
+                pre_filter_count = len(actionable)
+                actionable = [
+                    s for s in actionable
+                    if getattr(s.market, "platform", "polymarket") != "kalshi"
+                ]
+                skipped = pre_filter_count - len(actionable)
+                if skipped > 0:
+                    log_event(
+                        "info",
+                        f"Kalshi trading disabled — filtered {skipped} Kalshi "
+                        f"signal(s) from actionable list; {len(actionable)} "
+                        f"Polymarket signals remain for trade consideration."
+                    )
+
             # Per-market dedup (2026-05-19 fix): one trade per market_ticker for
             # its lifetime, regardless of UTC-day boundaries. Each weather ticker
             # is unique per (city, resolution date), so a trade for ticker X is by
@@ -260,15 +288,12 @@ async def weather_scan_and_trade_job():
             # 2274497 opposite-direction re-entry. Also blocks re-buy of an already-
             # settled market on later days (which makes no sense for daily resolution).
             for signal in actionable[:MAX_TRADES_PER_SCAN]:
-                # Kalshi trade kill-switch (2026-05-20): the Kalshi platform
-                # integration is currently incomplete — bucket semantics
-                # need re-verification and the live-mark / stop-loss path
-                # was missing until today's parity patches. Until we've
-                # explicitly cleared Kalshi for trade execution, signals
-                # still SCAN and LOG but trades are gated behind
-                # KALSHI_TRADING_ENABLED. Polymarket trading is unaffected.
+                # Kalshi trade kill-switch (2026-05-20): defense-in-depth check.
+                # The pre-loop filter above should have removed all Kalshi
+                # signals when KALSHI_TRADING_ENABLED=False, but we leave this
+                # guard in case the filter path is ever bypassed.
                 platform = getattr(signal.market, "platform", "polymarket")
-                if platform == "kalshi" and not getattr(settings, "KALSHI_TRADING_ENABLED", False):
+                if platform == "kalshi" and not kalshi_trading_enabled:
                     log_event(
                         "info",
                         f"Kalshi trading disabled — skipping {signal.market.market_id} "
