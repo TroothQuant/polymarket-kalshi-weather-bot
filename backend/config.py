@@ -112,6 +112,27 @@ class Settings(BaseSettings):
     # not just Kalshi. The cap is per-direction: a $0.05 NO buy and a
     # $0.05 YES buy are equally suspect.
     WEATHER_MIN_ENTRY_PRICE: float = 0.10
+    # WEATHER_MAX_CLIPPED_EDGE (added 2026-05-22): edge magnitude cap that
+    # applies ONLY when the model probability has been clipped to the 0.05
+    # floor or 0.95 ceiling in weather_signals.py (~line 152). When the
+    # raw ensemble probability rounds to those bounds, the model has run
+    # out of representational range — the 'true' probability could be
+    # 0.001 or 0.04 (both clip to 0.05), and we don't know which. The raw
+    # edge calc (|model_p - market_p|) attributes high confidence to that
+    # delta when it shouldn't.
+    #
+    # The companion WEATHER_MIN_ENTRY_PRICE filter catches one expression
+    # of this problem (we buy a clipped-floor long-tail at < $0.10), but
+    # the at-the-money case is NOT covered by an entry-price floor:
+    # e.g., model says 95% YES, market at 0.50, edge +0.45 — we'd buy
+    # YES @ 0.50 with raw +45% edge, sized aggressively. Trade #12 in our
+    # DB is exactly this pattern (Polymarket entry 0.500, model=0.950,
+    # edge=+0.450, stopped −$42). With stop-loss now disabled, that loss
+    # would have been the full stake.
+    #
+    # Cap at 0.25 by default. Above-cap signals still log as ACTIONABLE
+    # for visibility but trade at the capped size.
+    WEATHER_MAX_CLIPPED_EDGE: float = 0.25
     WEATHER_MAX_TRADE_SIZE: float = 100.0
     WEATHER_MAX_ALLOCATION_USD: float = 1500.0  # Max combined open weather exposure (was hardcoded $500 in scheduler; bumped 2026-05-19 after Kalshi expanded the universe 13x)
     WEATHER_CITIES: str = "nyc,chicago,miami,los_angeles,denver"

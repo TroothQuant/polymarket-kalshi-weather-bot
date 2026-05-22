@@ -161,6 +161,20 @@ async def generate_weather_signal(
     edge, direction_raw = calculate_edge(model_yes_prob, market_yes_prob)
     direction = "yes" if direction_raw == "up" else "no"
 
+    # Clipped-probability edge cap (added 2026-05-22). The model_yes_prob
+    # clipping at line ~152 above bounds the raw probability into [0.05,
+    # 0.95]. When the clip fires, the underlying ensemble probability is
+    # somewhere in (0, 0.05] or [0.95, 1) — we don't know where. Treating
+    # the post-clip value as exact inflates our confidence in the edge.
+    # Cap |edge| at WEATHER_MAX_CLIPPED_EDGE in that regime.
+    # See config.py for the full rationale + trade #12 reference.
+    edge_was_clipped = False
+    if model_yes_prob in (0.05, 0.95):
+        cap = settings.WEATHER_MAX_CLIPPED_EDGE
+        if abs(edge) > cap:
+            edge_was_clipped = True
+            edge = cap if edge > 0 else -cap
+
     # Entry price filter — applied symmetrically:
     #   too high (> WEATHER_MAX_ENTRY_PRICE): paying too much for asymmetric upside.
     #   too low  (< WEATHER_MIN_ENTRY_PRICE): long-tail bucket where the GFS
@@ -215,6 +229,8 @@ async def generate_weather_signal(
         filter_notes.append(f"entry {entry_price:.0%} > {settings.WEATHER_MAX_ENTRY_PRICE:.0%}")
     if entry_price < settings.WEATHER_MIN_ENTRY_PRICE:
         filter_notes.append(f"entry {entry_price:.0%} < {settings.WEATHER_MIN_ENTRY_PRICE:.0%} (long-tail)")
+    if edge_was_clipped:
+        filter_notes.append(f"edge capped @ {settings.WEATHER_MAX_CLIPPED_EDGE:.0%} (model clipped {model_yes_prob:.2f})")
     filter_note = f" [{', '.join(filter_notes)}]" if filter_notes else ""
 
     reasoning = (
