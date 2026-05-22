@@ -8,7 +8,7 @@ from backend.config import settings
 from backend.core.signals import calculate_edge, calculate_kelly_size
 from backend.data.weather import fetch_ensemble_forecast, EnsembleForecast, CITY_CONFIG
 from backend.data.weather_markets import WeatherMarket, fetch_polymarket_weather_markets
-from backend.models.database import SessionLocal, Signal
+from backend.models.database import SessionLocal, Signal, BotState
 
 logger = logging.getLogger("trading_bot")
 
@@ -45,9 +45,19 @@ class WeatherTradingSignal:
         return abs(self.edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD
 
 
-async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTradingSignal]:
+async def generate_weather_signal(
+    market: WeatherMarket,
+    current_bankroll: Optional[float] = None,
+) -> Optional[WeatherTradingSignal]:
     """
     Generate a trading signal for a weather temperature market.
+
+    current_bankroll (added 2026-05-21): pass the bot's current bankroll for
+    Kelly sizing. Defaults to settings.INITIAL_BANKROLL when None, but the
+    scan loop should always pass the live value so sizing adapts as the
+    bot's capital changes. Previously hardcoded INITIAL_BANKROLL, meaning
+    the bot would oversize when bankroll dropped (treating $5K bankroll as
+    if it were $10K) and undersize when bankroll grew above initial.
 
     Uses ensemble forecast to estimate probability:
     - Count fraction of ensemble members above/below the threshold
@@ -166,15 +176,23 @@ async def generate_weather_signal(market: WeatherMarket) -> Optional[WeatherTrad
     agreement_frac = max(above_count, len(members) - above_count) / len(members)
     confidence = min(0.9, agreement_frac)
 
-    # Kelly sizing
-    bankroll = settings.INITIAL_BANKROLL
+    # Kelly sizing — pass WEATHER_MAX_TRADE_SIZE so calculate_kelly_size
+    # caps at the weather cap ($100) not the legacy BTC cap ($75). Without
+    # this, every weather signal was being silently shrunk to $75 by the
+    # hardcoded MAX_TRADE_SIZE check inside calculate_kelly_size (bug fix
+    # 2026-05-21). Also use current_bankroll (caller-supplied) instead of
+    # INITIAL_BANKROLL so sizing tracks actual capital.
+    bankroll = current_bankroll if current_bankroll is not None else settings.INITIAL_BANKROLL
     suggested_size = calculate_kelly_size(
         edge=abs(edge),
         probability=model_yes_prob,
         market_price=market_yes_prob,
         direction=direction_raw,  # calculate_kelly_size expects "up"/"down"
         bankroll=bankroll,
+        max_size=settings.WEATHER_MAX_TRADE_SIZE,
     )
+    # Defense-in-depth cap (no-op if the inner cap already fired, but kept
+    # so any future code paths around suggested_size respect the weather cap).
     suggested_size = min(suggested_size, settings.WEATHER_MAX_TRADE_SIZE)
 
     # Ensemble stats for display
@@ -249,9 +267,24 @@ async def scan_for_weather_signals() -> List[WeatherTradingSignal]:
 
     logger.info(f"Found {len(markets)} total weather temperature markets")
 
+    # Fetch current bankroll once per scan so Kelly sizing tracks actual
+    # capital, not the hardcoded INITIAL_BANKROLL constant (bug fix
+    # 2026-05-21). Falls back to INITIAL_BANKROLL if the DB query fails.
+    current_bankroll = settings.INITIAL_BANKROLL
+    try:
+        _db = SessionLocal()
+        try:
+            _state = _db.query(BotState).first()
+            if _state and _state.bankroll is not None:
+                current_bankroll = float(_state.bankroll)
+        finally:
+            _db.close()
+    except Exception as e:
+        logger.warning(f"Could not fetch live bankroll for sizing, using initial: {e}")
+
     for market in markets:
         try:
-            signal = await generate_weather_signal(market)
+            signal = await generate_weather_signal(market, current_bankroll=current_bankroll)
             if signal:
                 signals.append(signal)
         except Exception as e:

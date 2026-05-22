@@ -76,7 +76,8 @@ def calculate_kelly_size(
     probability: float,
     market_price: float,
     direction: str,
-    bankroll: float
+    bankroll: float,
+    max_size: Optional[float] = None,
 ) -> float:
     """
     Calculate position size using fractional Kelly criterion.
@@ -87,6 +88,14 @@ def calculate_kelly_size(
         p = probability of winning
         q = probability of losing (1 - p)
         b = odds (payout ratio)
+
+    max_size (added 2026-05-21): per-trade dollar cap. Defaults to
+    settings.MAX_TRADE_SIZE (legacy BTC cap = $75) but weather signals
+    pass settings.WEATHER_MAX_TRADE_SIZE ($100) to avoid being capped by
+    the BTC limit. Bug-fix: the function previously hardcoded
+    settings.MAX_TRADE_SIZE which silently shrank every weather signal's
+    suggested size from $100 (the intended weather cap) to $75 (the BTC
+    cap).
     """
     if direction == "up":
         win_prob = probability
@@ -114,8 +123,10 @@ def calculate_kelly_size(
 
     size = kelly * bankroll
 
-    # Hard cap from config
-    size = min(size, settings.MAX_TRADE_SIZE)
+    # Hard cap from config — use caller-supplied max_size if given (weather
+    # passes WEATHER_MAX_TRADE_SIZE), else fall back to legacy MAX_TRADE_SIZE.
+    effective_max = max_size if max_size is not None else settings.MAX_TRADE_SIZE
+    size = min(size, effective_max)
 
     return size
 
