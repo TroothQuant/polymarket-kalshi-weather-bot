@@ -222,6 +222,15 @@ async def check_weather_settlement(trade: Trade) -> Tuple[bool, Optional[float],
     """
     Check if a weather trade's market has settled.
     Routes to the correct platform's resolution method.
+
+    Return contract:
+      - (False, None, None) — market still open, no settlement yet.
+      - (True, settlement_value, pnl) — normal win/loss settlement.
+      - (True, None, 0) — VOID: market resolved void/refund. Stake comes
+        back, no PnL. Bug fix 2026-05-21: previously this branch was
+        swallowed because the condition required `settlement_value is not
+        None`, leaving voided trades stuck in pending forever (see trade #9
+        which had to be manually voided via SQL).
     """
     platform = getattr(trade, 'platform', 'polymarket') or 'polymarket'
 
@@ -233,7 +242,11 @@ async def check_weather_settlement(trade: Trade) -> Tuple[bool, Optional[float],
             event_slug=trade.event_slug,
         )
 
-    if is_resolved and settlement_value is not None:
+    if is_resolved:
+        if settlement_value is None:
+            # Void / refund path. pnl=0 — stake refund is handled by
+            # update_bot_state_with_settlements via payout = size + pnl = size.
+            return True, None, 0
         pnl = calculate_pnl(trade, settlement_value)
         return True, settlement_value, pnl
 
@@ -277,14 +290,18 @@ async def _fetch_kalshi_resolution(ticker: str) -> Tuple[bool, Optional[float]]:
             elif result in ("no", "no_win", "all_no"):
                 return True, 0.0
             elif result == "void":
-                # Market voided. Stake returned, no PnL. Surface this so
-                # callers can route to a stake-refund settlement path.
+                # Market voided -- stake is returned, no PnL change.
+                # Signal void to callers via (True, None): is_resolved=True
+                # but no settlement_value. The settle_pending_trades caller
+                # handles this as a void/refund settlement.
+                # Bug fix 2026-05-21: previously returned (False, None) which
+                # left voided trades stuck in pending forever (see trade #9
+                # which had to be manually voided via SQL).
                 logger.warning(
-                    f"Kalshi market {ticker} resolved 'void' -- stake should "
-                    f"be returned but the bot currently has no void path; "
-                    f"treating as still pending for now."
+                    f"Kalshi market {ticker} resolved 'void' -- "
+                    f"closing trade with stake refund, no PnL change."
                 )
-                return False, None
+                return True, None
             else:
                 # Finalized status with an unrecognized result -- this is the
                 # bug surface we want LOUDLY visible, not silently swallowed.
@@ -328,23 +345,35 @@ async def settle_pending_trades(db: Session) -> List[Trade]:
             else:
                 is_settled, settlement_value, pnl = await check_market_settlement(trade)
 
-            if is_settled and settlement_value is not None:
+            # is_settled with settlement_value=None signals a void/refund
+            # (added 2026-05-21). settlement_value=0.0 or 1.0 signals normal
+            # win/loss resolution.
+            if is_settled:
                 trade.settled = True
-                trade.settlement_value = settlement_value
-                trade.pnl = pnl
                 trade.settlement_time = datetime.utcnow()
 
-                if pnl is not None and pnl > 0:
-                    trade.result = "win"
-                elif pnl is not None and pnl < 0:
-                    trade.result = "loss"
+                if settlement_value is None:
+                    # Void / refund — stake comes back, no PnL.
+                    trade.settlement_value = None
+                    trade.pnl = 0
+                    trade.result = "void"
                 else:
-                    trade.result = "push"
+                    trade.settlement_value = settlement_value
+                    trade.pnl = pnl
+                    if pnl is not None and pnl > 0:
+                        trade.result = "win"
+                    elif pnl is not None and pnl < 0:
+                        trade.result = "loss"
+                    else:
+                        trade.result = "push"
 
                 settled_trades.append(trade)
 
-                # Update linked Signal with actual outcome for calibration
-                if trade.signal_id:
+                # Update linked Signal with actual outcome for calibration.
+                # Voids (settlement_value=None) are NOT a calibration data
+                # point — the market never resolved, so we don't know if the
+                # model was right. Skip the outcome_correct update for voids.
+                if trade.signal_id and settlement_value is not None:
                     linked_signal = db.query(Signal).filter(Signal.id == trade.signal_id).first()
                     if linked_signal:
                         actual_outcome = "up" if settlement_value == 1.0 else "down"
