@@ -148,7 +148,14 @@ class Settings(BaseSettings):
     #
     # Concrete example: NO @ 0.17 size $75 → max loss $12.75. Stop triggers when
     # the NO mark drops to 0.085 (current unrealized = −$6.375).
-    WEATHER_STOP_LOSS_ENABLED: bool = True
+    # Default flipped 2026-05-23 to match .env production override. The .env
+    # has had WEATHER_STOP_LOSS_ENABLED=false since 2026-05-21 when the
+    # backtest showed stops cost ~$2,160 EV vs saving ~$80. Empirically
+    # validated three settled trades over: #13 +$74.55, #14 +$73.51
+    # (2026-05-21 overnight), #29 +$163.10 (2026-05-23). All three would
+    # have stopped under True. A fresh checkout no longer contradicts
+    # the documented live behavior.
+    WEATHER_STOP_LOSS_ENABLED: bool = False
     WEATHER_STOP_LOSS_FRACTION: float = 0.50
     WEATHER_STOP_LOSS_INTERVAL_SECONDS: int = 600  # check every 10 min
 
