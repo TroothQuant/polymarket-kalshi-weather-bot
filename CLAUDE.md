@@ -118,10 +118,21 @@ ps aux | grep -i "python.*main.py" | grep -v grep
 ```
 If anything comes back, force-kill with `kill -9 <PID>`.
 
+## Operational notes (added 2026-05-22)
+
+Two defensive filters shipped today against actual lifetime loss patterns. Both live in `backend/config.py` + `backend/core/weather_signals.py`. Both apply to BOTH platforms (the same GFS model feeds both).
+
+- **`WEATHER_MIN_ENTRY_PRICE = 0.10`** (commit `327541d`). Refuses to enter on either side when the asked-side price is below the floor. Lifetime DB scan at introduction: entries < $0.10 were n=12, **zero wins**, 10 stops, 1 loss, 1 void, −$554 P&L. Symmetric with the existing `WEATHER_MAX_ENTRY_PRICE = 0.70` cap. Zeros edge while preserving the signal row for post-hoc calibration. Catches the 0.05-clipped long-tail case.
+- **`WEATHER_MAX_CLIPPED_EDGE = 0.25`** (commit `9074eec`). Caps `|edge|` when `model_yes_prob` clips at the 0.05 floor or 0.95 ceiling. Catches the at-the-money case the entry-price filter cannot see — trade #12 pattern: Polymarket entry 0.500, model=0.950, raw edge +0.450, stopped −$42. With stop-loss now disabled, that same trade would have eaten the full stake. Capped signals still log as ACTIONABLE with a `[edge capped @ 25% (model clipped 0.XX)]` filter note for visibility; Kelly sizing then uses the capped edge.
+
+**Kalshi calibration finding 2026-05-22**: `scripts/kalshi_eod_calibration_2026-05-20.py` returned **0/10 cities** across May 20 + May 21 — model picked the winning bucket on NO city across EITHER day. Three failure modes: wrong tail direction, right region wrong bucket, right bucket clipped at 0.05. `KALSHI_TRADING_ENABLED` stays `false`. Re-enable gate: ≥ 7/10 cities in a rolling 10-day window AND ≥ 4/5 in the most recent 5 days.
+
+**Daily Kalshi calibration scheduled** via Cowork's scheduled-tasks MCP. Cron `15 0 * * *` (local CDT = 05:15 UTC, 16 min after Kalshi finalizes resolutions at 04:59 UTC). Appends to `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/kalshi_calibration_history.csv`. Observation-only — does not flip flags or commit. Note: scheduled tasks only fire while the Claude desktop app is open; if closed at 00:15, runs on next launch.
+
+**Backtest harness scaffolded** at `scripts/backtest_weather_harness_2026-05-22.py` (untracked, awaits operator review). Pulls settled Polymarket weather trades, re-fetches ERA5 reanalyzed daily max + 5-yr climatological std as GFS-ensemble stand-in (ERA5 is the only no-key historical source; GFS hindcast via NOAA NOMADS is the documented next step). Replays the model probability calc with configurable std inflation, outputs Brier + 5-bin calibration curve + 1.0 → 2.5 inflation sweep. 3-trade smoke succeeded end-to-end. First interesting datum: trade #7 ERA5 replay disagreed with the bot's GFS ensemble, and the bot's tighter ensemble called it right — hint that GFS may NOT be under-dispersive (opposite of yesterday's Trade #1 deep-dive hypothesis). n=1, not actionable; full-book replay is queued.
+
+**Note**: `WEATHER_STOP_LOSS_ENABLED` default in `config.py` is `True` but `.env` overrides to `False`. The override is the intended live behavior (per the 2026-05-21 backtest finding: stops cost $2,160 EV vs saving ~$80). Validated again 2026-05-22 by +$148 overnight realized from trades #13 and #14, both of which would have stopped under the old policy. Consider flipping the `config.py` default to match.
+
 ## Today's open carryovers
 
-Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files. As of EOD 2026-05-19: 9 weather positions open, $675/$1500 cap used, awaiting overnight audit report from Claude Code (`14_audit_report_2026-05-19.md`).
-
-## Today's open carryovers
-
-Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files.
+Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `16_session_log_2026-05-22.md`). As of EOD 2026-05-22: 5 weather positions open ($450/$1500 cap used), bankroll $9,249.32, total_pnl −$300.68, 34 trades / 8 wins. Trade #29 (Chicago today NO above 66°F) resolves tonight; expected win +$163.
