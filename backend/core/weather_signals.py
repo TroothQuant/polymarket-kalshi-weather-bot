@@ -41,8 +41,18 @@ class WeatherTradingSignal:
 
     @property
     def passes_threshold(self) -> bool:
-        """Check if signal passes minimum edge threshold."""
-        return abs(self.edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD
+        """Check if signal passes the edge band [MIN, MAX].
+
+        Below MIN (default 0.25): edge isn't strong enough — losses pile up
+        per the 10-25% cohort.
+        Above MAX (default 0.50): model is wildly disagreeing with the market
+        and the market is winning — see the 50%+ cohort (1 win in 12 trades).
+        """
+        if abs(self.edge) < settings.WEATHER_MIN_EDGE_THRESHOLD:
+            return False
+        if abs(self.edge) > settings.WEATHER_MAX_EDGE_THRESHOLD:
+            return False
+        return True
 
 
 async def generate_weather_signal(
@@ -222,9 +232,17 @@ async def generate_weather_signal(
     mean_val = forecast.mean_high if market.metric == "high" else forecast.mean_low
     std_val = forecast.std_high if market.metric == "high" else forecast.std_low
 
-    # Build reasoning
-    filter_status = "ACTIONABLE" if abs(edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD else "FILTERED"
+    # Build reasoning. ACTIONABLE only if the edge sits inside [MIN, MAX].
+    actionable = (
+        abs(edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD
+        and abs(edge) <= settings.WEATHER_MAX_EDGE_THRESHOLD
+    )
+    filter_status = "ACTIONABLE" if actionable else "FILTERED"
     filter_notes = []
+    if abs(edge) > settings.WEATHER_MAX_EDGE_THRESHOLD:
+        filter_notes.append(
+            f"edge {edge:+.1%} > {settings.WEATHER_MAX_EDGE_THRESHOLD:.0%} ceiling"
+        )
     if entry_price > settings.WEATHER_MAX_ENTRY_PRICE:
         filter_notes.append(f"entry {entry_price:.0%} > {settings.WEATHER_MAX_ENTRY_PRICE:.0%}")
     if entry_price < settings.WEATHER_MIN_ENTRY_PRICE:

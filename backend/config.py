@@ -100,6 +100,12 @@ class Settings(BaseSettings):
     # failing band. Working strategy is NO bets with 25-50% edge — see
     # diagnostic_pull_2026-05-27.csv in the Polymarket folder. Was 0.08.
     WEATHER_MIN_EDGE_THRESHOLD: float = 0.25
+    # Cohort analysis 2026-05-27 also showed the 50%+ edge band is 12 trades,
+    # 1 win, -$390 P&L (8.3% win rate). Distinct from WEATHER_MAX_CLIPPED_EDGE
+    # (which only fires when model_yes_prob clips at 0.05/0.95); this ceiling
+    # fires regardless of clipping. The catastrophic regime — when the model
+    # thinks the market is wildly mispricing, the model is usually wrong.
+    WEATHER_MAX_EDGE_THRESHOLD: float = 0.50
     WEATHER_MAX_ENTRY_PRICE: float = 0.70
     # WEATHER_MIN_ENTRY_PRICE (added 2026-05-22): refuse to enter on either
     # side when the asked-side price is below this floor. Lifetime DB scan
