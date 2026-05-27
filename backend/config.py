@@ -106,6 +106,14 @@ class Settings(BaseSettings):
     # fires regardless of clipping. The catastrophic regime — when the model
     # thinks the market is wildly mispricing, the model is usually wrong.
     WEATHER_MAX_EDGE_THRESHOLD: float = 0.50
+    # YES-side kill-switch (added 2026-05-27). Per the same cohort analysis,
+    # YES/above is 13 trades, 2 wins, 16.7% WR, -$411 P&L — 80% of total
+    # lifetime drawdown lives in one cohort. NO bets work either way (60%
+    # win rate). YES/below is mediocre. Temporarily refuse all YES entries
+    # while we figure out the root cause (GFS warm bias vs bucket-direction
+    # inversion vs calibration). Override in .env to True to enable; the
+    # default keeps a fresh checkout matching tomorrow's intent.
+    WEATHER_DISABLE_YES_ENTRIES: bool = False
     WEATHER_MAX_ENTRY_PRICE: float = 0.70
     # WEATHER_MIN_ENTRY_PRICE (added 2026-05-22): refuse to enter on either
     # side when the asked-side price is below this floor. Lifetime DB scan

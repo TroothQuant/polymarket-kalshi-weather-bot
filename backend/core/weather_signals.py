@@ -41,16 +41,20 @@ class WeatherTradingSignal:
 
     @property
     def passes_threshold(self) -> bool:
-        """Check if signal passes the edge band [MIN, MAX].
+        """Check if signal passes the edge band [MIN, MAX] AND direction gate.
 
         Below MIN (default 0.25): edge isn't strong enough — losses pile up
         per the 10-25% cohort.
         Above MAX (default 0.50): model is wildly disagreeing with the market
         and the market is winning — see the 50%+ cohort (1 win in 12 trades).
+        YES direction when WEATHER_DISABLE_YES_ENTRIES=True: blocked entirely
+        pending NOMADS-backtest diagnosis of the YES/above failure mode.
         """
         if abs(self.edge) < settings.WEATHER_MIN_EDGE_THRESHOLD:
             return False
         if abs(self.edge) > settings.WEATHER_MAX_EDGE_THRESHOLD:
+            return False
+        if settings.WEATHER_DISABLE_YES_ENTRIES and self.direction == "yes":
             return False
         return True
 
@@ -232,10 +236,23 @@ async def generate_weather_signal(
     mean_val = forecast.mean_high if market.metric == "high" else forecast.mean_low
     std_val = forecast.std_high if market.metric == "high" else forecast.std_low
 
-    # Build reasoning. ACTIONABLE only if the edge sits inside [MIN, MAX].
+    # YES-side kill-switch (added 2026-05-27). Logged loudly so it's visible
+    # in bot.log when the gate fires — the dashboard's reasoning text alone
+    # is easy to miss.
+    yes_blocked = settings.WEATHER_DISABLE_YES_ENTRIES and direction == "yes"
+    if yes_blocked:
+        logger.info(
+            f"YES entry blocked by kill-switch: {market.city_name} "
+            f"{market.metric} {market.direction} {market.threshold_f:.0f}F "
+            f"on {market.target_date} (edge {edge:+.1%})"
+        )
+
+    # Build reasoning. ACTIONABLE only if the edge sits inside [MIN, MAX]
+    # AND direction passes the kill-switch.
     actionable = (
         abs(edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD
         and abs(edge) <= settings.WEATHER_MAX_EDGE_THRESHOLD
+        and not yes_blocked
     )
     filter_status = "ACTIONABLE" if actionable else "FILTERED"
     filter_notes = []
@@ -243,6 +260,8 @@ async def generate_weather_signal(
         filter_notes.append(
             f"edge {edge:+.1%} > {settings.WEATHER_MAX_EDGE_THRESHOLD:.0%} ceiling"
         )
+    if yes_blocked:
+        filter_notes.append("YES entry blocked by kill-switch")
     if entry_price > settings.WEATHER_MAX_ENTRY_PRICE:
         filter_notes.append(f"entry {entry_price:.0%} > {settings.WEATHER_MAX_ENTRY_PRICE:.0%}")
     if entry_price < settings.WEATHER_MIN_ENTRY_PRICE:
