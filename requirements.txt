@@ -31,3 +31,10 @@ structlog>=24.1.0
 # Utils
 python-dotenv==1.0.0
 orjson==3.9.10
+
+# GRIB2 decode for the NOMADS GFS hindcast backtest (added 2026-05-27).
+# Only used by scripts/nomads_gfs_hindcast.py and the offline backtest
+# harness — NOT loaded by the live bot. cfgrib bundles eccodes in its
+# wheel so no separate `brew install eccodes` step is required.
+cfgrib==0.9.15.1
+xarray==2026.4.0
