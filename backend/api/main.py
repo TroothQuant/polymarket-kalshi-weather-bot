@@ -166,6 +166,7 @@ class TradeResponse(BaseModel):
     settled: bool
     result: str
     pnl: Optional[float]
+    edge_at_entry: Optional[float] = None
 
 
 class BotStats(BaseModel):
@@ -476,6 +477,11 @@ async def get_trades(
         query = query.filter(Trade.result == status)
     trades = query.order_by(Trade.timestamp.desc()).limit(limit).all()
 
+    def _compute_edge(t):
+        if t.model_probability is None or t.market_price_at_entry is None:
+            return None
+        return abs(t.model_probability - t.market_price_at_entry)
+
     return [
         TradeResponse(
             id=t.id,
@@ -488,7 +494,8 @@ async def get_trades(
             timestamp=t.timestamp,
             settled=t.settled,
             result=t.result,
-            pnl=t.pnl
+            pnl=t.pnl,
+            edge_at_entry=_compute_edge(t),
         )
         for t in trades
     ]
