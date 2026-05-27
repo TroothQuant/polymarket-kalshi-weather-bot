@@ -112,19 +112,22 @@ def strike_and_direction_from_reasoning(reasoning: str):
     return int(m.group(2)), m.group(1)
 
 
-def settled_to_yes(settlement_value, direction_traded):
+def settled_to_yes(settlement_value, direction_traded=None):
     """
     settled_to_yes -> 1.0 if the market resolved YES, 0.0 if NO, None if void.
-    settlement_value is the value paid for the SIDE TRADED, not the YES side.
-    To get the YES outcome we flip if we traded NO.
+
+    NOTE 2026-05-27: this function previously flipped on direction_traded
+    under the assumption that settlement_value was "value paid for the
+    side the bot traded." In reality, backend/core/settlement.py's
+    _parse_market_resolution stores settlement_value canonically in
+    YES-terms: 1.0 = YES won, 0.0 = NO won, regardless of which side the
+    bot bet. The flip caused NO-side trades to report inverted outcomes,
+    silently breaking Brier calculations for ~half the book. Removed.
+    `direction_traded` kept as an unused kwarg for backwards compat.
     """
     if settlement_value is None:
         return None
-    if direction_traded == "yes":
-        return float(settlement_value)
-    elif direction_traded == "no":
-        return 1.0 - float(settlement_value)
-    return None
+    return float(settlement_value)
 
 
 # ---------- ERA5 archive (stand-in for GFS ensemble while we wait on a hindcast source) ----------
