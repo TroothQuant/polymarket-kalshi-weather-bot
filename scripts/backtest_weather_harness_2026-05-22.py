@@ -42,6 +42,19 @@ LIMITATIONS (today's scaffold):
     on port 443 unresponsive). The NOMADS swap is the documented next-
     step source and removes this dependency.
 
+NOMADS HINDCAST (added 2026-05-27)
+  Pass --source nomads (default) to use the GEFS hindcast adapter at
+  scripts/nomads_gfs_hindcast.py. Pulls 31 ensemble members from NOAA's
+  S3 mirror per (date, city), uses the empirical mean + std across
+  members. Pass --source openmeteo for the legacy ERA5 stand-in.
+
+  --report PATH writes a Markdown calibration report covering:
+    1. Summary
+    2. Per-cohort Brier (direction × bucket)
+    3. 5-bin calibration curve
+    4. Std-inflation sweep
+    5. Comparison to the live bot's open-meteo model prob (from DB)
+
 OUTSTANDING (next session):
   - GFS hindcast source (NOMADS or paid Open-Meteo)
   - Kalshi support (re-use the bucket-aware path from weather_signals.py)
@@ -63,6 +76,15 @@ from pathlib import Path
 from typing import List, Dict, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+# NOMADS S3 hindcast adapter (added 2026-05-27)
+try:
+    from nomads_gfs_hindcast import fetch_gefs_ensemble_hindcast
+    HAVE_NOMADS = True
+except Exception as _e:
+    HAVE_NOMADS = False
+    _NOMADS_IMPORT_ERROR = _e
 sys.path.insert(0, str(ROOT))
 
 # Local imports
@@ -259,7 +281,17 @@ def main():
                     help="Single ensemble-std inflation factor for the headline replay.")
     ap.add_argument("--no-sweep", action="store_true",
                     help="Skip the 1.0 .. 2.5 inflation sweep.")
+    ap.add_argument("--source", choices=["nomads", "openmeteo"], default="nomads",
+                    help="Forecast data source. 'nomads' = NOAA GEFS hindcast via S3 "
+                         "(added 2026-05-27, default). 'openmeteo' = legacy ERA5 stand-in.")
+    ap.add_argument("--report", type=str, default=None,
+                    help="If set, write a Markdown calibration report to this path.")
     args = ap.parse_args()
+
+    if args.source == "nomads" and not HAVE_NOMADS:
+        print(f"ERROR: --source nomads requires nomads_gfs_hindcast module: {_NOMADS_IMPORT_ERROR}",
+              file=sys.stderr)
+        sys.exit(1)
 
     if not DB_PATH.exists():
         print(f"DB not found at {DB_PATH}", file=sys.stderr)
@@ -323,60 +355,190 @@ def main():
 
     print(f"Parseable: {len(replay_rows)} trades enter replay.")
 
-    def run_replay(std_inflation: float):
+    skipped_in_fetch: list[tuple[int, str]] = []
+
+    def run_replay(std_inflation: float, source: str, skip_log: Optional[list] = None):
+        """source='nomads' uses the GEFS hindcast adapter against S3;
+        source='openmeteo' uses ERA5 + climatology stand-in (legacy)."""
         results = []
         for r in replay_rows:
             city_cfg = CITY_CONFIG[r["city"]]
             lat, lon = city_cfg["lat"], city_cfg["lon"]
-            era5_mean = fetch_era5_max_for_date(lat, lon, r["target_date"])
-            era5_std = fetch_climatology_std(lat, lon, r["target_date"])
-            if era5_mean is None or era5_std is None:
-                continue
+
+            if source == "openmeteo":
+                src_mean = fetch_era5_max_for_date(lat, lon, r["target_date"])
+                src_std = fetch_climatology_std(lat, lon, r["target_date"])
+                if src_mean is None or src_std is None:
+                    if skip_log is not None:
+                        skip_log.append((r["trade_id"], "ERA5 unavailable"))
+                    continue
+                src_n = 1
+            elif source == "nomads":
+                date_str = r["target_date"].strftime("%Y-%m-%d")
+                ens = fetch_gefs_ensemble_hindcast(date_str, city_cfg["name"])
+                if ens is None:
+                    if skip_log is not None:
+                        skip_log.append((r["trade_id"], f"GEFS hindcast unavailable for {date_str} {city_cfg['name']}"))
+                    continue
+                src_mean = sum(ens.members) / len(ens.members)
+                src_std = ens.spread_std
+                src_n = ens.n_members_used
+            else:
+                raise ValueError(f"unknown source {source!r}")
+
             if r["direction"] == "above":
                 model_p = model_probability_high_above(
-                    era5_mean, era5_std, r["threshold"], std_inflation=std_inflation
+                    src_mean, src_std, r["threshold"], std_inflation=std_inflation
                 )
             else:
                 model_p = model_probability_high_below(
-                    era5_mean, era5_std, r["threshold"], std_inflation=std_inflation
+                    src_mean, src_std, r["threshold"], std_inflation=std_inflation
                 )
-            results.append({**r, "era5_mean": era5_mean, "era5_std": era5_std,
+            results.append({**r, "source_mean": src_mean, "source_std": src_std,
+                            "source_n": src_n,
                             "replay_model_p": model_p, "inflation": std_inflation})
         return results
 
-    print(f"\n=== HEADLINE REPLAY (std inflation = {args.inflate}) ===")
-    headline = run_replay(args.inflate)
-    print(f"  {'#':>3} {'city':<12} {'date':<10} {'strike':<7} {'dir':<6} "
-          f"{'era5_mean':>9} {'era5_std':>8} {'replay_p':>9} {'settled_yes':>11} "
-          f"{'bot_p':>7} {'mkt_p':>7} {'pnl':>8}")
+    def per_cohort_brier(results):
+        """Group by (direction_traded ∈ {yes,no}, direction ∈ {above,below})
+        and compute Brier per cohort."""
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for r in results:
+            groups[(r["direction_traded"], r["direction"])].append(
+                (r["replay_model_p"], r["settled_yes"])
+            )
+        out = []
+        for key in sorted(groups.keys()):
+            preds = [p for p, _ in groups[key]]
+            outs = [o for _, o in groups[key]]
+            out.append((key[0], key[1], len(groups[key]), brier(preds, outs)))
+        return out
+
+    print(f"\n=== HEADLINE REPLAY ({args.source}, std inflation = {args.inflate}) ===")
+    headline = run_replay(args.inflate, args.source, skip_log=skipped_in_fetch)
+    print(f"  {'#':>3} {'city':<13} {'date':<10} {'strike':<7} {'dir':<6} "
+          f"{'src_n':>5} {'src_mean':>9} {'src_std':>8} {'replay_p':>9} "
+          f"{'set_yes':>7} {'bot_p':>7} {'mkt_p':>7} {'pnl':>8}")
     for r in headline:
-        print(f"  #{r['trade_id']:>2} {r['city']:<12} {r['target_date']!s:<10} "
+        print(f"  #{r['trade_id']:>2} {r['city']:<13} {r['target_date']!s:<10} "
               f"{r['threshold']:<7} {r['direction']:<6} "
-              f"{r['era5_mean']:>9.1f} {r['era5_std']:>8.2f} "
-              f"{r['replay_model_p']:>9.3f} {r['settled_yes']:>11.0f} "
+              f"{r['source_n']:>5} {r['source_mean']:>9.1f} {r['source_std']:>8.2f} "
+              f"{r['replay_model_p']:>9.3f} {r['settled_yes']:>7.0f} "
               f"{(r['bot_model_p'] or 0):>7.3f} {(r['bot_market_p'] or 0):>7.3f} "
               f"{(r['pnl'] or 0):>+8.2f}")
+    if skipped_in_fetch:
+        print(f"\n  Skipped {len(skipped_in_fetch)} trades in fetch:")
+        for tid, why in skipped_in_fetch:
+            print(f"    #{tid}  {why}")
 
     preds = [r["replay_model_p"] for r in headline]
     outs = [r["settled_yes"] for r in headline]
-    print(f"\n  Brier score (replay model vs YES outcome): {brier(preds, outs):.4f}")
+    headline_brier = brier(preds, outs)
+    print(f"\n  Brier score (replay model vs YES outcome): {headline_brier:.4f}")
     print(f"  (lower = better; 0.25 = always-50%; 0 = perfect)")
 
-    print("\n  Calibration bins (replay_model_p decile vs actual YES rate):")
-    for lo, hi, avg_p, win_rate, n in calibration_bins(preds, outs, n_bins=5):
-        if n == 0:
-            print(f"    [{lo:.1f}-{hi:.1f}]  n=0")
-        else:
-            print(f"    [{lo:.1f}-{hi:.1f}]  n={n:>2}  avg_predicted={avg_p:.3f}  actual_yes_rate={win_rate:.3f}")
+    print("\n=== PER-COHORT BRIER (direction_traded × bucket) ===")
+    cohort_rows = per_cohort_brier(headline)
+    print(f"  {'dir_traded':<11} {'bucket':<8} {'n':>4} {'brier':>8}")
+    for dir_t, bucket, n, b in cohort_rows:
+        print(f"  {dir_t:<11} {bucket:<8} {n:>4} {b:>8.4f}")
 
+    print("\n=== 5-BIN CALIBRATION CURVE ===")
+    print(f"  {'bin':<12} {'n':>4} {'avg_predicted':>14} {'actual_yes_rate':>16}")
+    cal_rows = calibration_bins(preds, outs, n_bins=5)
+    for lo, hi, avg_p, win_rate, n in cal_rows:
+        if n == 0:
+            print(f"  [{lo:.1f}-{hi:.1f}]    {n:>4} {'':>14} {'':>16}")
+        else:
+            print(f"  [{lo:.1f}-{hi:.1f}]    {n:>4} {avg_p:>14.3f} {win_rate:>16.3f}")
+
+    sweep_rows = []
     if not args.no_sweep:
         print("\n=== INFLATION SWEEP ===")
         print(f"  {'inflation':>10} {'brier':>8}  (lower better)")
         for f in [round(x * 0.25 + 1.0, 2) for x in range(7)]:
-            replay = run_replay(f)
-            preds = [r["replay_model_p"] for r in replay]
-            outs = [r["settled_yes"] for r in replay]
-            print(f"  {f:>10.2f} {brier(preds, outs):>8.4f}")
+            replay = run_replay(f, args.source)
+            preds_s = [r["replay_model_p"] for r in replay]
+            outs_s = [r["settled_yes"] for r in replay]
+            b = brier(preds_s, outs_s)
+            sweep_rows.append((f, len(replay), b))
+            print(f"  {f:>10.2f} {b:>8.4f}")
+
+    print("\n=== LIVE-BOT vs REPLAY COMPARISON ===")
+    bot_preds = [r["bot_model_p"] for r in headline if r["bot_model_p"] is not None]
+    bot_outs = [r["settled_yes"] for r in headline if r["bot_model_p"] is not None]
+    bot_brier = brier(bot_preds, bot_outs)
+    print(f"  Live-bot (Open-Meteo at trade entry) Brier: {bot_brier:.4f}  (n={len(bot_preds)})")
+    print(f"  Replay ({args.source}) Brier:              {headline_brier:.4f}  (n={len(headline)})")
+    # mean-abs-diff between bot's prob and replay's prob
+    if headline:
+        diffs = [abs((r["bot_model_p"] or 0) - r["replay_model_p"]) for r in headline if r["bot_model_p"] is not None]
+        if diffs:
+            print(f"  mean |bot_p − replay_p| across {len(diffs)} trades: {sum(diffs)/len(diffs):.3f}")
+
+    # ── Markdown report ──────────────────────────────────────────────────
+    if args.report:
+        report_path = Path(args.report).expanduser()
+        with open(report_path, "w") as f:
+            f.write(f"# Weather-Bot Backtest Report — {args.source.upper()}\n\n")
+            f.write(f"**Source:** `{args.source}`  \n")
+            f.write(f"**Headline inflation:** {args.inflate}  \n")
+            f.write(f"**Generated:** {datetime.utcnow().isoformat()}Z  \n\n")
+
+            f.write("## 1. Summary\n\n")
+            f.write(f"- Replay rows entered:       **{len(replay_rows)}**\n")
+            f.write(f"- Trades scored:             **{len(headline)}**\n")
+            f.write(f"- Trades skipped in fetch:   **{len(skipped_in_fetch)}**\n")
+            f.write(f"- Headline Brier (replay):   **{headline_brier:.4f}**\n")
+            f.write(f"- Live-bot Brier (DB):       **{bot_brier:.4f}** (n={len(bot_preds)})\n")
+            f.write(f"- Reference: 0 = perfect, 0.25 = always-50% baseline\n\n")
+            if skipped_in_fetch:
+                f.write("Skipped trades:\n\n")
+                for tid, why in skipped_in_fetch:
+                    f.write(f"- #{tid}: {why}\n")
+                f.write("\n")
+
+            f.write("## 2. Per-cohort Brier (direction_traded × bucket)\n\n")
+            f.write("| direction_traded | bucket | n | Brier |\n|---|---|---:|---:|\n")
+            for dir_t, bucket, n, b in cohort_rows:
+                f.write(f"| {dir_t} | {bucket} | {n} | {b:.4f} |\n")
+            f.write("\n")
+
+            f.write("## 3. 5-bin calibration curve\n\n")
+            f.write("| Predicted-prob bin | n | mean predicted | actual YES rate |\n|---|---:|---:|---:|\n")
+            for lo, hi, avg_p, win_rate, n in cal_rows:
+                if n == 0:
+                    f.write(f"| [{lo:.1f}, {hi:.1f}] | 0 | — | — |\n")
+                else:
+                    f.write(f"| [{lo:.1f}, {hi:.1f}] | {n} | {avg_p:.3f} | {win_rate:.3f} |\n")
+            f.write("\n")
+
+            if sweep_rows:
+                f.write("## 4. Std-inflation sweep\n\n")
+                f.write("| inflation | n | Brier |\n|---:|---:|---:|\n")
+                for fctr, nn, b in sweep_rows:
+                    f.write(f"| {fctr:.2f} | {nn} | {b:.4f} |\n")
+                best = min(sweep_rows, key=lambda x: x[2])
+                f.write(f"\nBest-Brier inflation: **{best[0]:.2f}** (Brier {best[2]:.4f}).\n\n")
+            else:
+                f.write("## 4. Std-inflation sweep\n\nSkipped (--no-sweep).\n\n")
+
+            f.write("## 5. Comparison vs live\n\n")
+            f.write("Per-trade comparison of the live bot's open-meteo model probability (recorded "
+                    "at trade entry) against the replay model probability under "
+                    f"`{args.source}`.\n\n")
+            f.write("| trade | city | date | dir | strike | settled_yes | bot_p | replay_p | |delta| |\n")
+            f.write("|---:|---|---|---|---:|---:|---:|---:|---:|\n")
+            for r in headline:
+                bp = r["bot_model_p"] or 0.0
+                f.write(f"| #{r['trade_id']} | {r['city']} | {r['target_date']} | "
+                        f"{r['direction']} | {r['threshold']} | "
+                        f"{int(r['settled_yes'])} | {bp:.3f} | {r['replay_model_p']:.3f} | "
+                        f"{abs(bp - r['replay_model_p']):.3f} |\n")
+            f.write("\n")
+
+        print(f"\n[report] wrote {report_path}")
 
     print("\nDone.")
 
