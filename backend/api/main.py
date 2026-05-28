@@ -311,6 +311,26 @@ async def startup():
     print(f"  - Settlement interval: {settings.SETTLEMENT_INTERVAL_SECONDS}s")
     print("")
 
+    print("Weather configuration:")
+    print(f"  - Min edge threshold: {settings.WEATHER_MIN_EDGE_THRESHOLD:.2f}")
+    print(f"  - Max edge threshold: {settings.WEATHER_MAX_EDGE_THRESHOLD:.2f}")
+    print(f"  - Min entry price: ${settings.WEATHER_MIN_ENTRY_PRICE:.2f}")
+    print(f"  - Max entry price: ${settings.WEATHER_MAX_ENTRY_PRICE:.2f}")
+    print(f"  - Max clipped edge: {settings.WEATHER_MAX_CLIPPED_EDGE:.2f}")
+    print(f"  - Max trade size: ${settings.WEATHER_MAX_TRADE_SIZE:.1f}")
+    print(f"  - Max allocation: ${settings.WEATHER_MAX_ALLOCATION_USD:.1f}")
+    print(f"  - Max new positions/day: {settings.WEATHER_MAX_NEW_POSITIONS_PER_DAY}")
+    print(f"  - Stop-loss enabled: {settings.WEATHER_STOP_LOSS_ENABLED}")
+    if settings.WEATHER_STOP_LOSS_ENABLED:
+        print(f"  - Stop-loss fraction: {settings.WEATHER_STOP_LOSS_FRACTION:.2f}")
+    print(f"  - Disable YES entries: {settings.WEATHER_DISABLE_YES_ENTRIES}")
+    print("")
+
+    print("Kalshi configuration:")
+    print(f"  - Kalshi enabled: {settings.KALSHI_ENABLED}")
+    print(f"  - Kalshi trading enabled: {settings.KALSHI_TRADING_ENABLED}")
+    print("")
+
     from backend.core.scheduler import start_scheduler, log_event
     start_scheduler()
     log_event("success", "BTC 5-min trading bot initialized")
