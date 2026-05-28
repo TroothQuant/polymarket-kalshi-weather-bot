@@ -250,6 +250,31 @@ async def weather_scan_and_trade_job():
                 log_event("info", f"Weather allocation limit reached: ${weather_pending:.0f}/${MAX_WEATHER_ALLOCATION:.0f}")
                 return
 
+            # Per-day new-position cap (added 2026-05-28). Counts weather
+            # positions OPENED today (UTC midnight → now) regardless of whether
+            # they've since settled — a position opened AND stopped the same day
+            # still consumed daily exposure, so settled-today rows must still
+            # count or the cap wouldn't stop a 2026-05-20-style run. This schema
+            # has no separate "exit" rows (settlement mutates the open row), so
+            # counting Trade rows by entry timestamp inherently counts opens only.
+            # The existing per-scan cap (MAX_TRADES_PER_SCAN) was never breached
+            # on 2026-05-20 — the damage was 10 trades across ~9 scans, which only
+            # a per-day cap can catch. Counts BOTH platforms together.
+            max_per_day = settings.WEATHER_MAX_NEW_POSITIONS_PER_DAY
+            utc_day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            positions_today = db.query(func.count(Trade.id)).filter(
+                Trade.market_type == "weather",
+                Trade.timestamp >= utc_day_start,
+            ).scalar() or 0
+
+            if positions_today >= max_per_day:
+                log_event(
+                    "info",
+                    f"[blocked] WEATHER_MAX_NEW_POSITIONS_PER_DAY={max_per_day} reached "
+                    f"({positions_today} opened today); skipping all new weather opens this scan."
+                )
+                return
+
             trades_executed = 0
             # Kalshi kill-switch budget-starvation fix (2026-05-21): when
             # KALSHI_TRADING_ENABLED=False, filter Kalshi signals OUT of the
@@ -322,6 +347,20 @@ async def weather_scan_and_trade_job():
                     break
 
                 if trades_executed >= MAX_TRADES_PER_SCAN:
+                    break
+
+                # Per-day cap (added 2026-05-28): positions_today was counted at
+                # scan start; trades_executed is what THIS scan has opened so far.
+                # Breaks mid-scan once the daily budget is exhausted. Belt-and-
+                # suspenders with the pre-loop early return above (same pattern as
+                # the per-scan cap, which uses both a slice and this break).
+                if positions_today + trades_executed >= max_per_day:
+                    log_event(
+                        "info",
+                        f"[blocked] WEATHER_MAX_NEW_POSITIONS_PER_DAY={max_per_day} reached "
+                        f"({positions_today} earlier today + {trades_executed} this scan); "
+                        f"deferring remaining candidate(s) to tomorrow."
+                    )
                     break
 
                 entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price

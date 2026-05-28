@@ -153,6 +153,8 @@ class Settings(BaseSettings):
     WEATHER_MAX_CLIPPED_EDGE: float = 0.25
     WEATHER_MAX_TRADE_SIZE: float = 100.0
     WEATHER_MAX_ALLOCATION_USD: float = 1500.0  # Max combined open weather exposure (was hardcoded $500 in scheduler; bumped 2026-05-19 after Kalshi expanded the universe 13x)
+    # Cap on new weather positions opened per UTC day. Catches cross-scan accumulation patterns like the 2026-05-20 Kalshi pile-in (10 trades over 33 hours across ~9 scans). Polymarket normal-day rate is 1-3 so this is headroom, not a bite.
+    WEATHER_MAX_NEW_POSITIONS_PER_DAY: int = 5
     WEATHER_CITIES: str = "nyc,chicago,miami,los_angeles,denver"
 
     # Weather stop-loss (added 2026-05-19)
