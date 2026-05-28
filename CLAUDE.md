@@ -191,4 +191,4 @@ The weather bot's −$247 realized P&L is **fossil damage** from the pre-2026-05
 
 ## Today's open carryovers
 
-Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-05-23.md`, next-session prompt: `morning_prompt_2026-05-24.md`). As of EOD 2026-05-23: 6 weather positions open ($575/$1500 cap used), bankroll $9,187.42, total_pnl −$212.58 (+$88.10 on the day from trade #29 win), 37 trades / 9 wins. Three positions resolve 5/24 (#31, #32, #33); three resolve 5/25 (#34, #35, #36).
+Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-05-27.md`, next-session briefing: `morning_briefing_2026-05-28.md`). As of EOD 2026-05-27: bankroll $9,452.72, total_pnl −$247.28, 37 trades, 34 settled (33 win/loss + 1 void), 3 weather positions open (all YES, riding to resolution under the temporary YES kill-switch). Carryover: re-decide `WEATHER_DISABLE_YES_ENTRIES` once those 3 open YES positions settle and the YES/above sample grows from n=4 to n=7.
