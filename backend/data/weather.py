@@ -35,10 +35,13 @@ CITY_CONFIG: Dict[str, dict] = {
         "nws_office": "MFL",
         "nws_gridpoint": "MFL/75,53",
     },
+    # Coords match KLAX (NWS settlement station for Polymarket).
+    # Previously used downtown 34.0522/-118.2437 — 9.6°F too warm vs the
+    # actual settlement location. See weather_source_mismatch_analysis_2026-05-29.md.
     "los_angeles": {
         "name": "Los Angeles",
-        "lat": 34.0522,
-        "lon": -118.2437,
+        "lat": 33.9425,
+        "lon": -118.4081,
         "nws_station": "KLAX",
         "nws_office": "LOX",
         "nws_gridpoint": "LOX/154,44",
