@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import os
 import sqlite3
 import sys
 from datetime import date as _date, datetime
@@ -143,8 +144,9 @@ async def _city_calibration(client, db_con, city_key: str, target: _date):
     return None
 
 
-CALIBRATION_CSV = (Path.home() / "Desktop" / "TROOTH" /
-                   "TROOTH - FINANCIAL" / "Polymarket" / "kalshi_calibration_history.csv")
+_DEFAULT_CSV = (Path.home() / "Desktop" / "TROOTH" /
+                "TROOTH - FINANCIAL" / "Polymarket" / "kalshi_calibration_history.csv")
+CALIBRATION_CSV = Path(os.environ.get("KALSHI_CALIBRATION_CSV_PATH", str(_DEFAULT_CSV)))
 CSV_HEADER = ["date", "n_correct", "n_total", "cities_correct", "notes"]
 
 
