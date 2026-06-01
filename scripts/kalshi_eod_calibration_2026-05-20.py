@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import sqlite3
 import sys
 from datetime import date as _date, datetime
@@ -142,6 +143,49 @@ async def _city_calibration(client, db_con, city_key: str, target: _date):
     return None
 
 
+CALIBRATION_CSV = (Path.home() / "Desktop" / "TROOTH" /
+                   "TROOTH - FINANCIAL" / "Polymarket" / "kalshi_calibration_history.csv")
+CSV_HEADER = ["date", "n_correct", "n_total", "cities_correct", "notes"]
+
+
+def _write_calibration_csv(target: _date, right: int, total: int, results) -> None:
+    """Append (or overwrite-by-date) one calibration row to CALIBRATION_CSV.
+
+    Idempotent: re-running for the same date replaces that date's row (incl.
+    earlier BLOCKED rows). Atomic: writes a .tmp then renames so a crash can't
+    leave a corrupt CSV. Added 2026-05-29 so an unattended launchd run persists
+    results — previously the script only printed and a Cowork agent wrote the CSV.
+    """
+    cities = ";".join(c for c, v in results if v == "MODEL RIGHT")
+    if total == 0:
+        note = "no cities resolved"
+    elif right == total:
+        note = "model calibrated across all resolved cities"
+    elif right * 2 >= total:
+        note = "mixed — more data needed"
+    else:
+        note = "model losing calibration test"
+    new_row = {"date": target.isoformat(), "n_correct": right, "n_total": total,
+               "cities_correct": cities, "notes": note}
+
+    rows = []
+    if CALIBRATION_CSV.exists():
+        with open(CALIBRATION_CSV, newline="") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("date") != new_row["date"]]
+    rows.append(new_row)
+    rows.sort(key=lambda r: r.get("date") or "")
+
+    CALIBRATION_CSV.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CALIBRATION_CSV.with_name(CALIBRATION_CSV.name + ".tmp")
+    with open(tmp, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADER)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in CSV_HEADER})
+    tmp.replace(CALIBRATION_CSV)  # atomic on same filesystem
+    print(f"\n  CSV updated ({CALIBRATION_CSV.name}): date={new_row['date']} -> {right}/{total}")
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", default=None,
@@ -168,6 +212,7 @@ async def main() -> int:
     print("=" * 80)
     if not results:
         print("  No resolved cities yet. Re-run after end-of-day.")
+        _write_calibration_csv(target, 0, 0, [])
         return 0
     right = sum(1 for _, v in results if v == "MODEL RIGHT")
     total = len(results)
@@ -183,6 +228,7 @@ async def main() -> int:
     else:
         print("  >>> Model is losing the calibration test. Investigate before")
         print("      re-enabling -- likely stale GFS forecasts vs market nowcast.")
+    _write_calibration_csv(target, right, total, results)
     return 0
 
 
