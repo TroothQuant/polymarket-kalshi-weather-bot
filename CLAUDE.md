@@ -198,6 +198,55 @@ Risk-control + documentation day. No trading-side changes — the bot was untouc
 - **Boot dump observability fix (commit `1cdae91`).** The FastAPI startup handler in `backend/api/main.py` now prints "Weather configuration:" and "Kalshi configuration:" blocks after the existing BTC-oriented "Configuration:" block — 11 weather fields + 2 Kalshi fields. Picks up on next natural restart; the live bot (PID 56099) is already running the correct config, so restarting twice just to surface the dump wasn't worth it.
 - **Allocation cap clarification.** `WEATHER_MAX_ALLOCATION_USD = $1,500`, not $500. The 5/28 morning briefing misread the cap because the open book was 5 positions × $100 max-trade-size = $500, which coincidentally matched the pre-5/19 hardcoded value. Per-trade max-size and the total allocation cap are different settings.
 
+## Operational notes (added 2026-06-01)
+
+**As of 2026-06-01 ~20:27 UTC, the live weather bot runs on `trooth-prod-nyc3` (DigitalOcean droplet, NYC3), NOT on the Mac.** Mac repo + state preserved as fallback at `~/Projects/trooth-weather-bot/` (untouched) and `~/Projects/trooth-weather-bot/data/backups/pre_cloud_migration_2026-06-01/` (snapshots). Cloud-migration plan in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/cloud_migration_plan_2026-05-29.md`; session prompts + log at `code_prompt_cloud_migration_session{1,2}_2026-06-01.md` + `session_log_2026-06-01.md` in the same folder.
+
+- **SSH into the server:** `ssh trooth-server` (alias, Tailnet-routed). The repo lives at `/home/trooth/Projects/trooth-weather-bot`. Cutover commit: `ae3ced4` (`origin/main` HEAD as of 2026-06-01).
+- **Live unit:** `trooth-weather-bot.service` (enabled, active). `sudo systemctl status trooth-weather-bot` from the server, or `sudo journalctl -u trooth-weather-bot -f` to tail logs. ExecStart is `.venv/bin/python run.py`. The unit sets `RAILWAY_ENVIRONMENT=systemd-production` (defeats uvicorn auto-reload) and `PYTHONUNBUFFERED=1` (so `print()` calls in the boot dump flush immediately through systemd's stdout pipe). EnvironmentFile is `/home/trooth/.config/trooth/weather.env` (mode 600).
+- **Kalshi daily calibration:** `trooth-kalshi-calibration.timer` fires at 05:15 UTC daily (16 min after Kalshi resolves at 04:59 UTC), invoking the calibration script for yesterday's UTC date. Writes to `/home/trooth/.local/state/trooth/kalshi_calibration_history.csv` (env-controlled by `KALSHI_CALIBRATION_CSV_PATH`). The Mac launchd job `com.trooth.kalshi-calibration` was unloaded but the plist remains at `~/Library/LaunchAgents/` as a break-glass fallback.
+- **Rollback procedure (next 7 days):** `sudo systemctl disable --now trooth-weather-bot trooth-kalshi-calibration.timer` on the server, then `~/Projects/trooth-weather-bot/scripts/run_backend.sh` in a fresh Mac Tab 1, then `launchctl load ~/Library/LaunchAgents/com.trooth.kalshi-calibration.plist`. Mac DB is intact at the 2026-06-01 20:25:46 UTC quiescent state.
+- **Server-side state path map:**
+
+  | What | Where |
+  |---|---|
+  | Repo | `/home/trooth/Projects/trooth-weather-bot/` |
+  | venv | `/home/trooth/Projects/trooth-weather-bot/.venv/` (Python 3.12.3) |
+  | Live `tradingbot.db` | `/home/trooth/Projects/trooth-weather-bot/tradingbot.db` |
+  | Env file | `/home/trooth/.config/trooth/weather.env` (mode 600) |
+  | Kalshi PEM | `/home/trooth/.config/trooth/kalshi_private_key.pem` (mode 600) |
+  | Calibration CSV | `/home/trooth/.local/state/trooth/kalshi_calibration_history.csv` |
+  | Backups | `/home/trooth/.local/state/trooth/backups/` (empty; DO Spaces sync pending Session 4) |
+
+**Three commits shipped to support the cutover** (already in `origin/main`):
+
+- `016f408` — `feat(kalshi): self-sufficient CSV writer, replaces Cowork-parsed output` (so the unattended calibration run writes a CSV row without a Cowork agent parsing stdout). Soak-tested for 3 nights on Mac launchd before shipping.
+- `ac5ec77` — `chore(deps): bump pandas pin 2.1.4 -> 3.0.3 to match live Mac venv`. The pinned 2.1.4 conflicted with `xarray==2026.4.0` (needs pandas≥2.2). The Mac venv had been running 3.0.3 since the NOMADS work — requirements just hadn't caught up.
+- `ae3ced4` — `feat(kalshi): env-overridable CSV path for cross-host portability`. Reads `KALSHI_CALIBRATION_CSV_PATH` env, falls back to the Mac Desktop default. Lets the server write to a server-side path without needing a `/home/trooth/Desktop/` tree.
+
+**Tech debt acknowledged in the unit file:** the `RAILWAY_ENVIRONMENT=systemd-production` repurpose is a side-channel — clean fix is a dedicated `WEATHER_BOT_RELOAD` env var read by `run.py:74`. Not blocking; tracked for a follow-up.
+
+## Operational notes (added 2026-06-05)
+
+Audit remediation (CRITICALs #4/#5 + HIGHs #8/#17/#21 on this bot). Shipped live with per-file backups (`*.bak_*_20260605`). No entry/sizing/exit-strategy change.
+
+- **`scheduler.shutdown(wait=True)`** (was `wait=False`, `scheduler.py:~695`) — in-flight scan/settlement jobs finish before exit on stop (#4).
+- **Allocation cap now re-checked in-loop (#5)** — new `weather_alloc_running` accumulator in `weather_scan_and_trade_job`; breaks once `weather_pending + running + trade_size > WEATHER_MAX_ALLOCATION_USD`. Mirrors the 5/28 per-day-cap structure; closes the burst-overshoot-by-$300 gap. Don't remove either the pre-loop early-return or the in-loop break — they're belt-and-suspenders.
+- **SQLite WAL + busy_timeout=5000 (#8)** — connect-event listener in `backend/models/database.py`, gated on `sqlite` in the URL so it no-ops against a future Postgres. Fixes dashboard "database is locked" overlap.
+- **APScheduler hardening (#17)** — all 5 `add_job` calls now carry `coalesce=True, misfire_grace_time=60` (collapses missed-tick bursts).
+- **Kalshi finalized-but-empty (#21)** — `settlement.py` now logs a WARNING ("void-pending-review: <ticker>") instead of silently re-polling forever. Still returns no-settle; does not force-settle.
+- **Deferred:** #9 (API auth token — needs coordinated FE `api.ts` + BE + frontend rebuild; endpoints are 127.0.0.1-only), #13 (stop-loss calibration backfill — moot while `WEATHER_STOP_LOSS_ENABLED=false`), #23 (dead 5% Kelly cap — would change low-bankroll sizing, left as-is), #12 (winning_trades KPI denominator — wants a careful pass).
+
+Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-05.md`.
+
+## Operational notes (added 2026-06-08)
+
+- **Kalshi calibration probe was broken-by-timing since the 6/1 server migration.** Kalshi now finalizes resolutions LATER than the documented 04:59 UTC, so the 05:15 UTC probe always saw all-pending and wrote `0/0` rows. Fixed 2026-06-07: backfilled 5/29–6/6 by re-running the probe per date (CSV upserts by date; backup `kalshi_calibration_history.csv.bak_20260607`), and added a **second `OnCalendar` at 22:00 UTC** to `trooth-kalshi-calibration.timer` (backup `.bak_20260607`) — the early run's empty row self-corrects. First 22:00 firing verified live.
+- **Re-enable gate after rebuild: NOT CLOSE.** Most-recent-5 graded days 11/24 (46%), rolling-10 17/49 (35%) vs the ≥7/10 + ≥4/5 bar (70–80%). Trend is up — late May ~20% (chance ≈17%), June ~46%. `KALSHI_TRADING_ENABLED` stays false; flag untouched.
+- **Deployed == version-controlled as of `65f2476`** (audit #4/#5/#8/#17/#21 patches committed retroactively + `.gitignore` rules for the `*.db-shm`/`*.db-wal` WAL sidecars). Server deploy key is read-only — push via Mac relay (`git fetch trooth-server:<repo> main`, then `git push origin FETCH_HEAD:main` from the Mac).
+
+Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-08.md`.
+
 ## Today's open carryovers
 
-Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-05-28.md`, next-session briefing: `morning_briefing_2026-05-29.md`). As of EOD 2026-05-28: bankroll $9,152.72, realized P&L −$347.28. The bot was untouched on the trading side today — only filter/cap/observability changes shipped (per-day position cap `5681db2`, boot dump `1cdae91`). Carryover unchanged: re-decide `WEATHER_DISABLE_YES_ENTRIES` once the 3 open YES positions settle and the YES/above sample grows from n=4 to n=7.
+Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-06-01.md`, this morning's briefing: `08_morning_briefing_2026-06-01.md`). As of cutover (2026-06-01 20:27 UTC): bankroll $9,193.72, realized P&L −$406.28, 49 trades, 4 open pending positions (#45 Polymarket 2391290, #46 Polymarket 2400011, #47 Polymarket 2407003, #48 Polymarket 2407026, all NO @ $100). Carryover: re-decide `WEATHER_DISABLE_YES_ENTRIES` once the YES/above sample grows from n=4 to n=7. Next session (3): migrate Claude bot + dashboard to the same droplet.
