@@ -311,6 +311,19 @@ async def _fetch_kalshi_resolution(ticker: str) -> Tuple[bool, Optional[float]]:
                 )
                 return False, None
 
+        # Audit HIGH #21 (2026-06-05): status is finalized/determined but
+        # result was empty/falsy -- Kalshi has closed the market on its end
+        # but hasn't published a result code yet. Previously fell through to
+        # the silent `return False, None` below, producing an invisible
+        # re-poll loop. Surface it so the operator can intervene if it
+        # persists past the normal short window between finalize + result.
+        if status in ("finalized", "determined"):
+            logger.warning(
+                f"Kalshi finalized with empty result -- "
+                f"void-pending-review: {ticker} (status={status!r})"
+            )
+            return False, None
+
         return False, None
 
     except Exception as e:

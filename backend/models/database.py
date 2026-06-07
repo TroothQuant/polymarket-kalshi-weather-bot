@@ -1,7 +1,7 @@
 """Database models and connection for BTC 5-min trading bot."""
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, JSON, text
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean, JSON, text, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import inspect
@@ -13,6 +13,26 @@ engine = create_engine(
     settings.DATABASE_URL,
     connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
 )
+
+
+# Audit HIGH #8 (2026-06-05): WAL mode lets readers (eg the FastAPI /api
+# routes serving the dashboard) coexist with the scheduler's writers without
+# locking up the DB. busy_timeout=5000 means SQLite will sleep up to 5s on a
+# lock contention before raising — eliminates spurious "database is locked"
+# errors from short overlap between scan/settlement/dashboard transactions.
+# Listener fires on every new dbapi connection (and pool checkouts re-use
+# existing connections — listener does not re-run), so this is one-time per
+# connection. Safe to leave unconditional; PRAGMA on non-SQLite no-ops are
+# avoided because this listener is only attached for SQLite URLs.
+if "sqlite" in settings.DATABASE_URL:
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=5000")
+        cur.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 

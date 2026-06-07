@@ -15,6 +15,9 @@ build/
 
 # Database
 *.db
+# SQLite WAL sidecar files (audit #8, 2026-06-05: journal_mode=WAL)
+*.db-shm
+*.db-wal
 *.sqlite3
 
 # Environment

@@ -276,6 +276,7 @@ async def weather_scan_and_trade_job():
                 return
 
             trades_executed = 0
+            weather_alloc_running = 0.0
             # Kalshi kill-switch budget-starvation fix (2026-05-21): when
             # KALSHI_TRADING_ENABLED=False, filter Kalshi signals OUT of the
             # actionable list BEFORE applying MAX_TRADES_PER_SCAN. Otherwise
@@ -363,6 +364,21 @@ async def weather_scan_and_trade_job():
                     )
                     break
 
+                # Allocation cap break (CRITICAL #5, 2026-06-05): mirror of the
+                # per-day-cap pattern above. weather_pending is the scan-start
+                # snapshot of size-on-the-book; weather_alloc_running is what
+                # THIS scan has opened so far. Breaks mid-scan once the dollar
+                # budget would be exceeded by adding this candidate's stake.
+                # Belt-and-suspenders with the pre-loop early return at ~line 249.
+                if weather_pending + weather_alloc_running + trade_size > MAX_WEATHER_ALLOCATION:
+                    log_event(
+                        "info",
+                        f"[blocked] WEATHER_MAX_ALLOCATION_USD=${MAX_WEATHER_ALLOCATION:.0f} would be exceeded "
+                        f"(pending ${weather_pending:.0f} + ${weather_alloc_running:.0f} this scan + ${trade_size:.0f}); "
+                        f"deferring remaining candidate(s)."
+                    )
+                    break
+
                 entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
 
                 # Use the signal's platform so Kalshi trades save as "kalshi"
@@ -401,6 +417,7 @@ async def weather_scan_and_trade_job():
 
                 state.total_trades += 1
                 trades_executed += 1
+                weather_alloc_running += trade_size
 
                 log_event("trade",
                     f"WX {signal.market.city_name}: {signal.direction.upper()} "
@@ -623,7 +640,9 @@ def start_scheduler():
             IntervalTrigger(seconds=scan_seconds),
             id="market_scan",
             replace_existing=True,
-            max_instances=1
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
         )
 
     # Check settlements every 2 minutes
@@ -632,7 +651,9 @@ def start_scheduler():
         IntervalTrigger(seconds=settle_seconds),
         id="settlement_check",
         replace_existing=True,
-        max_instances=1
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
 
     # Heartbeat every minute
@@ -641,7 +662,9 @@ def start_scheduler():
         IntervalTrigger(minutes=1),
         id="heartbeat",
         replace_existing=True,
-        max_instances=1
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
 
     # Weather trading jobs (gated by WEATHER_ENABLED)
@@ -655,6 +678,8 @@ def start_scheduler():
             id="weather_scan",
             replace_existing=True,
             max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
         )
 
         # Stop-loss check (added 2026-05-19): mark-to-market open weather
@@ -666,6 +691,8 @@ def start_scheduler():
                 id="weather_stop_loss",
                 replace_existing=True,
                 max_instances=1,
+                coalesce=True,
+                misfire_grace_time=60,
             )
 
     scheduler.start()
@@ -692,7 +719,7 @@ def stop_scheduler():
         log_event("info", "Scheduler not running")
         return
 
-    scheduler.shutdown(wait=False)
+    scheduler.shutdown(wait=True)
     scheduler = None
     log_event("info", "Scheduler stopped")
 
