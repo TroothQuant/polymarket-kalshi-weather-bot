@@ -405,15 +405,16 @@ async def get_stats(db: Session = Depends(get_db)):
     # stop_loss_count + stop_loss_rate as their own metric.
     stop_loss_count = db.query(Trade).filter(Trade.result == "stop_loss").count()
     resolved_count = db.query(Trade).filter(Trade.result.in_(["win", "loss"])).count()
+    win_count = db.query(Trade).filter(Trade.result == "win").count()
     settled_count = stop_loss_count + resolved_count
 
-    win_rate = state.winning_trades / resolved_count if resolved_count > 0 else 0.0
+    win_rate = win_count / resolved_count if resolved_count > 0 else 0.0
     stop_loss_rate = stop_loss_count / settled_count if settled_count > 0 else 0.0
 
     return BotStats(
         bankroll=state.bankroll,
         total_trades=state.total_trades,
-        winning_trades=state.winning_trades,
+        winning_trades=win_count,
         win_rate=win_rate,
         total_pnl=state.total_pnl,
         weather_pnl_by_platform=_compute_weather_pnl_by_platform(db),
