@@ -10,6 +10,7 @@ export function StatsCards({ stats }: Props) {
   const returnPercent = stats.bankroll - stats.total_pnl > 0
     ? ((stats.total_pnl / (stats.bankroll - stats.total_pnl)) * 100)
     : 0
+  const wx = stats.weather_pnl_by_platform
 
   return (
     <div className="flex items-center gap-3">
@@ -31,6 +32,30 @@ export function StatsCards({ stats }: Props) {
           {returnPercent >= 0 ? '+' : ''}{returnPercent.toFixed(1)}%
         </span>
       </motion.div>
+
+      {wx && (
+        <>
+          <div className="w-px h-3 bg-neutral-800" />
+
+          <motion.div className="flex items-center gap-1.5" initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.075 }}>
+            <span className="text-[10px] text-neutral-600 uppercase">WX</span>
+            <span className="text-[10px] text-neutral-600">Poly</span>
+            <span className={`text-sm font-semibold tabular-nums ${wx.polymarket >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+              {wx.polymarket >= 0 ? '+' : ''}${Math.abs(wx.polymarket).toFixed(0)}
+            </span>
+            <span className="text-[10px] text-neutral-600 tabular-nums">{wx.polymarket_trades}</span>
+            <span className="text-[10px] text-neutral-600">Kal</span>
+            <span className={`text-sm font-semibold tabular-nums ${wx.kalshi >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+              {wx.kalshi >= 0 ? '+' : ''}${Math.abs(wx.kalshi).toFixed(0)}
+            </span>
+            <span className="text-[10px] text-neutral-600 tabular-nums">{wx.kalshi_trades}</span>
+            <span className="text-[10px] text-neutral-600">Net</span>
+            <span className={`text-sm font-semibold tabular-nums ${wx.total >= 0 ? 'text-green-500' : 'text-red-500'}`}>
+              {wx.total >= 0 ? '+' : ''}${Math.abs(wx.total).toFixed(0)}
+            </span>
+          </motion.div>
+        </>
+      )}
 
       <div className="w-px h-3 bg-neutral-800" />
 

@@ -67,12 +67,21 @@ export interface Trade {
   pnl: number | null
 }
 
+export interface WeatherPnlByPlatform {
+  polymarket: number
+  kalshi: number
+  total: number
+  polymarket_trades: number
+  kalshi_trades: number
+}
+
 export interface BotStats {
   bankroll: number
   total_trades: number
   winning_trades: number
   win_rate: number
   total_pnl: number
+  weather_pnl_by_platform?: WeatherPnlByPlatform | null
   is_running: boolean
   last_run: string | null
 }

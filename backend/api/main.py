@@ -2,6 +2,7 @@
 from fastapi import FastAPI, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from datetime import datetime, timedelta
 from typing import List, Optional
 import asyncio
@@ -169,12 +170,21 @@ class TradeResponse(BaseModel):
     edge_at_entry: Optional[float] = None
 
 
+class WeatherPnlByPlatform(BaseModel):
+    polymarket: float
+    kalshi: float
+    total: float
+    polymarket_trades: int
+    kalshi_trades: int
+
+
 class BotStats(BaseModel):
     bankroll: float
     total_trades: int
     winning_trades: int
     win_rate: float
     total_pnl: float
+    weather_pnl_by_platform: Optional[WeatherPnlByPlatform] = None
     is_running: bool
     last_run: Optional[datetime]
     # Audit 2026-05-19 HIGH #9: previously win_rate was
@@ -363,6 +373,26 @@ async def health():
     return {"status": "healthy"}
 
 
+def _compute_weather_pnl_by_platform(db: Session) -> WeatherPnlByPlatform:
+    rows = (db.query(Trade.platform,
+                     func.coalesce(func.sum(Trade.pnl), 0.0),
+                     func.count())
+              .filter(Trade.market_type == "weather",
+                      Trade.settled == True,
+                      Trade.pnl.isnot(None))
+              .group_by(Trade.platform).all())
+    by = {p: (float(pnl), int(n)) for p, pnl, n in rows}
+    poly_pnl, poly_n = by.get("polymarket", (0.0, 0))
+    kal_pnl, kal_n = by.get("kalshi", (0.0, 0))
+    return WeatherPnlByPlatform(
+        polymarket=round(poly_pnl, 2),
+        kalshi=round(kal_pnl, 2),
+        total=round(poly_pnl + kal_pnl, 2),
+        polymarket_trades=poly_n,
+        kalshi_trades=kal_n,
+    )
+
+
 @app.get("/api/stats", response_model=BotStats)
 async def get_stats(db: Session = Depends(get_db)):
     state = db.query(BotState).first()
@@ -386,6 +416,7 @@ async def get_stats(db: Session = Depends(get_db)):
         winning_trades=state.winning_trades,
         win_rate=win_rate,
         total_pnl=state.total_pnl,
+        weather_pnl_by_platform=_compute_weather_pnl_by_platform(db),
         is_running=state.is_running,
         last_run=state.last_run,
         stop_loss_count=stop_loss_count,
