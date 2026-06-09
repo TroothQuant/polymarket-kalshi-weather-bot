@@ -256,6 +256,11 @@ Weather is now the **primary book** (the Claude bot was put on probation — see
 - **#9 (API auth)** — closed on the **already-present** incumbent `require_auth_token` (Bearer / `API_AUTH_TOKEN`, fail-open-when-unset, endpoints bind 127.0.0.1). A redundant `WEATHER_API_TOKEN` layer added by mistake was reverted. Intentionally inert — no public surface (no frontend served on the droplet; React runs Mac-local via SSH tunnel).
 - **#7 (`WEATHER_DISABLE_YES_ENTRIES`) — decided KEEP `true`.** Clean YES sample now past n=7 and still loses (4W/6 honest losses, −$257 ex-stops); NO is the engine (+$766). Evidence-backed close.
 
+**Weather-widening direction (analysis only, nothing built/changed in the live bot):**
+
+- **Temperature coord lever is CLOSED.** NYC/Denver settlement-station re-analysis (the 5/29 carryover) → HOLD both at current coords (NYC 82%=82% tie vs KLGA; Denver current 100% > KBKF 80%). All 5 temp cities now validated well-sited. Doc: `nyc_denver_coord_validation_2026-06-09.md`.
+- **Precipitation validated as the next book (gate PASSED, NOT yet built).** GEFS probability-of-rain calibration backtest, `scripts/precip_calibration_backtest_2026-06-09.py` (committed `11a3d86`; reuses `nomads_gfs_hindcast.py` + adds APCP — **GEFS APCP is 6h buckets, so a UTC day = f030+f036+f042+f048 of the D-1 00z run**). 78 city-days: **Brier 0.082 vs 0.249 climatology, BSS +0.67.** Tier-1 trade Atlanta/Boston/NYC (BSS +0.79–0.89); Tier-2 size-down Dallas/Denver (use ≥0.10″ — 0.01″ has trace-boundary noise); **exclude San Francisco (no skill, marine regime).** Doc: `precip_calibration_backtest_2026-06-09.md`. **Building the precip category needs operator GO** + a local-day accumulation window (the backtest used UTC day) + a rain settlement parser (NYC rain settles on **Central Park**, not the LGA temp station) + per-city tiering, then paper-confirm. Validated only at 24–48h lead.
+
 Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-09.md`.
 
 ## Today's open carryovers
