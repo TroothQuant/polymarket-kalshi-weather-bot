@@ -247,6 +247,17 @@ Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-0
 
 Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-08.md`.
 
+## Operational notes (added 2026-06-09)
+
+Weather is now the **primary book** (the Claude bot was put on probation — see that repo's CLAUDE.md). Two backend changes shipped (view/KPI only, no trading change):
+
+- **`/api/stats` now returns `weather_pnl_by_platform`** (`92ae6d3`) — a `GROUP BY platform` realized-P&L sum over settled `market_type='weather'` trades: `{polymarket, kalshi, total, polymarket_trades, kalshi_trades}`. Pure computed view; `total_pnl` unchanged. Live: **Polymarket +$448.95 (37) / Kalshi −$464.79 (12) / net −$15.84** — the blended −$15.84 was hiding a profitable Polymarket book dragged to breakeven by the dead Kalshi book. Kalshi −$464.79 is real model loss (why `KALSHI_TRADING_ENABLED=false`), not an error.
+- **#12 win-rate KPI fix (`d1fc667`)** — `get_stats` derives `winning_trades` from the DB (`Trade.result=="win"`) so numerator + denominator are both DB-derived (kills `state.winning_trades` counter drift). KPI-only.
+- **#9 (API auth)** — closed on the **already-present** incumbent `require_auth_token` (Bearer / `API_AUTH_TOKEN`, fail-open-when-unset, endpoints bind 127.0.0.1). A redundant `WEATHER_API_TOKEN` layer added by mistake was reverted. Intentionally inert — no public surface (no frontend served on the droplet; React runs Mac-local via SSH tunnel).
+- **#7 (`WEATHER_DISABLE_YES_ENTRIES`) — decided KEEP `true`.** Clean YES sample now past n=7 and still loses (4W/6 honest losses, −$257 ex-stops); NO is the engine (+$766). Evidence-backed close.
+
+Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-09.md`.
+
 ## Today's open carryovers
 
 Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-06-01.md`, this morning's briefing: `08_morning_briefing_2026-06-01.md`). As of cutover (2026-06-01 20:27 UTC): bankroll $9,193.72, realized P&L −$406.28, 49 trades, 4 open pending positions (#45 Polymarket 2391290, #46 Polymarket 2400011, #47 Polymarket 2407003, #48 Polymarket 2407026, all NO @ $100). Carryover: re-decide `WEATHER_DISABLE_YES_ENTRIES` once the YES/above sample grows from n=4 to n=7. Next session (3): migrate Claude bot + dashboard to the same droplet.
