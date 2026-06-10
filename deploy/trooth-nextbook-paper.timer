@@ -1,0 +1,13 @@
+# Every 2h — covers the EU (UTC 05-13) and US (UTC 11-19) pre-peak windows.
+# Off-window runs just settle yesterday + skip (cheap, read-only).
+[Unit]
+Description=Next-book paper harness timer (every 2h)
+Requires=trooth-nextbook-paper.service
+
+[Timer]
+OnCalendar=*-*-* 00/2:00:00 UTC
+Persistent=true
+Unit=trooth-nextbook-paper.service
+
+[Install]
+WantedBy=timers.target

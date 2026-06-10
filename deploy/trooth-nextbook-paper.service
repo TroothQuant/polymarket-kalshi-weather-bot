@@ -1,0 +1,17 @@
+# Standalone next-book PAPER harness (expansion temp cities). Paper-only sandbox:
+# writes ONLY to ~/.local/state/trooth/nextbook_paper.{db,ledger.csv}. NEVER touches
+# the live weather service, tradingbot.db, or its config. Runs from the isolated
+# nextbook-paper worktree using the main bot's venv interpreter (read-only use).
+[Unit]
+Description=TROOTH next-book PAPER harness (paper-only expansion sandbox)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=trooth
+Group=trooth
+WorkingDirectory=/home/trooth/Projects/trooth-weather-nextbook
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/trooth/Projects/trooth-weather-bot/.venv/bin/python /home/trooth/Projects/trooth-weather-nextbook/scripts/nextbook_paper_harness.py
+StandardOutput=journal
+StandardError=journal
