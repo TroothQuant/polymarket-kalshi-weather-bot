@@ -263,6 +263,17 @@ Weather is now the **primary book** (the Claude bot was put on probation — see
 
 Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-09.md`.
 
+## Operational notes (added 2026-06-10)
+
+**Next book = temperature-book EXPANSION, now in paper validation (GATE 4).** Precip was shelved (Polymarket sells only thin monthly-cumulative precip buckets). The validated path is adding more of the SAME daily high-temp markets Polymarket already lists (~46 cities, 2–8¢ middle spreads). GEFS-NOMADS calibration "failed" but the REDO with the bot's actual open-meteo GFS source proved the tool was the confound (Dallas MAE 4.88→0.91°F); 5 cities cleared a control anchor (Dallas/Paris/London/Austin/BA), Atlanta/Seattle/Madrid/Sao Paulo are genuine non-edges.
+
+- **Isolated paper sandbox — NOT wired into the live service.** Branch + worktree **`nextbook-paper`** at `/home/trooth/Projects/trooth-weather-nextbook` (live `main` worktree untouched). Harness `scripts/nextbook_paper_harness.py` + `nextbook_cities.json`. Writes ONLY to `~/.local/state/trooth/nextbook_paper.{db,ledger.csv}` — **never `tradingbot.db`**. Runs via `trooth-nextbook-paper.timer` (every 2h). Uses the main bot's `.venv` interpreter (read-only).
+- **Active: Austin + Dallas** (settlement stations verified from market text: **Dallas = Love Field KDAL, not DFW**; Austin = Bergstrom). **London/Paris** config-gated `enabled:false` (flip on once the pre-peak filter is validated for their UTC windows). **Buenos Aires excluded** (Southern-Hemisphere winter model overconfidence). Hard per-city pre-peak entry filter; selection ranks by edge and honors the live caps (5/day, $1,500).
+- **Pre-committed GO bar (review ~2026-07-01):** ≥15 settled/city + ≥25 total; within-1-bucket ≥73% (control floor) + no overconfidence; mean realized edge ≥ +0.05 AND aggregate paper P&L > 0; 100% pre-peak discipline. Documented in `weather_nextbook_calibration_2026-06-10.md`. **All four must hold → then Jonathon's live-GO to merge a city as a second book.** No live money yet.
+- Docs: `weather_nextbook_discovery_2026-06-10.md`, `weather_nextbook_calibration_2026-06-10.md`. Branch `c2293ee` relay-pushed (not merged).
+
+Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-10.md`.
+
 ## Today's open carryovers
 
 Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-06-01.md`, this morning's briefing: `08_morning_briefing_2026-06-01.md`). As of cutover (2026-06-01 20:27 UTC): bankroll $9,193.72, realized P&L −$406.28, 49 trades, 4 open pending positions (#45 Polymarket 2391290, #46 Polymarket 2400011, #47 Polymarket 2407003, #48 Polymarket 2407026, all NO @ $100). Carryover: re-decide `WEATHER_DISABLE_YES_ENTRIES` once the YES/above sample grows from n=4 to n=7. Next session (3): migrate Claude bot + dashboard to the same droplet.
