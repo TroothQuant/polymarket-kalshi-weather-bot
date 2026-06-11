@@ -38,3 +38,8 @@ orjson==3.9.10
 # wheel so no separate `brew install eccodes` step is required.
 cfgrib==0.9.15.1
 xarray==2026.4.0
+
+# Weather LIVE execution (G2, weather-live-v1). NOT loaded on the paper path —
+# only imported by backend/core/live_trader.py when WEATHER_LIVE_TRADING=True.
+# Same pin as the soak-tested Claude bot.
+py-clob-client>=0.0.1

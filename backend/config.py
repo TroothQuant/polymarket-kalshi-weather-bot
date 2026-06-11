@@ -14,6 +14,23 @@ class Settings(BaseSettings):
     # API Keys (optional)
     POLYMARKET_API_KEY: Optional[str] = None
 
+    # ─── Weather LIVE execution (G2, weather-live-v1 branch) ──────────────────
+    # MASTER kill-switch — ships False and STAYS False through G2. First live
+    # order is G3 only (Jonathon's GO), after G0 clears n>=20 and the wallet is
+    # funded. Nothing below this line is reachable while WEATHER_LIVE_TRADING is
+    # False; the live trader is never even imported on the paper path.
+    WEATHER_LIVE_TRADING: bool = False
+    WEATHER_LIVE_MAX_TRADE_USD: float = 2.0        # hard per-trade $ cap at G3 smoke
+    WEATHER_LIVE_DAILY_LOSS_STOP_USD: float = 10.0  # daily realized-loss kill-switch (live only)
+    CLOB_HOST: str = "https://clob.polymarket.com"
+    POLYMARKET_CHAIN_ID: int = 137                  # Polygon
+    POLYMARKET_SIGNATURE_TYPE: int = 0             # match the wallet type set at G1
+    POLYMARKET_PRIVATE_KEY: Optional[str] = None    # from server secrets, mode 600
+    POLYMARKET_FUNDER_ADDRESS: Optional[str] = None
+    # optional pre-generated CLOB creds (else derived at trader init):
+    POLYMARKET_API_SECRET: Optional[str] = None
+    POLYMARKET_API_PASSPHRASE: Optional[str] = None
+
     # Kalshi API
     KALSHI_API_KEY_ID: Optional[str] = None
     KALSHI_PRIVATE_KEY_PATH: Optional[str] = None

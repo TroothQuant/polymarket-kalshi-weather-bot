@@ -81,6 +81,12 @@ class WeatherMarket:
     # (yes_ask + (1 - no_ask)) / 2 instead. Default = yes_price for backward
     # compatibility with existing Polymarket call sites.
     implied_yes_prob: float = -1.0  # sentinel; resolved on access via .implied_or_yes()
+    # P0 (2026-06-11, weather-live-v1): CLOB token IDs + condition_id are required
+    # to post a live order. The paper path ignores these; the live path REQUIRES
+    # them and must refuse any market missing them (never guess a token_id).
+    token_id_yes: str = ""
+    token_id_no: str = ""
+    condition_id: str = ""
 
     def implied_or_yes(self) -> float:
         """Return the implied YES probability for edge math.
@@ -312,6 +318,20 @@ def _parse_polymarket_weather(
 
     volume = float(market_data.get("volume", 0) or 0)
 
+    # P0: capture CLOB token IDs + conditionId for the live path. clobTokenIds is
+    # JSON-encoded string OR array (same quirk as outcomePrices) and is ordered
+    # [yes_token, no_token] to match outcomes/outcomePrices.
+    token_ids_raw = market_data.get("clobTokenIds", [])
+    if isinstance(token_ids_raw, str):
+        import json
+        try:
+            token_ids_raw = json.loads(token_ids_raw)
+        except Exception:
+            token_ids_raw = []
+    token_id_yes = str(token_ids_raw[0]) if len(token_ids_raw) >= 1 else ""
+    token_id_no = str(token_ids_raw[1]) if len(token_ids_raw) >= 2 else ""
+    condition_id = str(market_data.get("conditionId", "") or "")
+
     return WeatherMarket(
         slug=event_slug,
         market_id=str(market_data.get("id", "")),
@@ -326,4 +346,7 @@ def _parse_polymarket_weather(
         yes_price=yes_price,
         no_price=no_price,
         volume=volume,
+        token_id_yes=token_id_yes,
+        token_id_no=token_id_no,
+        condition_id=condition_id,
     )
