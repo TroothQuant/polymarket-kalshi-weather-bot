@@ -38,8 +38,12 @@ class WeatherLiveTrader:
             signature_type=cfg.POLYMARKET_SIGNATURE_TYPE,
             funder=cfg.POLYMARKET_FUNDER_ADDRESS or None,
         )
-        # Pre-generated CLOB creds if provided, else derive (network call).
-        if cfg.POLYMARKET_API_KEY and cfg.POLYMARKET_API_SECRET:
+        # Pre-generated CLOB creds only when ALL THREE are present: the existing
+        # POLYMARKET_API_KEY (config block above the live block) plus the new
+        # POLYMARKET_API_SECRET / _PASSPHRASE. Otherwise derive them on-chain from
+        # the private key (a network call at init).
+        if (cfg.POLYMARKET_API_KEY and cfg.POLYMARKET_API_SECRET
+                and cfg.POLYMARKET_API_PASSPHRASE):
             from py_clob_client.clob_types import ApiCreds
             self.client.set_api_creds(ApiCreds(
                 api_key=cfg.POLYMARKET_API_KEY,
@@ -75,6 +79,31 @@ class WeatherLiveTrader:
             log.warning(f"Weather live balance check failed: {e}")
             return None
 
+    @staticmethod
+    def _parse_fill(resp: dict, order_id, size_usd: float, fallback_price: float) -> Optional[dict]:
+        """Resolve ACTUAL fill economics from a CLOB order response.
+
+        `fill_price` is the REALIZED AVERAGE (cost / shares), so a stored row with
+        size=cost and entry_price=fill_price implies EXACTLY `shares` via the
+        settlement identity shares = size / entry_price. Returns None when no
+        shares filled, so the caller writes no row.
+        """
+        cost = float(size_usd)
+        shares = size_usd / fallback_price if fallback_price > 0 else 0.0
+        try:
+            making = float(resp.get("makingAmount", 0))  # USDC paid
+            taking = float(resp.get("takingAmount", 0))  # conditional tokens received
+            if making > 0:
+                cost = making
+            if taking > 0:
+                shares = taking
+        except (ValueError, TypeError):
+            pass
+        if shares <= 0:
+            return None
+        return {"order_id": order_id, "fill_price": cost / shares,
+                "shares": shares, "cost": cost}
+
     def execute_buy(self, token_id: str, size_usd: float, market_price: float) -> Optional[dict]:
         """Post a GTC BUY, poll 5×3s for MATCHED, cancel-if-unfilled. Returns
         {order_id, fill_price, shares, cost} on a confirmed fill, else None (so
@@ -89,17 +118,6 @@ class WeatherLiveTrader:
             signed_order = self.client.create_order(order_args)
             resp = self.client.post_order(signed_order, OrderType.GTC)
             order_id = resp.get("orderID") or resp.get("id")
-            actual_cost = size_usd
-            actual_shares = size_usd / args["price"] if args["price"] > 0 else 0.0
-            try:
-                making = float(resp.get("makingAmount", 0))
-                taking = float(resp.get("takingAmount", 0))
-                if making > 0:
-                    actual_cost = making
-                if taking > 0:
-                    actual_shares = taking
-            except (ValueError, TypeError):
-                pass
             log.info(f"Weather live CLOB GTC order submitted: {order_id}")
         except Exception as e:
             log.error(f"Weather live CLOB order failed: {e}")
@@ -129,10 +147,13 @@ class WeatherLiveTrader:
                 log.warning(f"Weather live cancel failed: {e}")
             return None
 
-        fill_price = actual_cost / actual_shares if actual_shares > 0 else args["price"]
-        log.info(f"Weather live fill: ${actual_cost:.2f} ({actual_shares:.2f} sh @ {fill_price:.4f})")
-        return {"order_id": order_id, "fill_price": fill_price,
-                "shares": actual_shares, "cost": actual_cost}
+        fill = self._parse_fill(resp, order_id, size_usd, args["price"])
+        if fill is None:
+            log.warning("Weather live order MATCHED but reported zero shares — treating as non-fill")
+            return None
+        log.info(f"Weather live fill: ${fill['cost']:.2f} "
+                 f"({fill['shares']:.2f} sh @ {fill['fill_price']:.4f})")
+        return fill
 
     def redeem_won(self, condition_id: str):
         """G2b SKELETON — claim winnings on a resolved-WON live position.

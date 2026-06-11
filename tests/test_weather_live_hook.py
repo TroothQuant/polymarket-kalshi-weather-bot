@@ -14,9 +14,10 @@ from backend.core.scheduler import resolve_weather_live
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
-def _signal(direction="yes", platform="polymarket", token_yes="YESTOK", token_no="NOTOK"):
+def _signal(direction="yes", platform="polymarket", token_yes="YESTOK", token_no="NOTOK",
+            market_type="weather"):
     market = types.SimpleNamespace(
-        platform=platform, market_id="2400000", slug="slug",
+        platform=platform, market_type=market_type, market_id="2400000", slug="slug",
         token_id_yes=token_yes, token_id_no=token_no,
         model_probability=0.6, threshold_f=90.0, direction="above",
         metric="high", city_name="Chicago",
@@ -72,6 +73,12 @@ def test_flag_off_is_paper():
 def test_kalshi_can_never_go_live():
     # platform != polymarket → paper even with the flag ON and no db/factory used.
     d = resolve_weather_live(_signal(platform="kalshi"), 50.0, 0.40, None, _settings(live=True), None)
+    assert d.action == "paper"
+
+
+def test_non_weather_can_never_go_live():
+    # market_type != weather → paper even with the flag ON (belt-and-suspenders).
+    d = resolve_weather_live(_signal(market_type="btc"), 50.0, 0.40, None, _settings(live=True), None)
     assert d.action == "paper"
 
 

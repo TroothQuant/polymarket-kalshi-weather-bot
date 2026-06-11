@@ -55,3 +55,27 @@ def test_dryrun_touches_no_network_or_crypto():
     assert set(a.keys()) == {"token_id", "price", "amount", "side"}
     # constructing the order required neither py-clob-client nor any network.
     assert "py_clob_client" not in sys.modules
+
+
+# ── _parse_fill: fill_price is the realized average (cost/shares) ─────────────
+def test_parse_fill_price_is_realized_average_and_implies_shares():
+    f = WeatherLiveTrader._parse_fill(
+        {"makingAmount": "1.68", "takingAmount": "4.0"}, "OID", 2.0, 0.42)
+    assert f["cost"] == 1.68 and f["shares"] == 4.0
+    assert abs(f["fill_price"] - 1.68 / 4.0) < 1e-12
+    # the settlement identity: shares = size / entry_price (within rounding)
+    assert abs(f["cost"] / f["fill_price"] - f["shares"]) < 1e-9
+
+
+def test_parse_fill_fallback_consistent_when_no_amounts():
+    # No making/taking in the response → cost=size, shares=size/price, and the
+    # identity still holds with fill_price == the order price.
+    f = WeatherLiveTrader._parse_fill({}, "OID", 2.0, 0.40)
+    assert abs(f["fill_price"] - 0.40) < 1e-12
+    assert abs(f["cost"] / f["fill_price"] - f["shares"]) < 1e-9
+
+
+def test_parse_fill_zero_shares_returns_none():
+    # MATCHED but zero tokens received → no row.
+    assert WeatherLiveTrader._parse_fill(
+        {"makingAmount": "2.0", "takingAmount": "0"}, "OID", 2.0, 0.0) is None

@@ -234,7 +234,11 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
     (platform != 'polymarket') and any non-weather can never reach the live path
     (defense-in-depth on top of the existing Kalshi kill-switch)."""
     platform = getattr(signal.market, "platform", "polymarket")
-    if not (settings.WEATHER_LIVE_TRADING and platform == "polymarket"):
+    # Belt-and-suspenders: this job only builds weather rows, but guard the live
+    # path on market_type too so a future caller can never reach it with non-weather.
+    market_type = getattr(signal.market, "market_type", "weather")
+    if not (settings.WEATHER_LIVE_TRADING and platform == "polymarket"
+            and market_type == "weather"):
         return LiveDecision("paper", entry_price, trade_size, None)
 
     # F3 guard: must know the CLOB token of the exact side we're buying. Never guess.
