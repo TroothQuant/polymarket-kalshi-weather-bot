@@ -53,6 +53,13 @@ class Trade(Base):
     entry_price = Column(Float)
     size = Column(Float)
     timestamp = Column(DateTime, default=datetime.utcnow)
+    # G2-2 (weather-live-v1): CLOB order id on a LIVE fill. NULL on every paper
+    # trade — and is itself the live-vs-paper marker (the daily-loss kill-switch
+    # keys off `order_id IS NOT NULL`). Additive + nullable so paper rows are
+    # unchanged. NOTE: a one-line ALTER TABLE migration is required BEFORE this
+    # branch merges to main, or paper inserts on the prod DB would reference a
+    # column the live table doesn't have yet.
+    order_id = Column(String, nullable=True, index=True)
 
     # Settlement
     settled = Column(Boolean, default=False)

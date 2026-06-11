@@ -52,6 +52,23 @@ def test_tokens_handle_array_form():
     assert m.token_id_no == "bbb"
 
 
+def test_f3_yes_no_mapped_by_outcomes_label_not_position():
+    # Reversed outcomes: "No" first. Both price AND token must map by LABEL, so
+    # yes_* resolves to index 1 and no_* to index 0 — not a blind [0]/[1].
+    d = dict(
+        SAMPLE,
+        outcomes='["No", "Yes"]',
+        outcomePrices='["0.70", "0.30"]',       # No=0.70, Yes=0.30
+        clobTokenIds='["notoken", "yestoken"]',  # No-token first
+    )
+    m = _parse_polymarket_weather(d, "highest-temperature-in-chicago-on-december-31-2099")
+    assert m is not None
+    assert abs(m.yes_price - 0.30) < 1e-9
+    assert abs(m.no_price - 0.70) < 1e-9
+    assert m.token_id_yes == "yestoken"
+    assert m.token_id_no == "notoken"
+
+
 def test_missing_tokens_default_empty_paper_still_parses():
     # A market with no clobTokenIds still parses for paper (live path will refuse it).
     d = dict(SAMPLE)

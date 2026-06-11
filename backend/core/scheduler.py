@@ -198,6 +198,66 @@ async def scan_and_trade_job():
         logger.exception("Error in scan_and_trade_job")
 
 
+# ── G2-2 (weather-live-v1): flag-gated LIVE execution for the weather job ──────
+# All of this is inert while settings.WEATHER_LIVE_TRADING is False (the default
+# and the only state through G2): resolve_weather_live() returns a "paper"
+# decision and the live_trader is never imported or constructed.
+from collections import namedtuple
+
+# action: "paper" (flag off / not polymarket — write the normal paper row)
+#         | "fill"  (confirmed live fill — write a row with the ACTUAL economics)
+#         | "skip"  (missing token id, or order unfilled — write NO row, continue)
+#         | "halt"  (daily live-loss kill-switch tripped — stop new live opens)
+LiveDecision = namedtuple("LiveDecision", ["action", "entry_price", "size", "order_id"])
+
+
+def _live_daily_realized_loss(db) -> float:
+    """Magnitude (>=0) of today's realized loss on LIVE polymarket weather trades.
+    Live trades are exactly those with a non-NULL order_id."""
+    day_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    total = db.query(func.coalesce(func.sum(Trade.pnl), 0.0)).filter(
+        Trade.order_id.isnot(None),
+        Trade.market_type == "weather",
+        Trade.platform == "polymarket",
+        Trade.settled == True,  # noqa: E712
+        Trade.pnl < 0,
+        Trade.timestamp >= day_start,
+    ).scalar() or 0.0
+    return abs(float(total))
+
+
+def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_trader_factory) -> LiveDecision:
+    """Decide paper-vs-live for one weather candidate. Pure except for the
+    injected db / live_trader_factory, so it unit-tests with mocks.
+
+    Live fires ONLY for polymarket weather with the master flag on — Kalshi
+    (platform != 'polymarket') and any non-weather can never reach the live path
+    (defense-in-depth on top of the existing Kalshi kill-switch)."""
+    platform = getattr(signal.market, "platform", "polymarket")
+    if not (settings.WEATHER_LIVE_TRADING and platform == "polymarket"):
+        return LiveDecision("paper", entry_price, trade_size, None)
+
+    # F3 guard: must know the CLOB token of the exact side we're buying. Never guess.
+    token_id = (signal.market.token_id_yes if signal.direction == "yes"
+                else signal.market.token_id_no)
+    if not token_id:
+        return LiveDecision("skip", entry_price, trade_size, None)
+
+    # Daily realized-loss kill-switch (live only).
+    if _live_daily_realized_loss(db) >= settings.WEATHER_LIVE_DAILY_LOSS_STOP_USD:
+        return LiveDecision("halt", entry_price, trade_size, None)
+
+    # Hard per-trade dollar cap.
+    live_size = min(trade_size, settings.WEATHER_LIVE_MAX_TRADE_USD)
+
+    fill = live_trader_factory().execute_buy(token_id, live_size, entry_price)
+    if fill is None:
+        return LiveDecision("skip", entry_price, trade_size, None)  # unfilled → NO row
+
+    # Confirmed fill — write the row with the ACTUAL fill economics + order_id.
+    return LiveDecision("fill", fill["fill_price"], fill["cost"], fill["order_id"])
+
+
 async def weather_scan_and_trade_job():
     """
     Background job: Scan weather temperature markets, generate signals, execute trades.
@@ -277,6 +337,19 @@ async def weather_scan_and_trade_job():
 
             trades_executed = 0
             weather_alloc_running = 0.0
+            # G2-2 (weather-live-v1): lazy live-trader holder. Constructed at most
+            # once per scan and ONLY when WEATHER_LIVE_TRADING is on, so
+            # py-clob-client is never imported on the paper path. Inert while the
+            # flag is False (resolve_weather_live returns a "paper" decision and
+            # never calls the factory).
+            _live_trader_box = []
+
+            def _live_trader_factory():
+                if not _live_trader_box:
+                    from backend.core.live_trader import WeatherLiveTrader
+                    _live_trader_box.append(WeatherLiveTrader())
+                return _live_trader_box[0]
+
             # Kalshi kill-switch budget-starvation fix (2026-05-21): when
             # KALSHI_TRADING_ENABLED=False, filter Kalshi signals OUT of the
             # actionable list BEFORE applying MAX_TRADES_PER_SCAN. Otherwise
@@ -381,6 +454,31 @@ async def weather_scan_and_trade_job():
 
                 entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
 
+                # ── G2-2 flag-gated LIVE execution ────────────────────────────
+                # Flag OFF (default, all of G2) → action == "paper": entry_price
+                # and trade_size pass through unchanged, order_id is None, and the
+                # row write below is byte-for-byte the original paper behaviour.
+                decision = resolve_weather_live(
+                    signal, trade_size, entry_price, db, settings, _live_trader_factory)
+                if decision.action == "halt":
+                    log_event(
+                        "warning",
+                        f"[live] daily realized-loss stop ${settings.WEATHER_LIVE_DAILY_LOSS_STOP_USD:.0f} "
+                        f"reached — halting new live opens for the day.")
+                    break
+                if decision.action == "skip":
+                    # Missing token id, or the live order did not fill: write NO
+                    # row, deduct NO bankroll, move on (no phantom paper row).
+                    log_event(
+                        "warning",
+                        f"[live] {signal.market.market_id} not opened "
+                        f"(missing token id or order unfilled) — no row written.")
+                    continue
+                # "paper" → unchanged; "fill" → ACTUAL fill price/cost + order_id.
+                entry_price = decision.entry_price
+                trade_size = decision.size
+                order_id = decision.order_id
+
                 # Use the signal's platform so Kalshi trades save as "kalshi"
                 # (was hardcoded to "polymarket" before the Kalshi rollout 2026-05-19).
                 trade = Trade(
@@ -394,6 +492,7 @@ async def weather_scan_and_trade_job():
                     model_probability=signal.model_probability,
                     market_price_at_entry=signal.market_probability,
                     edge_at_entry=signal.edge,
+                    order_id=order_id,  # NULL on paper; CLOB id on a live fill
                 )
 
                 db.add(trade)

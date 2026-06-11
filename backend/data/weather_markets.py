@@ -292,10 +292,11 @@ def _parse_polymarket_weather(
     if parsed["target_date"] < date.today():
         return None
 
+    import json
+
     # Parse prices
     outcome_prices = market_data.get("outcomePrices", [])
     if isinstance(outcome_prices, str):
-        import json
         try:
             outcome_prices = json.loads(outcome_prices)
         except Exception:
@@ -304,9 +305,27 @@ def _parse_polymarket_weather(
     if not outcome_prices or len(outcome_prices) < 2:
         return None
 
+    # F3 (2026-06-11): derive the YES/NO ordering from the gamma 'outcomes'
+    # labels, not a blind [0]/[1] positional assumption. Polymarket orders BOTH
+    # outcomePrices and clobTokenIds to match 'outcomes', so the same index pair
+    # is reused below for the token IDs. Defaults to (0, 1) for the canonical
+    # ["Yes", "No"] ordering or when labels are unavailable — byte-for-byte
+    # identical to the prior behaviour on every real Polymarket weather market.
+    outcomes_raw = market_data.get("outcomes", [])
+    if isinstance(outcomes_raw, str):
+        try:
+            outcomes_raw = json.loads(outcomes_raw)
+        except Exception:
+            outcomes_raw = []
+    yes_idx, no_idx = 0, 1
+    if isinstance(outcomes_raw, list) and len(outcomes_raw) == 2:
+        labels = [str(o).strip().lower() for o in outcomes_raw]
+        if "yes" in labels and "no" in labels:
+            yes_idx, no_idx = labels.index("yes"), labels.index("no")
+
     try:
-        yes_price = float(outcome_prices[0])
-        no_price = float(outcome_prices[1])
+        yes_price = float(outcome_prices[yes_idx])
+        no_price = float(outcome_prices[no_idx])
     except (ValueError, IndexError):
         return None
 
@@ -318,18 +337,18 @@ def _parse_polymarket_weather(
 
     volume = float(market_data.get("volume", 0) or 0)
 
-    # P0: capture CLOB token IDs + conditionId for the live path. clobTokenIds is
-    # JSON-encoded string OR array (same quirk as outcomePrices) and is ordered
-    # [yes_token, no_token] to match outcomes/outcomePrices.
+    # P0/F3: capture CLOB token IDs + conditionId for the live path. clobTokenIds
+    # is a JSON-encoded string OR array (same quirk as outcomePrices), ordered to
+    # match 'outcomes' — so index it by the SAME yes_idx/no_idx derived from the
+    # labels above, never a blind [0]/[1].
     token_ids_raw = market_data.get("clobTokenIds", [])
     if isinstance(token_ids_raw, str):
-        import json
         try:
             token_ids_raw = json.loads(token_ids_raw)
         except Exception:
             token_ids_raw = []
-    token_id_yes = str(token_ids_raw[0]) if len(token_ids_raw) >= 1 else ""
-    token_id_no = str(token_ids_raw[1]) if len(token_ids_raw) >= 2 else ""
+    token_id_yes = str(token_ids_raw[yes_idx]) if len(token_ids_raw) > yes_idx else ""
+    token_id_no = str(token_ids_raw[no_idx]) if len(token_ids_raw) > no_idx else ""
     condition_id = str(market_data.get("conditionId", "") or "")
 
     return WeatherMarket(
