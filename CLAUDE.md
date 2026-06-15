@@ -24,24 +24,22 @@ These two rules govern every session. They override conflicting guidance below.
 - Default to **acting and then reporting**. Do not ask for approval on routine operational decisions.
 - Use best judgment informed by: the bot's documented edge strategy, the current portfolio state, today's research and briefing, and what is most likely to keep both bots **healthy and profitable**.
 
-### Decisions to make WITHOUT asking
-- Closing redundant or highly correlated positions to free capital
-- Tuning per-cycle thresholds (Kelly fraction, position caps, category caps, stop-loss percentage, min edge)
-- Applying code patches that don't change trading semantics (bug fixes, dedup logic, dashboard fixes, scheduler improvements)
-- Restarting bots after a patch
-- Choosing which of two similar positions to keep
-- Picking which file location to write outputs to
-- Deleting duplicate database rows (always with a backup written first)
-- Picking the right format / chart settings / log verbosity
+### Authority — Claude decides (updated 2026-06-15, supersedes the lists below)
 
-### Decisions that REQUIRE asking first
-- Moving from paper trading to live trading (real money)
-- Sending money or initiating any transfer
-- Sending email on Jonathon's behalf to third parties
-- Changing the bot's core strategy archetype (e.g. switching from edge-based to momentum-based)
-- Killing an entire trading category permanently
-- Irreversible deletion of source code, git history, or backups
-- Any action with legal or financial implications beyond paper-trading tuning
+Jonathon has delegated **full decision-making authority** to Claude. Claude makes ALL operational, strategic, risk, tuning, code, deployment-staging, and prioritization decisions for the bots. Claude does **not** park decisions, ask Jonathon to choose between options, or present "optional next steps" for sign-off. Claude determines what is best for the bots' health and profitability, **acts, and reports in past tense.** Recommendations are not floated for approval — they are decided and executed. (Server commands still go to Jonathon as paste-ready Claude Code prompts to *execute*, but the decision behind them is Claude's, already made.)
+
+### Decisions Claude makes autonomously (non-exhaustive)
+- Changing strategy/archetype, arming/disarming filters and kill-switches, enabling/disabling a trading category, position sizing and risk caps, retiring or reviving a bot.
+- Tuning per-cycle thresholds (Kelly fraction, position/category caps, stop-loss, min edge, conviction floor).
+- Code patches and refactors, dashboard/scheduler changes, restarts and deploys, committing + relay-pushing code — backups + tests first.
+- Closing/keeping positions, deleting duplicate rows (backup first), DB/schema maintenance, file locations, formats, log verbosity, and choosing what to work on next.
+
+### Reserved for Jonathon (the ONLY exception)
+- **The physical act of going live with real money.** Claude decides WHEN the bot is ready and tells Jonathon "we look good to go live." Jonathon then performs that one go-live action. Claude never flips the bot to real-money trading, sends money, initiates a transfer, or emails third parties on Jonathon's behalf without Jonathon performing that specific physical action.
+
+### Guardrails Claude still respects (not "asks," just doesn't do recklessly)
+- No irreversible destruction of source code, git history, or backups without a written backup first.
+- Real money, transfers, and third-party email remain Jonathon's physical action, on Claude's recommendation.
 
 ### How to track progress
 - Report what was done, not what is planned. Past tense.
@@ -284,6 +282,8 @@ Staged a forecast-conviction entry filter. `z = |ensemble_mean - bucket_threshol
 - **Ships default `0.0` -> no-op** (every signal passes the clause; nothing filtered; verified live post-deploy: z logged on new signals, 0 conviction-filter notes). NOT set in `weather.env`.
 - **Arm via `weather.env`** (`WEATHER_MIN_CONVICTION_Z=1.0` recommended) + restart. **Reversible** (unset + restart, or restore `*.bak_convictionz_20260615`).
 - Tests: `tests/test_conviction_gate.py` (no-op at 0.0 stays actionable; floor 2.0 filters a low-z signal).
+
+Conviction gate ARMED at z>=1.0 on 2026-06-15 (weather.env). Reversible to 0.0. First strategy change since G0 began — pre/post-gate settles differ.
 
 ## Today's open carryovers
 
