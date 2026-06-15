@@ -274,6 +274,17 @@ Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-0
 
 Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-10.md`.
 
+## Operational notes (added 2026-06-15)
+
+### Conviction gate — `WEATHER_MIN_CONVICTION_Z` (default 0.0 = no-op)
+
+Staged a forecast-conviction entry filter. `z = |ensemble_mean - bucket_threshold| / ensemble_std` — how many standard deviations the ensemble mean sits from the market's threshold (high z = the forecast is far from the line relative to its spread). Computed in `generate_weather_signal` and **logged on every signal** (`| Conviction z: X.X` appended to the reasoning); enforced as an extra `and conviction_z >= settings.WEATHER_MIN_CONVICTION_Z` clause in the `actionable` test, with a filter note when it trips.
+
+- **Validated on 500 independently-settled offered markets:** z<1.0 wins **41.6%** (losing), z>=1.0 wins **~58-67%**. See `weather_nyc_dominance_analysis_2026-06-15.md`.
+- **Ships default `0.0` -> no-op** (every signal passes the clause; nothing filtered; verified live post-deploy: z logged on new signals, 0 conviction-filter notes). NOT set in `weather.env`.
+- **Arm via `weather.env`** (`WEATHER_MIN_CONVICTION_Z=1.0` recommended) + restart. **Reversible** (unset + restart, or restore `*.bak_convictionz_20260615`).
+- Tests: `tests/test_conviction_gate.py` (no-op at 0.0 stays actionable; floor 2.0 filters a low-z signal).
+
 ## Today's open carryovers
 
 Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-06-01.md`, this morning's briefing: `08_morning_briefing_2026-06-01.md`). As of cutover (2026-06-01 20:27 UTC): bankroll $9,193.72, realized P&L −$406.28, 49 trades, 4 open pending positions (#45 Polymarket 2391290, #46 Polymarket 2400011, #47 Polymarket 2407003, #48 Polymarket 2407026, all NO @ $100). Carryover: re-decide `WEATHER_DISABLE_YES_ENTRIES` once the YES/above sample grows from n=4 to n=7. Next session (3): migrate Claude bot + dashboard to the same droplet.
