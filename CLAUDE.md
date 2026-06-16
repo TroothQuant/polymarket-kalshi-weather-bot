@@ -41,6 +41,9 @@ Jonathon has delegated **full decision-making authority** to Claude. Claude make
 - No irreversible destruction of source code, git history, or backups without a written backup first.
 - Real money, transfers, and third-party email remain Jonathon's physical action, on Claude's recommendation.
 
+### Two-brain habit — offer "My take" (added 2026-06-16)
+- Jonathon runs a two-brain workflow (Code = hands-on/measurement, Cowork = strategy/interpretation). When producing or reviewing analysis, designs, prompts, or verdicts — **especially anything headed to or from Cowork** — proactively add a short **"My take"**: an additive/adversarial second opinion flagging a gap, risk, faster/cheaper path, a metric that better answers the real question, a wrong assumption, or a finding that changes the conclusion. Don't rubber-stamp; don't withhold a substantive improvement. Concise and decision-relevant. Two brains beat one. (It already caught the copy-trade cashPnl/positions survivorship bug and found the real `lb-api/profit` leaderboard endpoint.)
+
 ### How to track progress
 - Report what was done, not what is planned. Past tense.
 - If intent or scope is ambiguous (rare), one targeted clarifying question at the start of the session is fine. Once scope is clear, execute without re-asking.
