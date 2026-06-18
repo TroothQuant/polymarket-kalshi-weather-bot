@@ -6,12 +6,18 @@ Reads tradingbot.db (signals + trades) ONLY. Writes a dated markdown report to
 ~/.local/state/trooth/. Does NOT touch the live bot, config, flags, DB schema, or the
 next-book harness. Runnable on demand.
 
-CORE METRIC (not settlement-limited — uses EVERY logged signal, traded or not):
-  rolling weekly mean( market_price - model_probability ) for high-z tail buckets (z>=1),
-  per platform and per city + pooled. The harvestable overpricing of the tail; if its
-  magnitude SHRINKS over time, the market is getting efficient => our edge is decaying.
+PRIMARY METRIC (per the 2026-06-18 entry-band finding — our edge lives in the market_yes
+0.30-0.50 INFORMATION-EDGE band, NOT the FLB longshot band the 0.70 cap excludes):
+  rolling weekly mean( model_probability - market_price ) for z>=1 signals with
+  market_yes in [0.30, 0.50], per platform and per city + pooled. This is the model-vs-market
+  disagreement that IS our information edge; if its magnitude (and the in-band signal COUNT)
+  SHRINK over time, fast forecast-bots are arbitraging our edge away => the decay we most need
+  to see coming. (not settlement-limited — uses EVERY logged signal, traded or not.)
 
-Also: OLS edge-on-time slope (+t-stat) on the weekly series, and a CUSUM on rolling
+SECONDARY METRIC: generic high-z (z>=1) tail overpricing mean( market_price - model_probability )
+  pooled across all bands — the broader FLB-style tail-overpricing gauge.
+
+Also: OLS gap-on-time slope (+t-stat) on the weekly series, and a CUSUM on rolling
 realized ROI from settled trades (where they exist).
 
 POWER CAVEAT (printed in the report): the PM *settled* sample is small (~45) and only ~5
@@ -64,51 +70,69 @@ def main():
         "FROM signals WHERE market_type='weather' AND market_price IS NOT NULL AND model_probability IS NOT NULL"
     ).fetchall()
 
-    # platform -> week -> list[(mispricing, city, overpriced_bool)]
+    # platform -> week -> list[(market_yes, model_prob, city)]  for z>=1
     data = {"kalshi": {}, "polymarket": {}}
     wk_signal_counts = {"kalshi": {}, "polymarket": {}}
     for plat, tk, ts, mkt, mod, rz in rows:
         if plat not in data: continue
-        wk_signal_counts[plat][isoweek(ts)] = wk_signal_counts[plat].get(isoweek(ts), 0) + 1
+        wk = isoweek(ts)
+        wk_signal_counts[plat][wk] = wk_signal_counts[plat].get(wk, 0) + 1
         z = parse_z(rz)
         if z is None or z < ZGATE:
             continue
-        mis = mkt - mod                 # harvestable tail overpricing
-        wk = isoweek(ts)
-        data[plat].setdefault(wk, []).append((mis, city_of(rz), mkt > mod))
+        data[plat].setdefault(wk, []).append((mkt, mod, city_of(rz)))
 
+    BAND = (0.30, 0.50)
     lines = []
     def P(s=""): lines.append(s)
     P(f"# Weather Edge Decay Sensor — run {datetime.date.today().isoformat()}")
     P()
-    P("READ-ONLY. Metric = weekly mean(market_price − model_probability) for high-z (z≥1) tail signals.")
-    P("Positive = market overprices the tail (our harvest); **shrinking toward 0 over weeks = edge decaying**.")
-    P("Power caveat: ~5 weeks of data + small PM settled n → treat slope/CUSUM as EARLY-WARNING flags, not proofs.")
+    P("READ-ONLY. **PRIMARY** = weekly mean(model_prob − market_yes) for z≥1 signals in the")
+    P("market_yes **0.30–0.50 information-edge band** (where the 2026-06-18 entry-band analysis showed our edge lives).")
+    P("Gap is negative (model<market = our forecast disagreement). **Magnitude shrinking toward 0, OR the in-band COUNT")
+    P("shrinking, = fast forecast-bots arbing our edge = the decay we most need to see.** SECONDARY = generic z≥1 tail overpricing.")
+    P("Power caveat: ~5 weeks + small PM settled n → slope/CUSUM are EARLY-WARNING flags, not proofs.")
     P()
     for plat in ("kalshi", "polymarket"):
         tag = "CONTINUOUS live stream" if plat == "kalshi" else "HISTORICAL / parser-degraded (do not read as live)"
         P(f"## {plat.upper()} — {tag}")
         weeks = sorted(data[plat].keys())
         if not weeks:
-            P("  (no z≥1 tail signals)"); P(); continue
-        P(f"| week | z≥1 sigs | all-gap | overpriced-only gap | n_overpriced | total wk sigs |")
-        P(f"|---|---|---|---|---|---|")
-        series_x, series_y = [], []
+            P("  (no z≥1 signals)"); P(); continue
+        flat = [r for wk in weeks for r in data[plat][wk]]
+        P("### PRIMARY — 0.30–0.50 information-edge band, mean(model − market)")
+        P("| week | in-band n | mean(model−market) | mean\\|gap\\| | total wk sigs |")
+        P("|---|---|---|---|---|")
+        bx, by = [], []
         for i, wk in enumerate(weeks):
-            vals = data[plat][wk]
-            allgap = statistics.mean(v[0] for v in vals)
-            over = [v[0] for v in vals if v[2]]
-            ovgap = statistics.mean(over) if over else 0.0
-            series_x.append(i); series_y.append(ovgap)
-            P(f"| {wk} | {len(vals)} | {allgap:+.3f} | {ovgap:+.3f} | {len(over)} | {wk_signal_counts[plat].get(wk,0)} |")
-        b, t, n = ols_slope_t(series_x, series_y)
+            inb = [(mkt, mod) for (mkt, mod, c) in data[plat][wk] if BAND[0] <= mkt < BAND[1]]
+            if inb:
+                gaps = [mod - mkt for (mkt, mod) in inb]
+                mg = statistics.mean(gaps); bx.append(i); by.append(mg)
+                P(f"| {wk} | {len(inb)} | {mg:+.3f} | {statistics.mean(abs(g) for g in gaps):.3f} | {wk_signal_counts[plat].get(wk,0)} |")
+            else:
+                P(f"| {wk} | 0 | — | — | {wk_signal_counts[plat].get(wk,0)} |")
+        b, t, n = ols_slope_t(bx, by)
         if b is None:
-            P(f"  trend: n={n} weeks — too few to regress.")
+            P(f"  trend: n={n} in-band weeks — too few to regress.")
         else:
-            direction = "DECAYING ↓" if b < 0 else "stable/strengthening ↑"
             tstr = f"{t:+.2f}" if t not in (None, float('inf')) else "n/a"
-            P(f"  **trend (overpriced-gap on week): slope={b:+.4f}/wk, t={tstr}, n={n} weeks → {direction}**")
-            P(f"  first week {series_y[0]:+.3f} → last week {series_y[-1]:+.3f}")
+            P(f"  **trend (gap on week): slope={b:+.4f}/wk, t={tstr}, n={n} → "
+              f"{'DECAYING — gap closing toward 0 ↓' if b > 0 else 'gap holding/widening ↑'}**")
+            P(f"  first in-band week {by[0]:+.3f} → last {by[-1]:+.3f}")
+        cities = sorted({c for (_, _, c) in flat})
+        pc = []
+        for c in cities:
+            g = [mod - mkt for (mkt, mod, cc) in flat if cc == c and BAND[0] <= mkt < BAND[1]]
+            if g: pc.append(f"{c}={statistics.mean(g):+.2f}(n{len(g)})")
+        P("  per-city in-band gap: " + (", ".join(pc) if pc else "none"))
+        P()
+        P("### SECONDARY — generic z≥1 tail overpricing, mean(market − model)")
+        P("| week | z≥1 n | mean(market−model) |")
+        P("|---|---|---|")
+        for wk in weeks:
+            vals = data[plat][wk]
+            P(f"| {wk} | {len(vals)} | {statistics.mean(mkt - mod for (mkt, mod, c) in vals):+.3f} |")
         P()
 
     # CUSUM on settled PM trade ROI (small n — early warning only)
@@ -131,17 +155,22 @@ def main():
         P(f"  only {len(rois)} settled trades — insufficient for CUSUM.")
     P()
     P("## Read")
-    # quick pooled verdict
     kw = sorted(data["kalshi"].keys())
-    if len(kw) >= 3:
-        ky = [statistics.mean([v[0] for v in data["kalshi"][w] if v[2]] or [0]) for w in kw]
-        kb, kt, _ = ols_slope_t(list(range(len(kw))), ky)
-        if kb is not None:
-            P(f"- Kalshi (live) overpriced-tail gap is currently {ky[-1]:+.3f}; slope {kb:+.4f}/wk "
-              f"→ {'watch: trending down' if kb < 0 else 'holding'}. The leading indicator to watch week-over-week.")
-    P("- Re-run this on demand; the value is the TREND across many runs, not any single reading.")
-    P("- If the overpriced-tail gap compresses toward 0 over successive weeks (esp. on Kalshi, the live stream), "
-      "that is sophistication entering — shrink size before realized P&L confirms it.")
+    ky = []
+    for w in kw:
+        inb = [mod - mkt for (mkt, mod, c) in data["kalshi"][w] if BAND[0] <= mkt < BAND[1]]
+        if inb: ky.append((w, statistics.mean(inb), len(inb)))
+    if len(ky) >= 3:
+        kb, _, _ = ols_slope_t(list(range(len(ky))), [g for (_, g, _) in ky])
+        w, cur, cn = ky[-1]
+        verdict = "WATCH: gap closing toward 0 = possible decay" if (kb is not None and kb > 0) else "holding"
+        P(f"- Kalshi (live) in-band gap currently {cur:+.3f} (n={cn} in-band sigs, wk {w}); "
+          f"slope {kb:+.4f}/wk → {verdict}.")
+        P(f"  In-band COUNT trend also matters: {[(w_, n_) for (w_, _, n_) in ky]} — a shrinking count means the "
+          f"market is pricing these tails below 0.30 (correcting toward our model) = the same decay.")
+    P("- Re-run on demand; the value is the TREND across many runs, not any single reading.")
+    P("- If the in-band gap magnitude compresses toward 0 OR the in-band signal count shrinks over successive weeks "
+      "(esp. Kalshi, the live stream), that is fast forecast-bots arbing our information edge — shrink size before realized P&L confirms it.")
     con.close()
 
     os.makedirs(OUT_DIR, exist_ok=True)
