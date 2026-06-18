@@ -6,7 +6,7 @@ Before any work that touches files in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polym
 
 # Operating Principles (READ FIRST — overrides everything else in this file)
 
-These two rules govern every session. They override conflicting guidance below.
+These three rules govern every session. They override conflicting guidance below.
 
 ## 1. Communicate like Jonathon is a beginner
 
