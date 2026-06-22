@@ -61,10 +61,12 @@ Jonathon has delegated **full decision-making authority** to Claude. Claude make
 
 Trooth Prediction Market Trading Bot — multi-strategy paper trading on Polymarket (and optionally Kalshi). See `README.md` for the full description.
 
-Two strategies run in one process:
+Two strategies exist in one process, but only one is active:
 
-- **BTC 5-minute Up/Down** — scans Polymarket BTC short-window markets every 60 seconds. Composite signal from RSI / momentum / VWAP / SMA / market skew. Trades when edge > 2%.
-- **Weather temperature** — scans daily-temperature markets in nyc / chicago / miami / los_angeles / denver every 5 minutes. Uses 31-member GFS ensemble forecasts from Open-Meteo. Trades when edge > 8%.
+- **Weather temperature (SOLE ACTIVE BOOK)** — scans daily-temperature markets in nyc / chicago / miami / los_angeles / denver every 5 minutes. Uses 31-member GFS ensemble forecasts from Open-Meteo.
+- **BTC 5-minute Up/Down — PRESENT BUT DISABLED** (`BTC_ENABLED=false`). Composite RSI / momentum / VWAP / SMA / skew signal on Polymarket BTC short-window markets; not trading.
+
+Current entry thresholds and flag states are NOT restated here (they drift) — see `REPO_RECORD_MAP.md` (and `backend/config.py`).
 
 ## Running
 
@@ -102,17 +104,13 @@ Frontend (React dashboard): runs out of `frontend/`, normally on port 5173 in de
 
 Was a fictional CFD model before today that under-counted P&L by ~1/entry_price. If you see numbers diverging by 5-50x between the bot and the dashboard or Polymarket UI, check whether someone reverted this. Historical trades were backfilled by `scripts/migrate_to_share_model_2026-05-19.py`.
 
-## Pydantic Settings v2 — `.env` IS loaded now
+## Pydantic Settings v2 — env IS loaded now
 
-`backend/config.py` uses `model_config = SettingsConfigDict(env_file=..., extra="ignore")`. Was using v1's `class Config: env_file = ".env"` syntax which v2 silently ignored. If something behaves like a config knob isn't being respected from `.env`, first sanity-check the syntax in `config.py` is still v2.
+`backend/config.py` uses `model_config = SettingsConfigDict(env_file=..., extra="ignore")`. Was using v1's `class Config: env_file = ".env"` syntax which v2 silently ignored. If something behaves like a config knob isn't being respected, first sanity-check the syntax in `config.py` is still v2.
 
-`.env` lives at the project root and currently sets:
-- `KALSHI_ENABLED=true`
-- `KALSHI_API_KEY_ID=<uuid>`
-- `KALSHI_PRIVATE_KEY_PATH=secrets/kalshi_private_key.pem`
-- `BTC_ENABLED=false`
+**Live env file (server):** `/home/trooth/.config/trooth/weather.env` (mode 600 — the `trooth-weather-bot.service` `EnvironmentFile`), currently 9 keys. The project-root `.env` is the **Mac-fallback only**, not the live source. **For the current flag names + live states + defaults, see `REPO_RECORD_MAP.md`** (don't restate them here — they drift).
 
-Adding a new env-controlled setting: add the field to `Settings` in `config.py` with a default, then it's automatically picked up from `.env` (or process env vars override).
+Adding a new env-controlled setting: add the field to `Settings` in `config.py` with a default, then it's picked up from the env file (or process env overrides).
 
 ## Kalshi is live (2026-05-19)
 
@@ -173,7 +171,7 @@ Cohort analysis + NOMADS hindcast backtest day. Four commits shipped (`1f61272`,
 
 - **`WEATHER_MIN_EDGE_THRESHOLD = 0.25`** (was 0.08, commit `1f61272`). Drops the failing 10-25% edge band entirely (6 historical trades, 1 win, −$402). The 0.08 floor was letting marginal-edge entries through that didn't have enough conviction to overcome variance.
 - **`WEATHER_MAX_EDGE_THRESHOLD = 0.50`** (new, commit `b8c6bb9`). Caps entries when the raw model-vs-market edge exceeds 50%. Distinct from `WEATHER_MAX_CLIPPED_EDGE = 0.25` which only fires when the model probability has been clipped at the 0.05/0.95 boundary. The new ceiling catches the at-the-money case (model 0.95, market 0.30, edge 0.65, no clipping). Historical 50%+ edge band was 12 trades, 1 win, −$390 — when the model thinks the market is wildly mispricing something, the model is usually wrong, not the market.
-- **`WEATHER_DISABLE_YES_ENTRIES = true`** (new, commit `d4644f1`, set in `.env`). **TEMPORARY** — pending settlement of the 3 currently-open YES positions (Denver 5/27, Denver 5/28, Chicago 5/28). Re-decide whether to flip back to `false` once we have n=7 clean YES/above outcomes instead of n=4. The data we have today doesn't justify keeping YES off permanently; it justifies waiting for the next round of evidence before re-enabling.
+- **`WEATHER_DISABLE_YES_ENTRIES = true`** (new, commit `d4644f1`). Originally framed as temporary pending more YES/above evidence — **superseded: decided KEEP `true`** per the 2026-06-09 note below (clean YES sample is past n=7 and still loses; NO is the engine). Live env confirms `true`.
 
 ### NOMADS hindcast adapter shipped (commits `47ae05f` + `f15eaa8`)
 
@@ -297,4 +295,4 @@ Conviction gate ARMED at z>=1.0 on 2026-06-15 (weather.env). Reversible to 0.0. 
 
 ## Today's open carryovers
 
-Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-06-01.md`, this morning's briefing: `08_morning_briefing_2026-06-01.md`). As of cutover (2026-06-01 20:27 UTC): bankroll $9,193.72, realized P&L −$406.28, 49 trades, 4 open pending positions (#45 Polymarket 2391290, #46 Polymarket 2400011, #47 Polymarket 2407003, #48 Polymarket 2407026, all NO @ $100). Carryover: re-decide `WEATHER_DISABLE_YES_ENTRIES` once the YES/above sample grows from n=4 to n=7. Next session (3): migrate Claude bot + dashboard to the same droplet.
+Current state is NOT restated here (it rots — this section used to and went stale). **Canonical handoff:** `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/NAVIGATION.md` → the latest dated session log. **Code/state/infra map:** `REPO_RECORD_MAP.md` in the same folder.
