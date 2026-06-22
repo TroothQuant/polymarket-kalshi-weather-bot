@@ -6,7 +6,7 @@ Before any work that touches files in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polym
 
 # Operating Principles (READ FIRST — overrides everything else in this file)
 
-These two rules govern every session. They override conflicting guidance below.
+These three rules govern every session. They override conflicting guidance below.
 
 ## 1. Communicate like Jonathon is a beginner
 
@@ -47,6 +47,13 @@ Jonathon has delegated **full decision-making authority** to Claude. Claude make
 ### How to track progress
 - Report what was done, not what is planned. Past tense.
 - If intent or scope is ambiguous (rare), one targeted clarifying question at the start of the session is fine. Once scope is clear, execute without re-asking.
+
+## 3. Division of labor — Code writes, Cowork does not
+
+- **Cowork (Claude Desktop) does NOT modify files** — no code, no scripts, no config, and no edits to the canonical record (session logs, NAVIGATION.md, CLAUDE.md). Cowork's job is to plan, research, decide, review, and draft exact content or paste-ready Claude Code prompts.
+- **Claude Code is the single writer.** Code makes ALL code/script/config changes AND all writes to the canonical docs, then reports back. If Cowork has produced text for a doc, it hands that text to Code to write.
+- **Rationale:** one writer prevents the duplicate-edit / drift failure mode the project has repeatedly hit, and keeps server-deployed code and its git history under a single hand. Cowork's leverage is judgment and drafting, not file edits.
+- **Only exception:** if Jonathon explicitly asks Cowork in-session to write or edit a specific file, that one-off overrides this. Default is hands-off.
 
 ---
 
