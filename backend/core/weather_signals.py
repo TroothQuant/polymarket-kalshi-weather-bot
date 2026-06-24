@@ -249,10 +249,12 @@ async def generate_weather_signal(
 
     # Build reasoning. ACTIONABLE only if the edge sits inside [MIN, MAX]
     # AND direction passes the kill-switch.
+    conviction_z = abs(mean_val - market.threshold_f) / std_val if std_val > 0 else 0.0
     actionable = (
         abs(edge) >= settings.WEATHER_MIN_EDGE_THRESHOLD
         and abs(edge) <= settings.WEATHER_MAX_EDGE_THRESHOLD
         and not yes_blocked
+        and conviction_z >= settings.WEATHER_MIN_CONVICTION_Z
     )
     filter_status = "ACTIONABLE" if actionable else "FILTERED"
     filter_notes = []
@@ -268,6 +270,8 @@ async def generate_weather_signal(
         filter_notes.append(f"entry {entry_price:.0%} < {settings.WEATHER_MIN_ENTRY_PRICE:.0%} (long-tail)")
     if edge_was_clipped:
         filter_notes.append(f"edge capped @ {settings.WEATHER_MAX_CLIPPED_EDGE:.0%} (model clipped {model_yes_prob:.2f})")
+    if conviction_z < settings.WEATHER_MIN_CONVICTION_Z:
+        filter_notes.append(f"conviction z={conviction_z:.1f} < {settings.WEATHER_MIN_CONVICTION_Z:.1f} floor")
     filter_note = f" [{', '.join(filter_notes)}]" if filter_notes else ""
 
     reasoning = (
@@ -277,6 +281,7 @@ async def generate_weather_signal(
         f"Model YES: {model_yes_prob:.0%} vs Market: {market_yes_prob:.0%} | "
         f"Edge: {edge:+.1%} -> {direction.upper()} @ {entry_price:.0%} | "
         f"Agreement: {agreement_frac:.0%}"
+        f" | Conviction z: {conviction_z:.1f}"
     )
 
     return WeatherTradingSignal(

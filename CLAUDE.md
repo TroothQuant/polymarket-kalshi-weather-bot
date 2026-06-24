@@ -6,7 +6,7 @@ Before any work that touches files in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polym
 
 # Operating Principles (READ FIRST — overrides everything else in this file)
 
-These two rules govern every session. They override conflicting guidance below.
+These three rules govern every session. They override conflicting guidance below.
 
 ## 1. Communicate like Jonathon is a beginner
 
@@ -24,28 +24,36 @@ These two rules govern every session. They override conflicting guidance below.
 - Default to **acting and then reporting**. Do not ask for approval on routine operational decisions.
 - Use best judgment informed by: the bot's documented edge strategy, the current portfolio state, today's research and briefing, and what is most likely to keep both bots **healthy and profitable**.
 
-### Decisions to make WITHOUT asking
-- Closing redundant or highly correlated positions to free capital
-- Tuning per-cycle thresholds (Kelly fraction, position caps, category caps, stop-loss percentage, min edge)
-- Applying code patches that don't change trading semantics (bug fixes, dedup logic, dashboard fixes, scheduler improvements)
-- Restarting bots after a patch
-- Choosing which of two similar positions to keep
-- Picking which file location to write outputs to
-- Deleting duplicate database rows (always with a backup written first)
-- Picking the right format / chart settings / log verbosity
+### Authority — Claude decides (updated 2026-06-15, supersedes the lists below)
 
-### Decisions that REQUIRE asking first
-- Moving from paper trading to live trading (real money)
-- Sending money or initiating any transfer
-- Sending email on Jonathon's behalf to third parties
-- Changing the bot's core strategy archetype (e.g. switching from edge-based to momentum-based)
-- Killing an entire trading category permanently
-- Irreversible deletion of source code, git history, or backups
-- Any action with legal or financial implications beyond paper-trading tuning
+Jonathon has delegated **full decision-making authority** to Claude. Claude makes ALL operational, strategic, risk, tuning, code, deployment-staging, and prioritization decisions for the bots. Claude does **not** park decisions, ask Jonathon to choose between options, or present "optional next steps" for sign-off. Claude determines what is best for the bots' health and profitability, **acts, and reports in past tense.** Recommendations are not floated for approval — they are decided and executed. (Server commands still go to Jonathon as paste-ready Claude Code prompts to *execute*, but the decision behind them is Claude's, already made.)
+
+### Decisions Claude makes autonomously (non-exhaustive)
+- Changing strategy/archetype, arming/disarming filters and kill-switches, enabling/disabling a trading category, position sizing and risk caps, retiring or reviving a bot.
+- Tuning per-cycle thresholds (Kelly fraction, position/category caps, stop-loss, min edge, conviction floor).
+- Code patches and refactors, dashboard/scheduler changes, restarts and deploys, committing + relay-pushing code — backups + tests first.
+- Closing/keeping positions, deleting duplicate rows (backup first), DB/schema maintenance, file locations, formats, log verbosity, and choosing what to work on next.
+
+### Reserved for Jonathon (the ONLY exception)
+- **The physical act of going live with real money.** Claude decides WHEN the bot is ready and tells Jonathon "we look good to go live." Jonathon then performs that one go-live action. Claude never flips the bot to real-money trading, sends money, initiates a transfer, or emails third parties on Jonathon's behalf without Jonathon performing that specific physical action.
+
+### Guardrails Claude still respects (not "asks," just doesn't do recklessly)
+- No irreversible destruction of source code, git history, or backups without a written backup first.
+- Real money, transfers, and third-party email remain Jonathon's physical action, on Claude's recommendation.
+
+### Two-brain habit — offer "My take" (added 2026-06-16)
+- Jonathon runs a two-brain workflow (Code = hands-on/measurement, Cowork = strategy/interpretation). When producing or reviewing analysis, designs, prompts, or verdicts — **especially anything headed to or from Cowork** — proactively add a short **"My take"**: an additive/adversarial second opinion flagging a gap, risk, faster/cheaper path, a metric that better answers the real question, a wrong assumption, or a finding that changes the conclusion. Don't rubber-stamp; don't withhold a substantive improvement. Concise and decision-relevant. Two brains beat one. (It already caught the copy-trade cashPnl/positions survivorship bug and found the real `lb-api/profit` leaderboard endpoint.)
 
 ### How to track progress
 - Report what was done, not what is planned. Past tense.
 - If intent or scope is ambiguous (rare), one targeted clarifying question at the start of the session is fine. Once scope is clear, execute without re-asking.
+
+## 3. Division of labor — Code writes, Cowork does not
+
+- **Cowork (Claude Desktop) does NOT modify files** — no code, no scripts, no config, and no edits to the canonical record (session logs, NAVIGATION.md, CLAUDE.md). Cowork's job is to plan, research, decide, review, and draft exact content or paste-ready Claude Code prompts.
+- **Claude Code is the single writer.** Code makes ALL code/script/config changes AND all writes to the canonical docs, then reports back. If Cowork has produced text for a doc, it hands that text to Code to write.
+- **Rationale:** one writer prevents the duplicate-edit / drift failure mode the project has repeatedly hit, and keeps server-deployed code and its git history under a single hand. Cowork's leverage is judgment and drafting, not file edits.
+- **Only exception:** if Jonathon explicitly asks Cowork in-session to write or edit a specific file, that one-off overrides this. Default is hands-off.
 
 ---
 
@@ -53,10 +61,12 @@ These two rules govern every session. They override conflicting guidance below.
 
 Trooth Prediction Market Trading Bot — multi-strategy paper trading on Polymarket (and optionally Kalshi). See `README.md` for the full description.
 
-Two strategies run in one process:
+Two strategies exist in one process, but only one is active:
 
-- **BTC 5-minute Up/Down** — scans Polymarket BTC short-window markets every 60 seconds. Composite signal from RSI / momentum / VWAP / SMA / market skew. Trades when edge > 2%.
-- **Weather temperature** — scans daily-temperature markets in nyc / chicago / miami / los_angeles / denver every 5 minutes. Uses 31-member GFS ensemble forecasts from Open-Meteo. Trades when edge > 8%.
+- **Weather temperature (SOLE ACTIVE BOOK)** — scans daily-temperature markets in nyc / chicago / miami / los_angeles / denver every 5 minutes. Uses 31-member GFS ensemble forecasts from Open-Meteo.
+- **BTC 5-minute Up/Down — PRESENT BUT DISABLED** (`BTC_ENABLED=false`). Composite RSI / momentum / VWAP / SMA / skew signal on Polymarket BTC short-window markets; not trading.
+
+Current entry thresholds and flag states are NOT restated here (they drift) — see `REPO_RECORD_MAP.md` (and `backend/config.py`).
 
 ## Running
 
@@ -94,17 +104,13 @@ Frontend (React dashboard): runs out of `frontend/`, normally on port 5173 in de
 
 Was a fictional CFD model before today that under-counted P&L by ~1/entry_price. If you see numbers diverging by 5-50x between the bot and the dashboard or Polymarket UI, check whether someone reverted this. Historical trades were backfilled by `scripts/migrate_to_share_model_2026-05-19.py`.
 
-## Pydantic Settings v2 — `.env` IS loaded now
+## Pydantic Settings v2 — env IS loaded now
 
-`backend/config.py` uses `model_config = SettingsConfigDict(env_file=..., extra="ignore")`. Was using v1's `class Config: env_file = ".env"` syntax which v2 silently ignored. If something behaves like a config knob isn't being respected from `.env`, first sanity-check the syntax in `config.py` is still v2.
+`backend/config.py` uses `model_config = SettingsConfigDict(env_file=..., extra="ignore")`. Was using v1's `class Config: env_file = ".env"` syntax which v2 silently ignored. If something behaves like a config knob isn't being respected, first sanity-check the syntax in `config.py` is still v2.
 
-`.env` lives at the project root and currently sets:
-- `KALSHI_ENABLED=true`
-- `KALSHI_API_KEY_ID=<uuid>`
-- `KALSHI_PRIVATE_KEY_PATH=secrets/kalshi_private_key.pem`
-- `BTC_ENABLED=false`
+**Live env file (server):** `/home/trooth/.config/trooth/weather.env` (mode 600 — the `trooth-weather-bot.service` `EnvironmentFile`), currently 9 keys. The project-root `.env` is the **Mac-fallback only**, not the live source. **For the current flag names + live states + defaults, see `REPO_RECORD_MAP.md`** (don't restate them here — they drift).
 
-Adding a new env-controlled setting: add the field to `Settings` in `config.py` with a default, then it's automatically picked up from `.env` (or process env vars override).
+Adding a new env-controlled setting: add the field to `Settings` in `config.py` with a default, then it's picked up from the env file (or process env overrides).
 
 ## Kalshi is live (2026-05-19)
 
@@ -165,7 +171,7 @@ Cohort analysis + NOMADS hindcast backtest day. Four commits shipped (`1f61272`,
 
 - **`WEATHER_MIN_EDGE_THRESHOLD = 0.25`** (was 0.08, commit `1f61272`). Drops the failing 10-25% edge band entirely (6 historical trades, 1 win, −$402). The 0.08 floor was letting marginal-edge entries through that didn't have enough conviction to overcome variance.
 - **`WEATHER_MAX_EDGE_THRESHOLD = 0.50`** (new, commit `b8c6bb9`). Caps entries when the raw model-vs-market edge exceeds 50%. Distinct from `WEATHER_MAX_CLIPPED_EDGE = 0.25` which only fires when the model probability has been clipped at the 0.05/0.95 boundary. The new ceiling catches the at-the-money case (model 0.95, market 0.30, edge 0.65, no clipping). Historical 50%+ edge band was 12 trades, 1 win, −$390 — when the model thinks the market is wildly mispricing something, the model is usually wrong, not the market.
-- **`WEATHER_DISABLE_YES_ENTRIES = true`** (new, commit `d4644f1`, set in `.env`). **TEMPORARY** — pending settlement of the 3 currently-open YES positions (Denver 5/27, Denver 5/28, Chicago 5/28). Re-decide whether to flip back to `false` once we have n=7 clean YES/above outcomes instead of n=4. The data we have today doesn't justify keeping YES off permanently; it justifies waiting for the next round of evidence before re-enabling.
+- **`WEATHER_DISABLE_YES_ENTRIES = true`** (new, commit `d4644f1`). Originally framed as temporary pending more YES/above evidence — **superseded: decided KEEP `true`** per the 2026-06-09 note below (clean YES sample is past n=7 and still loses; NO is the engine). Live env confirms `true`.
 
 ### NOMADS hindcast adapter shipped (commits `47ae05f` + `f15eaa8`)
 
@@ -274,6 +280,19 @@ Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-0
 
 Full writeup: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-06-10.md`.
 
+## Operational notes (added 2026-06-15)
+
+### Conviction gate — `WEATHER_MIN_CONVICTION_Z` (default 0.0 = no-op)
+
+Staged a forecast-conviction entry filter. `z = |ensemble_mean - bucket_threshold| / ensemble_std` — how many standard deviations the ensemble mean sits from the market's threshold (high z = the forecast is far from the line relative to its spread). Computed in `generate_weather_signal` and **logged on every signal** (`| Conviction z: X.X` appended to the reasoning); enforced as an extra `and conviction_z >= settings.WEATHER_MIN_CONVICTION_Z` clause in the `actionable` test, with a filter note when it trips.
+
+- **Validated on 500 independently-settled offered markets:** z<1.0 wins **41.6%** (losing), z>=1.0 wins **~58-67%**. See `weather_nyc_dominance_analysis_2026-06-15.md`.
+- **Ships default `0.0` -> no-op** (every signal passes the clause; nothing filtered; verified live post-deploy: z logged on new signals, 0 conviction-filter notes). NOT set in `weather.env`.
+- **Arm via `weather.env`** (`WEATHER_MIN_CONVICTION_Z=1.0` recommended) + restart. **Reversible** (unset + restart, or restore `*.bak_convictionz_20260615`).
+- Tests: `tests/test_conviction_gate.py` (no-op at 0.0 stays actionable; floor 2.0 filters a low-z signal).
+
+Conviction gate ARMED at z>=1.0 on 2026-06-15 (weather.env). Reversible to 0.0. First strategy change since G0 began — pre/post-gate settles differ.
+
 ## Today's open carryovers
 
-Up-to-date status lives in `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/` — look for the latest dated session log and daily briefing files (latest: `session_log_2026-06-01.md`, this morning's briefing: `08_morning_briefing_2026-06-01.md`). As of cutover (2026-06-01 20:27 UTC): bankroll $9,193.72, realized P&L −$406.28, 49 trades, 4 open pending positions (#45 Polymarket 2391290, #46 Polymarket 2400011, #47 Polymarket 2407003, #48 Polymarket 2407026, all NO @ $100). Carryover: re-decide `WEATHER_DISABLE_YES_ENTRIES` once the YES/above sample grows from n=4 to n=7. Next session (3): migrate Claude bot + dashboard to the same droplet.
+Current state is NOT restated here (it rots — this section used to and went stale). **Canonical handoff:** `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/NAVIGATION.md` → the latest dated session log. **Code/state/infra map:** `REPO_RECORD_MAP.md` in the same folder.

@@ -24,7 +24,6 @@ class Settings(BaseSettings):
     WEATHER_LIVE_DAILY_LOSS_STOP_USD: float = 10.0  # daily realized-loss kill-switch (live only)
     WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD: float = 10.0  # OI1 (2026-06-24): hard cap on summed OPEN live exposure; set <= funded wallet balance
     WEATHER_LIVE_CITIES: str = "nyc"                    # OI1: live path restricted to these cities (defense-in-depth on WEATHER_CITIES)
-    WEATHER_MIN_CONVICTION_Z: float = 0.0              # ported from main 2026-06-15 gate; env sets 1.0 for the live test
     CLOB_HOST: str = "https://clob.polymarket.com"
     POLYMARKET_CHAIN_ID: int = 137                  # Polygon
     POLYMARKET_SIGNATURE_TYPE: int = 0             # match the wallet type set at G1
@@ -171,6 +170,11 @@ class Settings(BaseSettings):
     # Cap at 0.25 by default. Above-cap signals still log as ACTIONABLE
     # for visibility but trade at the capped size.
     WEATHER_MAX_CLIPPED_EDGE: float = 0.25
+    # Minimum forecast conviction to enter (added 2026-06-15). z = |ensemble_mean
+    # - bucket_threshold| / ensemble_std. Validated on 500 independently-settled
+    # offered markets: z<1.0 wins 41.6% (losing), z>=1.0 wins ~58-67%. Default 0.0
+    # = no-op. Arm via .env (recommend 1.0).
+    WEATHER_MIN_CONVICTION_Z: float = 0.0
     WEATHER_MAX_TRADE_SIZE: float = 100.0
     WEATHER_MAX_ALLOCATION_USD: float = 1500.0  # Max combined open weather exposure (was hardcoded $500 in scheduler; bumped 2026-05-19 after Kalshi expanded the universe 13x)
     # Cap on new weather positions opened per UTC day. Catches cross-scan accumulation patterns like the 2026-05-20 Kalshi pile-in (10 trades over 33 hours across ~9 scans). Polymarket normal-day rate is 1-3 so this is headroom, not a bite.
