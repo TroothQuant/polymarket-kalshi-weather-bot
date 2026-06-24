@@ -1,14 +1,18 @@
 """Weather bot LIVE execution via the Polymarket CLOB.
 
-Ported from the Claude bot's soak-tested `LiveTrader`
-(`trooth-claude-bot/python/trader.py`) — EIP-712 signing, HMAC L2 auth, and the
-GTC order lifecycle are reused, not reinvented.
+MIGRATED to Polymarket CLOB V2 + pUSD (2026-06-24, round 3). Uses
+`py-clob-client-v2` (1.0.1). The V2 SDK signs orders against the V2 CTF Exchange
+exchange_v2=0xE111180000d2663C0091e4f400237545B87B996B (EIP-712 domain version
+"2", default) with collateral=pUSD 0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB.
+L1/L2 API auth domain stays "1" (unchanged). Addresses verified against the V2
+SDK's baked config AND docs.polymarket.com/resources/contracts. The V1 SDK is
+NOT backward-compatible (order_version_mismatch) — do not import it here.
 
 HARD GUARDRAILS (G2, weather-live-v1):
   * This module is imported ONLY when `settings.WEATHER_LIVE_TRADING` is True.
-    The paper path never touches it, so `py-clob-client` is never imported on
+    The paper path never touches it, so `py-clob-client-v2` is never imported on
     the paper path. The flag ships False and STAYS False through G2.
-  * `py-clob-client` imports are LAZY (inside methods) for the same reason.
+  * `py-clob-client-v2` imports are LAZY (inside methods) for the same reason.
   * `build_order_args` is a pure static method (no py-clob, no network, no
     signing) so order-construction can be unit-tested with zero dependencies —
     this is the dry-run path. NO order is posted anywhere in G2.
@@ -29,7 +33,7 @@ class WeatherLiveTrader:
             from backend.config import settings as cfg  # singleton
         self.cfg = cfg
         # Lazy import — paper path must never pull py-clob-client.
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2.client import ClobClient
 
         self.client = ClobClient(
             cfg.CLOB_HOST,
@@ -44,14 +48,14 @@ class WeatherLiveTrader:
         # the private key (a network call at init).
         if (cfg.POLYMARKET_API_KEY and cfg.POLYMARKET_API_SECRET
                 and cfg.POLYMARKET_API_PASSPHRASE):
-            from py_clob_client.clob_types import ApiCreds
+            from py_clob_client_v2.clob_types import ApiCreds
             self.client.set_api_creds(ApiCreds(
                 api_key=cfg.POLYMARKET_API_KEY,
                 api_secret=cfg.POLYMARKET_API_SECRET,
                 api_passphrase=cfg.POLYMARKET_API_PASSPHRASE,
             ))
         else:
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
+            self.client.set_api_creds(self.client.create_or_derive_api_key())
         log.info("Weather live CLOB client initialized")
 
     # ── pure construction logic (no deps, no network — the dry-run unit) ──────
@@ -76,7 +80,7 @@ class WeatherLiveTrader:
 
     def get_balance(self) -> Optional[float]:
         """Actual USDC collateral balance (atomic /1e6). None on failure."""
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
         try:
             resp = self.client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
@@ -114,8 +118,8 @@ class WeatherLiveTrader:
         """Post a GTC BUY, poll 5×3s for MATCHED, cancel-if-unfilled. Returns
         {order_id, fill_price, shares, cost} on a confirmed fill, else None (so
         the caller writes NO Trade row on a non-fill)."""
-        from py_clob_client.clob_types import OrderArgs, OrderType
-        from py_clob_client.order_builder.constants import BUY
+        from py_clob_client_v2.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2.order_builder.constants import BUY
 
         args = self.build_order_args(token_id, size_usd, market_price)
         try:
@@ -148,7 +152,7 @@ class WeatherLiveTrader:
         if not matched:
             log.warning(f"Weather live GTC order not filled after 15s, cancelling: {order_id}")
             try:
-                self.client.cancel(order_id)
+                self.client.cancel_order(order_id)
             except Exception as e:
                 log.warning(f"Weather live cancel failed: {e}")
             return None

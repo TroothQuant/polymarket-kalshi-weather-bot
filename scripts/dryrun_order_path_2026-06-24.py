@@ -39,5 +39,5 @@ if spec['size'] < MIN_SHARES:
           f"(raise WEATHER_LIVE_MAX_TRADE_USD to ~${need:.2f}+ for the smoke test, or confirm the "
           f"market's real min_order_size from the live orderbook).")
 
-print(f"\nSAFETY: py_clob_client imported? {'py_clob_client' in sys.modules}  (must be False)")
+print(f"\nSAFETY: py_clob_client_v2 imported? {'py_clob_client_v2' in sys.modules}  (must be False)")
 print("No order posted. execute_buy (which signs+posts) was never called.")

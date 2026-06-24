@@ -42,4 +42,4 @@ xarray==2026.4.0
 # Weather LIVE execution (G2, weather-live-v1). NOT loaded on the paper path —
 # only imported by backend/core/live_trader.py when WEATHER_LIVE_TRADING=True.
 # Same pin as the soak-tested Claude bot.
-py-clob-client>=0.0.1
+py-clob-client-v2>=1.0.1  # CLOB V2 + pUSD (migrated 2026-06-24); V1 py-clob-client is NOT V2-compatible

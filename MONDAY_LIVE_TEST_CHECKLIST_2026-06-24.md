@@ -1,40 +1,48 @@
-# weather-live-v1 — Monday NYC Live-Test GO/NO-GO Checklist (rev 2026-06-24, round 2)
+# weather-live-v1 — Monday NYC Live-Test GO/NO-GO Checklist (rev 3, 2026-06-24 — CLOB V2 + pUSD)
 
-Engineering-only. **No flag flip, no real order.** Isolated worktree `trooth-weather-live` (branch `weather-live-v1`),
-isolated venv + DB. Live paper bot (`main`) verified untouched. Edits backed up `*.bak_livetest_20260624` / `*.bak_round2_20260624`.
+Engineering-only. **No flag flip, no real order.** Isolated worktree + venv + DB. Paper bot (`main`) verified untouched.
 
-## ✅ VERIFIED / DONE
-- **Strategy-faithful merge** — `main`→`weather-live-v1` (commit `23aeb87`), every hunk reviewed. Only semantic issue (duplicate `WEATHER_MIN_CONVICTION_Z` from a clean textual auto-merge) caught + fixed. Brought the **conviction gate** + decay sensor + governance.
-- **Conviction gate ACTIVE on the live path** — `weather_signals.py` filters `conviction_z < WEATHER_MIN_CONVICTION_Z`; env sets **z=1.0** (verified loaded). Conviction-failing signals never reach the live hook.
-- **Master flag still default-OFF** — `WEATHER_LIVE_TRADING=False` (config default + env). Jonathon's physical GO only.
-- **MG1** — isolated `weather_live.db` (`/home/trooth/.local/state/trooth/`), `order_id` added + verified; paper DB untouched.
-- **OI1 caps** — daily realized-loss kill-switch wired; per-trade cap; **total-open-exposure cap** added. 6 cap unit-tests pass.
-- **F2 order-path units FIX** — `OrderArgs(size=shares)` not `amount` (py-clob has no `amount` field). Confirmed against py-clob **0.34.6** signature.
-- **py-clob-client INSTALLED** in the isolated weather-live venv (`0.34.6`, httpx `0.28.1` — resolved the `httpx==0.26.0` requirements conflict). Import + `OrderArgs.size` confirmed.
-- **Real CLOB minimum confirmed = 15 shares** (96% of markets; the claude-bot's "5" was stale). Corrects round-1.
-- **Cap set for the real min** — `WEATHER_LIVE_MAX_TRADE_USD = $11` (15 shares × ~0.72 NO-band top = $10.8; **$3–5 would be REJECTED**). `WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD = $25`.
-- **Dry-run** — $11 → 19.3 shares @ price 0.57, clears the 15-share min; cost=size×price; no post, no py-clob in the dry-run.
-- **Full suite: 31/31 pass** in the isolated venv (incl. `paper_unchanged` + merged `test_conviction_gate.py`).
+## 🔴 ROUND-3 CONTEXT — why this was mandatory
+Polymarket cut over to **CLOB V2 + pUSD collateral on 2026-04-28**. The V1 SDK has **no backward compatibility** (`order_version_mismatch`). The bot's live path is now migrated to V2.
 
-## ⚠ REMAINING NOTES (not blockers, but know them)
-1. **The order path was just fixed and has still never executed** (the bug existed in the "soak-tested" port too). The first live order IS the test of the fix — watch order 1 like an experiment, not a trade.
-2. **One full smoke loss (~$10.8) trips the $10 daily-loss stop** — intended (halts further live opens). Fine for a 1-order test; bump `WEATHER_LIVE_DAILY_LOSS_STOP_USD` only if you want a 2nd attempt same day.
-3. **`redeem_won` is `NotImplementedError` (G2b)** — a WON live position needs MANUAL claim. Fine for one order.
-4. **httpx bumped 0.26→0.28** in the live venv (required by py-clob; matches the proven claude-bot). Tests pass; runtime httpx calls exercised first on Monday.
-5. **No systemd unit yet** — Monday runs via env-sourced manual launch (below).
+## ✅ V2 MIGRATION — DONE + VERIFIED
+- **SDK swapped:** removed `py-clob-client` 0.34.6 (V1); installed **`py-clob-client-v2` 1.0.1** in the isolated venv. `requirements.txt` updated.
+- **`WeatherLiveTrader` rebuilt for V2** — V2 client constructor; order signing via the V2 builder (**default `version=2` → V2 CTF Exchange + EIP-712 domain "2"**); collateral/balance → **pUSD** (`AssetType.COLLATERAL` now returns pUSD); creds `create_or_derive_api_key`; cancel `cancel_order`. L1/L2 auth domain stays "1" (SDK-internal).
+- **F2-on-V2:** V2 `OrderArgs.size` = *"Size in terms of the ConditionalToken"* = **SHARES** (same as the round-1 fix). `MarketOrderArgs.amount` = USD. **15-share CLOB min unchanged under V2.** Cap stays $11.
+- **V2 signing dry-run (throwaway key, NO post, no funds):** real EIP-712 signature produced; `makerAmount=11001000` (**$11.00 pUSD**, 6dp) for `takerAmount=19300000` (**19.3 shares**), implied price 0.5700 = order price ✓; signed against **V2 exchange `0xE111180000d2663C0091e4f400237545B87B996B`**, **pUSD `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB`**.
+- **Full suite: 31/31 pass** (V2 in venv; `paper_unchanged` + `test_conviction_gate` incl).
+- **Conviction gate active** (z=1.0), **flag default-OFF**, **isolated DB** — all carried from round 2.
+
+## 🔑 VERIFIED V2 CONTRACT ADDRESSES (Polygon, chain 137)
+Confirmed by THREE independent sources (docs.polymarket.com/resources/contracts + the V2 SDK's baked config + the actual signed order):
+| Contract | Address | Confidence |
+|---|---|---|
+| pUSD collateral | `0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB` | triple-confirmed |
+| V2 CTF Exchange | `0xE111180000d2663C0091e4f400237545B87B996B` | triple-confirmed |
+| V2 Neg-Risk Exchange | `0xe2222d279d744050d28e00520010520000310F59` | docs + SDK |
+| Conditional Tokens | `0x4D97DCd97eC945f40cF65F87097ACe5EA0476045` | docs + SDK |
+| **CollateralOnramp** | `0x93070a847efEf7F70739046A929D47a521F5B8ee` | **docs only — RE-VERIFY by eye before funding** |
+| USDC.e (source) | `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174` | docs + SDK(V1) |
+
+**⚠ Before ANY transaction, re-read each address directly on docs.polymarket.com. The CollateralOnramp (funding-critical) is from a single doc source — confirm it by eye.**
+
+## 💵 VERIFIED V2 FUNDING FLOW (API/private-key route → pUSD collateral)
+1. Get **USDC.e** (`0x2791…`) onto Polygon in the trading wallet (or use the bridge `POST /deposit` flow from any chain, which auto-wraps to pUSD — simplest).
+2. **Approve** the CollateralOnramp on the USDC.e ERC-20: `approve(spender=0x93070a847efEf7F70739046A929D47a521F5B8ee, amount)`.
+3. **Wrap**: `CollateralOnramp.wrap(_asset=0x2791…USDC.e, _to=<wallet>, _amount=<6-decimals>)` (e.g. 25 USDC.e = `25000000`). pUSD is minted to the wallet — that pUSD is the CLOB collateral.
+
+## ⚠ REMAINING NOTES
+- **The V2 order path has still never POSTED** (signing verified; the network post + fill-response parsing exercise first on Monday). `_parse_fill` keeps a robust fallback; confirm the real V2 fill-response keys (`makingAmount`/`takingAmount` vs V2 naming) on order 1.
+- `redeem_won` still `NotImplementedError` (G2b) — won live position needs MANUAL claim.
+- One full smoke loss (~$10.8) trips the $10 daily-loss stop (intended).
 
 ## Jonathon's Monday physical actions — FINAL ORDERED LIST
-1. **Fund** a small Polygon wallet with USDC (≈ **$15–25**: covers one ~$8–11 min order + buffer).
-2. **Secrets** → edit `/home/trooth/.config/trooth/weather-live.env` (stays mode 600): set `POLYMARKET_PRIVATE_KEY` + `POLYMARKET_FUNDER_ADDRESS`.
-3. **Set** `WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD` = funded balance (or ≤).
-4. **Launch** weather-live (env-sourced, isolated venv):
-   `set -a; source /home/trooth/.config/trooth/weather-live.env; set +a; cd /home/trooth/Projects/trooth-weather-live && .venv/bin/python run.py`
-   (confirm boot dump shows `WEATHER_LIVE_TRADING False`, conviction z=1.0, DB=weather_live.db — still paper at this point).
-5. **GO**: set `WEATHER_LIVE_TRADING=true` in the env, relaunch. This is the live flip — **Jonathon only.**
-6. **First-order verification (the experiment):** wait for ONE NYC conviction-passing NO signal →
-   - confirm in `weather_live.db`: `order_id` set; `size`(cost) & `entry_price`(fill) imply shares = size/entry_price; ~15+ shares.
-   - cross-check Polymarket UI: position, size, fill price match intent.
-   - **Match → continue. ANY mismatch → set `WEATHER_LIVE_TRADING=false` immediately, diagnose. No 2nd order until order 1 reconciles.**
+1. **Fund** wallet with **~$15–25 of USDC.e** on Polygon (covers one ~$8–11 min order + buffer).
+2. **Wrap to pUSD** (approve CollateralOnramp → `wrap()`), per the funding flow above — or use the bridge deposit which auto-wraps.
+3. **Secrets** → set `POLYMARKET_PRIVATE_KEY` + `POLYMARKET_FUNDER_ADDRESS` in `weather-live.env` (mode 600); set `WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD` = pUSD balance.
+4. **Launch** (still paper): `set -a; source /home/trooth/.config/trooth/weather-live.env; set +a; cd /home/trooth/Projects/trooth-weather-live && .venv/bin/python run.py` — confirm boot shows flag False, z=1.0, isolated DB.
+5. **GO**: set `WEATHER_LIVE_TRADING=true`, relaunch (Jonathon only).
+6. **First-order verification (experiment):** one NYC NO signal → confirm fill in `weather_live.db` (order_id, ~15+ shares, size/price) AND on Polymarket UI → match continue, mismatch flip OFF + diagnose.
 
 ## RECOMMENDATION
-**GO for a 1-order NYC smoke test** once Jonathon completes actions 1–3. The build is now strategy-faithful (conviction gate live), isolated, dependency-complete, cap-correct for the real CLOB minimum, and fully tested. Treat order 1 as the validation of the never-before-run order path.
+**GO for a 1-order NYC smoke test** once Jonathon funds + wraps to pUSD + sets secrets. The live path is now CLOB-V2 compatible (verified signing against the V2 exchange + pUSD), strategy-faithful (conviction gate), isolated, and fully tested. Order 1 remains the experiment that validates the never-posted V2 path live.
