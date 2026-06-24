@@ -21,8 +21,9 @@ SAMPLE = {
 
 def test_flag_ships_off():
     s = Settings()
-    assert s.WEATHER_LIVE_TRADING is False
-    assert s.WEATHER_LIVE_MAX_TRADE_USD == 2.0
+    assert s.WEATHER_LIVE_TRADING is False           # the master flag still ships OFF
+    assert s.WEATHER_LIVE_MAX_TRADE_USD == 11.0       # tiny per-trade cap; raised 2->11 (2026-06-24) to clear the REAL 15-share CLOB min
+    assert s.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD == 25.0
     assert s.WEATHER_LIVE_DAILY_LOSS_STOP_USD == 10.0
     assert s.CLOB_HOST == "https://clob.polymarket.com"
 

@@ -20,9 +20,9 @@ class Settings(BaseSettings):
     # funded. Nothing below this line is reachable while WEATHER_LIVE_TRADING is
     # False; the live trader is never even imported on the paper path.
     WEATHER_LIVE_TRADING: bool = False
-    WEATHER_LIVE_MAX_TRADE_USD: float = 2.0        # hard per-trade $ cap at G3 smoke
+    WEATHER_LIVE_MAX_TRADE_USD: float = 11.0       # per-trade $ cap; sized to clear the REAL CLOB 15-share min at NO entry-band top ~0.72 (15*0.72=$10.8). Corrects round-1 5-share assumption (2026-06-24)
     WEATHER_LIVE_DAILY_LOSS_STOP_USD: float = 10.0  # daily realized-loss kill-switch (live only)
-    WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD: float = 10.0  # OI1 (2026-06-24): hard cap on summed OPEN live exposure; set <= funded wallet balance
+    WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD: float = 25.0  # OI1: hard cap on summed OPEN live exposure (> per-trade so 1 order fits); set <= funded wallet balance at G1
     WEATHER_LIVE_CITIES: str = "nyc"                    # OI1: live path restricted to these cities (defense-in-depth on WEATHER_CITIES)
     CLOB_HOST: str = "https://clob.polymarket.com"
     POLYMARKET_CHAIN_ID: int = 137                  # Polygon

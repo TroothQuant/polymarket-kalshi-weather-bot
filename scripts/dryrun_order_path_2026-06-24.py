@@ -6,8 +6,8 @@ import sys
 sys.path.insert(0, "/home/trooth/Projects/trooth-weather-live")
 from backend.core.live_trader import WeatherLiveTrader
 
-MAX_TRADE_USD = 2.0          # WEATHER_LIVE_MAX_TRADE_USD
-MIN_SHARES = 5.0             # Polymarket CLOB practical minimum (per claude-bot proven path)
+MAX_TRADE_USD = 11.0          # WEATHER_LIVE_MAX_TRADE_USD (corrected for 15-share CLOB min)
+MIN_SHARES = 15.0            # REAL Polymarket CLOB minimum_order_size (96%% of markets; was assumed 5)
 
 # Representative NYC NO entry (0 live NYC weather markets in summer; this is a
 # conviction-passing crossover-band NO fade like the live paper book takes).
