@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     WEATHER_LIVE_TRADING: bool = False
     WEATHER_LIVE_MAX_TRADE_USD: float = 2.0        # hard per-trade $ cap at G3 smoke
     WEATHER_LIVE_DAILY_LOSS_STOP_USD: float = 10.0  # daily realized-loss kill-switch (live only)
+    WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD: float = 10.0  # OI1 (2026-06-24): hard cap on summed OPEN live exposure; set <= funded wallet balance
+    WEATHER_LIVE_CITIES: str = "nyc"                    # OI1: live path restricted to these cities (defense-in-depth on WEATHER_CITIES)
+    WEATHER_MIN_CONVICTION_Z: float = 0.0              # ported from main 2026-06-15 gate; env sets 1.0 for the live test
     CLOB_HOST: str = "https://clob.polymarket.com"
     POLYMARKET_CHAIN_ID: int = 137                  # Polygon
     POLYMARKET_SIGNATURE_TYPE: int = 0             # match the wallet type set at G1

@@ -66,7 +66,13 @@ class WeatherLiveTrader:
         if size_usd <= 0:
             raise ValueError("live order requires size_usd > 0")
         price = min(round(market_price + 0.02, 2), 0.99)
-        return {"token_id": str(token_id), "price": price, "amount": float(size_usd), "side": "BUY"}
+        # py-clob OrderArgs.size is SHARES (conditional tokens), NOT USD, and there
+        # is NO `amount` field — passing amount= raises TypeError (the latent bug
+        # that would have crashed the FIRST live order; fixed 2026-06-24). To spend
+        # ~size_usd at `price`, buy size_usd/price shares (cost = shares*price).
+        shares = round(size_usd / price, 2)
+        return {"token_id": str(token_id), "price": price, "size": shares,
+                "amount_usd": float(size_usd), "side": "BUY"}
 
     def get_balance(self) -> Optional[float]:
         """Actual USDC collateral balance (atomic /1e6). None on failure."""
@@ -113,7 +119,7 @@ class WeatherLiveTrader:
 
         args = self.build_order_args(token_id, size_usd, market_price)
         try:
-            order_args = OrderArgs(token_id=args["token_id"], amount=args["amount"],
+            order_args = OrderArgs(token_id=args["token_id"], size=args["size"],
                                    price=args["price"], side=BUY)
             signed_order = self.client.create_order(order_args)
             resp = self.client.post_order(signed_order, OrderType.GTC)

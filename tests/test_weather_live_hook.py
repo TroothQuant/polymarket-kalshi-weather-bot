@@ -20,7 +20,7 @@ def _signal(direction="yes", platform="polymarket", token_yes="YESTOK", token_no
         platform=platform, market_type=market_type, market_id="2400000", slug="slug",
         token_id_yes=token_yes, token_id_no=token_no,
         model_probability=0.6, threshold_f=90.0, direction="above",
-        metric="high", city_name="Chicago",
+        metric="high", city_name="Chicago", city_key="nyc",
     )
     return types.SimpleNamespace(
         market=market, direction=direction, edge=0.20,
@@ -33,6 +33,8 @@ def _settings(live=True, cap=2.0, stop=10.0):
         WEATHER_LIVE_TRADING=live,
         WEATHER_LIVE_MAX_TRADE_USD=cap,
         WEATHER_LIVE_DAILY_LOSS_STOP_USD=stop,
+        WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD=1000.0,
+        WEATHER_LIVE_CITIES="nyc",
     )
 
 

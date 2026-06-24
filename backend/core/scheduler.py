@@ -226,6 +226,18 @@ def _live_daily_realized_loss(db) -> float:
     return abs(float(total))
 
 
+def _live_total_open_exposure(db) -> float:
+    """Summed stake (USD) on OPEN live polymarket weather positions (order_id NOT
+    NULL, still pending). The OI1 total-exposure cap is checked against this."""
+    total = db.query(func.coalesce(func.sum(Trade.size), 0.0)).filter(
+        Trade.order_id.isnot(None),
+        Trade.market_type == "weather",
+        Trade.platform == "polymarket",
+        Trade.result == "pending",
+    ).scalar() or 0.0
+    return float(total)
+
+
 def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_trader_factory) -> LiveDecision:
     """Decide paper-vs-live for one weather candidate. Pure except for the
     injected db / live_trader_factory, so it unit-tests with mocks.
@@ -241,6 +253,13 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
             and market_type == "weather"):
         return LiveDecision("paper", entry_price, trade_size, None)
 
+    # OI1 NYC-only live restriction (defense-in-depth; the scan is also limited
+    # to WEATHER_CITIES). Non-NYC weather still trades on PAPER, never live.
+    live_cities = {c.strip().lower() for c in settings.WEATHER_LIVE_CITIES.split(",") if c.strip()}
+    city = (getattr(signal.market, "city_key", "") or "").lower()
+    if live_cities and city not in live_cities:
+        return LiveDecision("paper", entry_price, trade_size, None)
+
     # F3 guard: must know the CLOB token of the exact side we're buying. Never guess.
     token_id = (signal.market.token_id_yes if signal.direction == "yes"
                 else signal.market.token_id_no)
@@ -253,6 +272,11 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
 
     # Hard per-trade dollar cap.
     live_size = min(trade_size, settings.WEATHER_LIVE_MAX_TRADE_USD)
+
+    # OI1 hard TOTAL open-exposure cap. Summed open live stake + this trade must
+    # not exceed the ceiling (set <= funded wallet balance). Blocks pile-in.
+    if _live_total_open_exposure(db) + live_size > settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD:
+        return LiveDecision("halt", entry_price, trade_size, None)
 
     fill = live_trader_factory().execute_buy(token_id, live_size, entry_price)
     if fill is None:
@@ -467,7 +491,8 @@ async def weather_scan_and_trade_job():
                 if decision.action == "halt":
                     log_event(
                         "warning",
-                        f"[live] daily realized-loss stop ${settings.WEATHER_LIVE_DAILY_LOSS_STOP_USD:.0f} "
+                        f"[live] daily realized-loss (${settings.WEATHER_LIVE_DAILY_LOSS_STOP_USD:.0f}) "
+                        f"or total-exposure (${settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD:.0f}) cap "
                         f"reached — halting new live opens for the day.")
                     break
                 if decision.action == "skip":
