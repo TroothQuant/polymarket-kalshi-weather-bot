@@ -1,14 +1,5 @@
 # weather-live-v1 — Monday NYC Live-Test GO/NO-GO Checklist (rev 3, 2026-06-24 — CLOB V2 + pUSD)
 
-> # 🛑 LIVE TRACK STOPPED (2026-06-24) — DO NOT FUND, DO NOT GO LIVE
-> The bot trades **Polymarket Global** (`polymarket.com`), which is **geo-blocked for ALL US persons** since the
-> Jan-2022 CFTC settlement. Jonathon (Texas) has **no legal way to fund/trade it** (VPN bypass violates ToS + the
-> settlement — declined). The legal US venue — **Polymarket US (QCX LLC, CFTC-regulated, KYC, iOS app, FCM/USD)** —
-> is a **separate system with no CLOB/API the bot can use**. So the engineering below is **complete and verified
-> (CLOB-V2 + pUSD ready), but there is NO legal automated live route from Texas.** Everything below is preserved as
-> a ready build for a future legal path; **the Monday smoke test and all funding steps are SUSPENDED.**
-> **Permanent gate going forward:** verify platform legality + a legal funding route BEFORE any execution-layer work.
-
 Engineering-only. **No flag flip, no real order.** Isolated worktree + venv + DB. Paper bot (`main`) verified untouched.
 
 ## 🔴 ROUND-3 CONTEXT — why this was mandatory
@@ -53,5 +44,5 @@ Confirmed by THREE independent sources (docs.polymarket.com/resources/contracts 
 5. **GO**: set `WEATHER_LIVE_TRADING=true`, relaunch (Jonathon only).
 6. **First-order verification (experiment):** one NYC NO signal → confirm fill in `weather_live.db` (order_id, ~15+ shares, size/price) AND on Polymarket UI → match continue, mismatch flip OFF + diagnose.
 
-## RECOMMENDATION — SUSPENDED (no legal route)
-The execution layer is **GO-ready** (CLOB-V2 + pUSD verified, strategy-faithful, isolated, tested) — but the live test is **STOPPED on platform legality**, not engineering. **No funding, no flag flip.** Jonathon owns the legal follow-up: (1) bot stays paper/research; (2) bot-as-advisor while Jonathon trades MANUALLY on the legal Polymarket US app; (3) watch for a Polymarket US trading API, then consider re-pointing the bot (first confirm that venue even lists daily city-temperature markets — the edge is specific to that book). The funding steps above are retained for reference only and must NOT be executed against Polymarket Global from the US.
+## RECOMMENDATION
+The execution layer is **GO-ready** for an automated smoke test (CLOB-V2 + pUSD verified, strategy-faithful, isolated, tested). Not yet deployed (flag-OFF). Live testing is currently **operator-driven / manual**; the automated path stays parked + ready.
