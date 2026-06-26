@@ -238,6 +238,118 @@ def _live_total_open_exposure(db) -> float:
     return float(total)
 
 
+# F3: in-memory consecutive-divergence counter per token (resets on restart). A
+# divergence must persist >= RECON_GRACE_CYCLES cycles before it's flagged, since
+# data-api lags fresh fills.
+_recon_divergence_counts: dict = {}
+RECON_GRACE_CYCLES = 2
+
+
+def _sync_live_bankroll() -> bool:
+    """D4: when live, set BotState.bankroll to the REAL on-chain wallet balance
+    (sig_type=3) so Kelly sizing + the dashboard 'current cash' reflect real
+    money, not INITIAL_BANKROLL. Returns True if it's safe to open new positions
+    this cycle; False if live AND the balance read failed — caller skips new
+    entries, and bankroll is left UNCHANGED (never zeroed). No-op (True) on paper.
+
+    Realized P&L is computed elsewhere from settled Trade rows, NOT from this
+    bankroll/wallet value — so operator deposits / profit-sweeps never read as P&L."""
+    if not settings.WEATHER_LIVE_TRADING:
+        return True
+    try:
+        from backend.core.live_trader import WeatherLiveTrader
+        bal = WeatherLiveTrader().get_balance()
+    except Exception as e:
+        log_event("warning", f"[live] bankroll sync failed ({e}); bankroll unchanged, skipping new entries this cycle")
+        return False
+    if bal is None:
+        log_event("warning", "[live] balance read None; bankroll unchanged, skipping new entries this cycle")
+        return False
+    db = SessionLocal()
+    try:
+        state = db.query(BotState).first()
+        if state is not None:
+            state.bankroll = float(bal)
+            db.commit()
+            log_event("data", f"[live] bankroll synced to on-chain wallet: ${bal:.2f}")
+    finally:
+        db.close()
+    return True
+
+
+def _fetch_onchain_positions(funder: str) -> dict:
+    """F3: data-api/positions for the funder → {token_id: shares} for size>0.1.
+    Read-only, unauthenticated. Raises on network error (caller catches)."""
+    import json
+    import urllib.request
+    url = f"https://data-api.polymarket.com/positions?user={funder}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0",
+                                               "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.load(r)
+    out = {}
+    for p in (data or []):
+        tok = str(p.get("asset") or "")
+        try:
+            sz = float(p.get("size") or 0)
+        except (TypeError, ValueError):
+            sz = 0.0
+        if tok and sz > 0.1:
+            out[tok] = sz
+    return out
+
+
+def _reconcile_live_positions() -> None:
+    """F3: per-cycle reconcile recorded OPEN live positions vs data-api/positions,
+    BOTH directions — ghost (recorded, not on-chain) + phantom (on-chain, not
+    recorded; the E3 backstop). Surface-only: logs + sets BotState.reconcile_status
+    for the dashboard; NEVER auto-closes. A divergence must persist
+    RECON_GRACE_CYCLES cycles before flagging (data-api lags fresh fills). No-op
+    on paper."""
+    if not settings.WEATHER_LIVE_TRADING:
+        return
+    funder = getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
+    if not funder:
+        return
+    try:
+        onchain = _fetch_onchain_positions(funder)
+    except Exception as e:
+        log_event("warning", f"[live] reconcile: data-api fetch failed ({e}); skipping this cycle")
+        return
+    db = SessionLocal()
+    try:
+        rows = db.query(Trade).filter(
+            Trade.order_id.isnot(None),
+            Trade.market_type == "weather",
+            Trade.result == "pending",
+            Trade.token_id.isnot(None),
+        ).all()
+        recorded = {t.token_id for t in rows}
+        onchain_toks = set(onchain.keys())
+        ghosts = recorded - onchain_toks       # recorded but NOT on-chain
+        phantoms = onchain_toks - recorded     # on-chain but NOT recorded
+        diverged = ghosts | phantoms
+        for tok in list(_recon_divergence_counts):
+            if tok not in diverged:
+                _recon_divergence_counts.pop(tok, None)
+        for tok in diverged:
+            _recon_divergence_counts[tok] = _recon_divergence_counts.get(tok, 0) + 1
+        conf_ghost = [t for t in ghosts if _recon_divergence_counts[t] >= RECON_GRACE_CYCLES]
+        conf_phantom = [t for t in phantoms if _recon_divergence_counts[t] >= RECON_GRACE_CYCLES]
+        state = db.query(BotState).first()
+        if conf_ghost or conf_phantom:
+            msg = f"⚠ {len(conf_phantom)} phantom / {len(conf_ghost)} ghost (>= {RECON_GRACE_CYCLES} cycles)"
+            log_event("warning", f"[live] RECONCILE DIVERGENCE: {msg}; phantom={conf_phantom} ghost={conf_ghost}")
+            if state is not None:
+                state.reconcile_status = msg
+                db.commit()
+        elif state is not None and state.reconcile_status not in (None, "ok"):
+            state.reconcile_status = "ok"
+            db.commit()
+    finally:
+        db.close()
+
+
 def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_trader_factory) -> LiveDecision:
     """Decide paper-vs-live for one weather candidate. Pure except for the
     injected db / live_trader_factory, so it unit-tests with mocks.
@@ -292,6 +404,13 @@ async def weather_scan_and_trade_job():
     Runs every 5 minutes when WEATHER_ENABLED.
     """
     log_event("info", "Scanning weather temperature markets...")
+
+    # D4/F3 (2026-06-26): when live, sync bankroll to the REAL wallet BEFORE
+    # sizing, and reconcile recorded vs on-chain positions. Both are no-ops on
+    # paper. If the balance read fails, skip NEW entries this cycle (review +
+    # settlement, which run in other jobs, are unaffected).
+    live_entries_ok = _sync_live_bankroll()
+    _reconcile_live_positions()
 
     try:
         from backend.core.weather_signals import scan_for_weather_signals
@@ -414,7 +533,9 @@ async def weather_scan_and_trade_job():
             # the 2265993/2274465/2274497 dupes observed on 2026-05-15..17 and the
             # 2274497 opposite-direction re-entry. Also blocks re-buy of an already-
             # settled market on later days (which makes no sense for daily resolution).
-            for signal in actionable[:MAX_TRADES_PER_SCAN]:
+            if not live_entries_ok:
+                log_event("info", "[live] balance unavailable this cycle — skipping new entries (position review/settlement run separately)")
+            for signal in (actionable[:MAX_TRADES_PER_SCAN] if live_entries_ok else []):
                 # Kalshi trade kill-switch (2026-05-20): defense-in-depth check.
                 # The pre-loop filter above should have removed all Kalshi
                 # signals when KALSHI_TRADING_ENABLED=False, but we leave this
@@ -522,6 +643,10 @@ async def weather_scan_and_trade_job():
                     market_price_at_entry=signal.market_probability,
                     edge_at_entry=signal.edge,
                     order_id=order_id,  # NULL on paper; CLOB id on a live fill
+                    # F3: store the bought outcome's CLOB token id on live fills
+                    # (NULL on paper) so reconciliation can match data-api/positions.
+                    token_id=((signal.market.token_id_yes if signal.direction == "yes"
+                               else signal.market.token_id_no) if order_id else None),
                 )
 
                 db.add(trade)

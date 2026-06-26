@@ -60,6 +60,10 @@ class Trade(Base):
     # branch merges to main, or paper inserts on the prod DB would reference a
     # column the live table doesn't have yet.
     order_id = Column(String, nullable=True, index=True)
+    # F3 (2026-06-26): CLOB token id of the bought outcome on a LIVE fill — lets
+    # per-cycle reconciliation match recorded positions to data-api/positions by
+    # token. NULL on paper. Additive + nullable.
+    token_id = Column(String, nullable=True, index=True)
 
     # Settlement
     settled = Column(Boolean, default=False)
@@ -95,6 +99,9 @@ class BotState(Base):
     total_pnl = Column(Float, default=0.0)
     last_run = Column(DateTime, nullable=True)
     is_running = Column(Boolean, default=False)
+    # F3 (2026-06-26): latest live position-reconciliation status for the
+    # dashboard ("ok" / "⚠ N phantom / M ghost …"). Live-only; NULL on paper.
+    reconcile_status = Column(String, nullable=True)
 
 
 class Signal(Base):

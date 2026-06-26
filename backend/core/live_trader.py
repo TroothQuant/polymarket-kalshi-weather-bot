@@ -18,7 +18,6 @@ HARD GUARDRAILS (G2, weather-live-v1):
     this is the dry-run path. NO order is posted anywhere in G2.
 """
 import logging
-import time
 from typing import Optional
 
 log = logging.getLogger("trading_bot")
@@ -90,34 +89,42 @@ class WeatherLiveTrader:
             return None
 
     @staticmethod
-    def _parse_fill(resp: dict, order_id, size_usd: float, fallback_price: float) -> Optional[dict]:
-        """Resolve ACTUAL fill economics from a CLOB order response.
+    def _parse_fill(resp: dict, order_id, size_usd: float = 0.0,
+                    fallback_price: float = 0.0) -> Optional[dict]:
+        """Resolve ACTUAL fill economics from a FAK order response.
 
-        `fill_price` is the REALIZED AVERAGE (cost / shares), so a stored row with
-        size=cost and entry_price=fill_price implies EXACTLY `shares` via the
-        settlement identity shares = size / entry_price. Returns None when no
-        shares filled, so the caller writes no row.
+        Under FAK (fill-and-kill) the response is AUTHORITATIVE: makingAmount =
+        USDC actually paid, takingAmount = conditional tokens actually received.
+        A killed / zero fill (taking<=0 or making<=0) returns None so the caller
+        writes NO row. We deliberately do NOT estimate from size_usd/price — that
+        GTC-era fallback would fabricate a phantom on a 0-fill now that this is
+        called on every (incl. killed) response (audit E3, 2026-06-26).
+
+        `fill_price` = making/taking (realized average); a stored row with
+        size=cost, entry_price=fill_price recovers shares via size/entry_price.
+        (size_usd / fallback_price kept for signature compatibility; unused.)
         """
-        cost = float(size_usd)
-        shares = size_usd / fallback_price if fallback_price > 0 else 0.0
         try:
-            making = float(resp.get("makingAmount", 0))  # USDC paid
-            taking = float(resp.get("takingAmount", 0))  # conditional tokens received
-            if making > 0:
-                cost = making
-            if taking > 0:
-                shares = taking
+            making = float(resp.get("makingAmount") or 0)  # USDC paid
+            taking = float(resp.get("takingAmount") or 0)  # conditional tokens received
         except (ValueError, TypeError):
-            pass
-        if shares <= 0:
             return None
-        return {"order_id": order_id, "fill_price": cost / shares,
-                "shares": shares, "cost": cost}
+        if taking <= 0 or making <= 0:
+            return None
+        return {"order_id": order_id, "fill_price": making / taking,
+                "shares": taking, "cost": making}
 
     def execute_buy(self, token_id: str, size_usd: float, market_price: float) -> Optional[dict]:
-        """Post a GTC BUY, poll 5×3s for MATCHED, cancel-if-unfilled. Returns
-        {order_id, fill_price, shares, cost} on a confirmed fill, else None (so
-        the caller writes NO Trade row on a non-fill)."""
+        """Post a FAK (fill-and-kill) BUY at the +2-tick taker price: it fills
+        immediately against the book and KILLS any unfilled remainder — no
+        resting order, no poll, no cancel, and no partial-fill PHANTOM (audit E3,
+        switched from GTC poll-then-cancel 2026-06-26). The FAK response carries
+        the ACTUAL makingAmount/takingAmount, so `_parse_fill` records the true
+        fill, or None on a zero fill (killed) so the caller writes NO Trade row.
+
+        FAK matches the existing +2-tick taker intent: we always wanted an
+        immediate taker fill, never a resting order. A thin book fills LESS than
+        requested but records it ACCURATELY (no phantom)."""
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
         from py_clob_client_v2.order_builder.constants import BUY
 
@@ -126,40 +133,19 @@ class WeatherLiveTrader:
             order_args = OrderArgs(token_id=args["token_id"], size=args["size"],
                                    price=args["price"], side=BUY)
             signed_order = self.client.create_order(order_args)
-            resp = self.client.post_order(signed_order, OrderType.GTC)
-            order_id = resp.get("orderID") or resp.get("id")
-            log.info(f"Weather live CLOB GTC order submitted: {order_id}")
+            resp = self.client.post_order(signed_order, OrderType.FAK)
+            order_id = (resp.get("orderID") or resp.get("id")) if isinstance(resp, dict) else None
+            status = resp.get("status") if isinstance(resp, dict) else None
+            log.info(f"Weather live CLOB FAK order submitted: {order_id} (status={status})")
         except Exception as e:
             log.error(f"Weather live CLOB order failed: {e}")
             return None
 
-        matched = False
-        for attempt in range(5):
-            time.sleep(3)
-            try:
-                info = self.client.get_order(order_id)
-                status = info.get("status") if isinstance(info, dict) else None
-                log.info(f"Weather live order poll {attempt+1}: status={status}")
-                if status == "MATCHED":
-                    matched = True
-                    break
-                if status in ("CANCELLED", "DELAYED"):
-                    break
-            except Exception as e:
-                log.warning(f"Weather live order status check failed: {e}")
-                break
-
-        if not matched:
-            log.warning(f"Weather live GTC order not filled after 15s, cancelling: {order_id}")
-            try:
-                self.client.cancel_order(order_id)
-            except Exception as e:
-                log.warning(f"Weather live cancel failed: {e}")
-            return None
-
+        # FAK is filled-or-killed at submit; the response is authoritative, so no
+        # poll/cancel. A zero fill -> _parse_fill returns None -> caller writes no row.
         fill = self._parse_fill(resp, order_id, size_usd, args["price"])
         if fill is None:
-            log.warning("Weather live order MATCHED but reported zero shares — treating as non-fill")
+            log.info("Weather live FAK order filled 0 shares (killed) — non-fill, no row")
             return None
         log.info(f"Weather live fill: ${fill['cost']:.2f} "
                  f"({fill['shares']:.2f} sh @ {fill['fill_price']:.4f})")

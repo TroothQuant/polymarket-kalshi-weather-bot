@@ -70,10 +70,20 @@ def test_parse_fill_price_is_realized_average_and_implies_shares():
     assert abs(f["cost"] / f["fill_price"] - f["shares"]) < 1e-9
 
 
-def test_parse_fill_fallback_consistent_when_no_amounts():
-    f = WeatherLiveTrader._parse_fill({}, "OID", 2.0, 0.40)
-    assert abs(f["fill_price"] - 0.40) < 1e-12
-    assert abs(f["cost"] / f["fill_price"] - f["shares"]) < 1e-9
+def test_parse_fill_empty_response_is_non_fill():
+    # Under FAK the response is authoritative: no amounts = killed = non-fill.
+    # (No size_usd/price estimate fallback — that could fabricate a phantom on a
+    # 0-fill now that _parse_fill runs on every response. Audit E3, 2026-06-26.)
+    assert WeatherLiveTrader._parse_fill({}, "OID", 2.0, 0.40) is None
+
+
+def test_parse_fill_partial_fak_records_actual_filled_amount():
+    # Thin-book FAK fills only part: record the ACTUAL filled portion, no phantom
+    # for the killed remainder.
+    f = WeatherLiveTrader._parse_fill(
+        {"makingAmount": "5.5", "takingAmount": "10.0"}, "OID", 11.0, 0.55)
+    assert f["cost"] == 5.5 and f["shares"] == 10.0
+    assert abs(f["fill_price"] - 0.55) < 1e-9
 
 
 def test_parse_fill_zero_shares_returns_none():
