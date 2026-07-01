@@ -184,6 +184,18 @@ class Settings(BaseSettings):
     WEATHER_STOP_LOSS_FRACTION: float = 0.50
     WEATHER_STOP_LOSS_INTERVAL_SECONDS: int = 600  # check every 10 min
 
+    # ── Model-upgrade v1 (2026-07-01, per research_model_upgrade_groundwork) ──
+    # SHADOW by default: v2 (per-city/per-model bias correction + equal-model-weight
+    # GFS+ECMWF pool) is computed and logged alongside v1 but does NOT trade. Flip
+    # WEATHER_MODEL_V2_TRADING only after the pre-committed shadow gate passes.
+    WEATHER_MODEL_V2_SHADOW: bool = True    # compute + log v2 alongside v1 (safe-on)
+    WEATHER_MODEL_V2_TRADING: bool = False  # feed v2 (not v1) into edge/sizing — GATED
+    WEATHER_MODEL_BIAS_ENABLED: bool = True  # apply the nightly per-(city,model) bias table
+    WEATHER_MODEL_V2_MODELS: str = "gfs_seamless,ecmwf_ifs025"  # GEM excluded (cold outlier)
+    WEATHER_MODEL_BIAS_MIN_DAYS: int = 20   # below this n, bias=0.0 (uncorrected)
+    WEATHER_MODEL_BIAS_WINDOW_DAYS: int = 30
+    WEATHER_MODEL_BIAS_CLAMP_F: float = 5.0  # clamp |bias| to this many °F
+
     # API / dashboard hardening (added 2026-05-20 per audit CRITICAL #2).
     # The FastAPI app used to bind 0.0.0.0 with CORS=* and no auth on the
     # mutating endpoints (/api/bot/reset, /api/bot/start|stop, /api/simulate-

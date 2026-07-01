@@ -133,9 +133,69 @@ class EnsembleForecast:
         return max(frac, 1 - frac)
 
 
+class PooledForecast:
+    """Model-upgrade v1 (2026-07-01): equal-MODEL-weight pooled forecast with
+    per-model bias correction. Mirrors EnsembleForecast's probability_* interface,
+    but each probability is
+        0.5 * frac(GFS corrected members) + 0.5 * frac(ECMWF corrected members)
+    so ECMWF's ~51 members can't swamp GFS's ~31 — each model votes as a block.
+    Members are bias-corrected BEFORE pooling: corrected = raw − bias_f(city, model).
+    """
+
+    def __init__(self, city_key, city_name, target_date, highs_by_model, lows_by_model):
+        self.city_key = city_key
+        self.city_name = city_name
+        self.target_date = target_date
+        self.highs_by_model = {m: v for m, v in highs_by_model.items() if v}
+        self.lows_by_model = {m: v for m, v in lows_by_model.items() if v}
+        self._high_models = list(self.highs_by_model)
+        self._low_models = list(self.lows_by_model)
+        # Display stats: equal-model-weight mean (mean of per-model means); std +
+        # member count over the member union (rough dispersion for the log/columns).
+        hmeans = [statistics.mean(v) for v in self.highs_by_model.values()]
+        union_h = [x for v in self.highs_by_model.values() for x in v]
+        self.mean_high = statistics.mean(hmeans) if hmeans else 0.0
+        self.std_high = statistics.pstdev(union_h) if len(union_h) > 1 else 0.0
+        lmeans = [statistics.mean(v) for v in self.lows_by_model.values()]
+        union_l = [x for v in self.lows_by_model.values() for x in v]
+        self.mean_low = statistics.mean(lmeans) if lmeans else 0.0
+        self.std_low = statistics.pstdev(union_l) if len(union_l) > 1 else 0.0
+        self.num_members = len(union_h)
+        # v1-compat attributes (some callers read these directly).
+        self.member_highs = union_h
+        self.member_lows = union_l
+
+    @staticmethod
+    def _pooled(by_model, models, pred):
+        if not models:
+            return 0.5
+        fracs = [sum(1 for x in by_model[m] if pred(x)) / len(by_model[m]) for m in models]
+        return sum(fracs) / len(fracs)   # EQUAL model weight
+
+    def probability_high_above(self, threshold_f: float) -> float:
+        return self._pooled(self.highs_by_model, self._high_models, lambda h: h > threshold_f)
+
+    def probability_high_below(self, threshold_f: float) -> float:
+        return 1.0 - self.probability_high_above(threshold_f)
+
+    def probability_high_between(self, floor_f: float, cap_f: float) -> float:
+        return self._pooled(self.highs_by_model, self._high_models, lambda h: floor_f <= h < cap_f)
+
+    def probability_low_above(self, threshold_f: float) -> float:
+        return self._pooled(self.lows_by_model, self._low_models, lambda l: l > threshold_f)
+
+    def probability_low_below(self, threshold_f: float) -> float:
+        return 1.0 - self.probability_low_above(threshold_f)
+
+    def probability_low_between(self, floor_f: float, cap_f: float) -> float:
+        return self._pooled(self.lows_by_model, self._low_models, lambda l: floor_f <= l < cap_f)
+
+
 # Simple cache: (city_key, target_date_str) -> (timestamp, EnsembleForecast)
 _forecast_cache: Dict[str, tuple] = {}
 _CACHE_TTL = 900  # 15 minutes
+# Multi-model (v2 shadow) cache — separate so v1's cache is untouched.
+_multimodel_cache: Dict[str, tuple] = {}
 
 
 def _celsius_to_fahrenheit(c: float) -> float:
@@ -223,6 +283,78 @@ async def fetch_ensemble_forecast(city_key: str, target_date: Optional[date] = N
 
     except Exception as e:
         logger.warning(f"Failed to fetch ensemble forecast for {city_key}: {e}")
+        return None
+
+
+async def fetch_multimodel_forecast(city_key: str, target_date: Optional[date] = None,
+                                    models: Optional[List[str]] = None) -> Optional[dict]:
+    """Model-upgrade v1 (2026-07-01): fetch per-member daily max/min for MULTIPLE
+    models in ONE call, returning {"highs": {model: [F]}, "lows": {model: [F]}} —
+    or None on failure.
+
+    Used ONLY by the v2 SHADOW path; fetch_ensemble_forecast (v1, GFS-only) is left
+    completely untouched so v1 trading stays byte-identical (a deliberate isolation
+    choice — the extra cached call is cheap insurance for the live benchmark).
+
+    Key routing: open-meteo leaves the FIRST requested model's variables un-suffixed
+    and suffixes the rest, so a key belongs to a later model iff its model id appears
+    in the key; otherwise it is the first model.
+    """
+    if city_key not in CITY_CONFIG:
+        return None
+    if target_date is None:
+        target_date = date.today()
+    if models is None:
+        models = ["gfs_seamless", "ecmwf_ifs025"]
+
+    cache_key = f"{city_key}_{target_date.isoformat()}_{','.join(models)}"
+    now = time.time()
+    if cache_key in _multimodel_cache:
+        cached_time, cached = _multimodel_cache[cache_key]
+        if now - cached_time < _CACHE_TTL:
+            return cached
+
+    city = CITY_CONFIG[city_key]
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                "https://ensemble-api.open-meteo.com/v1/ensemble",
+                params={
+                    "latitude": city["lat"], "longitude": city["lon"],
+                    "daily": "temperature_2m_max,temperature_2m_min",
+                    "temperature_unit": "fahrenheit",
+                    "start_date": target_date.isoformat(),
+                    "end_date": target_date.isoformat(),
+                    "models": ",".join(models),
+                },
+            )
+            resp.raise_for_status()
+            daily = resp.json().get("daily", {})
+
+        highs = {m: [] for m in models}
+        lows = {m: [] for m in models}
+        rest = models[1:]  # later models are suffixed; first model is bare
+        for key, values in daily.items():
+            if key == "time" or not isinstance(values, list) or not values:
+                continue
+            val = values[0]
+            if val is None:
+                continue
+            model = next((m for m in rest if m in key), models[0])
+            if "temperature_2m_max" in key:
+                highs[model].append(float(val))
+            elif "temperature_2m_min" in key:
+                lows[model].append(float(val))
+
+        # Require the primary (first) model to have members — else this is useless.
+        if not highs.get(models[0]):
+            logger.warning(f"Multi-model fetch for {city_key}: primary model {models[0]} empty")
+            return None
+        result = {"highs": highs, "lows": lows}
+        _multimodel_cache[cache_key] = (now, result)
+        return result
+    except Exception as e:
+        logger.warning(f"Multi-model fetch failed for {city_key}: {e}")
         return None
 
 

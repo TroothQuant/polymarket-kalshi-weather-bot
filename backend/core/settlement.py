@@ -391,7 +391,16 @@ async def settle_pending_trades(db: Session) -> List[Trade]:
                     if linked_signal:
                         actual_outcome = "up" if settlement_value == 1.0 else "down"
                         linked_signal.actual_outcome = actual_outcome
-                        linked_signal.outcome_correct = (linked_signal.direction == actual_outcome)
+                        # BUGFIX 2026-07-01: weather signals store direction as
+                        # 'yes'/'no', not 'up'/'down' — the old equality compared
+                        # 'yes' == 'up' and NEVER matched, so every graded weather
+                        # signal read outcome_correct=False (the ~54/10.2k, all-0%
+                        # symptom). Normalize yes↔up / no↔down before comparing.
+                        # (The bulk backfill of untraded signals is done by the
+                        # nightly model_bias.grade_weather_signals job.)
+                        dir_norm = {"yes": "up", "no": "down"}.get(
+                            linked_signal.direction, linked_signal.direction)
+                        linked_signal.outcome_correct = (dir_norm == actual_outcome)
                         linked_signal.settlement_value = settlement_value
                         linked_signal.settled_at = datetime.utcnow()
         except Exception as e:

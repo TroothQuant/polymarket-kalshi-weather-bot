@@ -120,6 +120,15 @@ class Signal(Base):
     settlement_value = Column(Float, nullable=True)     # 1.0=UP won, 0.0=DOWN won
     settled_at = Column(DateTime, nullable=True)        # when we recorded the outcome
 
+    # Model-upgrade v1 SHADOW (2026-07-01): v2 = per-city/per-model bias-corrected +
+    # equal-model-weight GFS/ECMWF pool, logged ALONGSIDE v1. v1 still trades unless
+    # WEATHER_MODEL_V2_TRADING. All nullable (NULL when v2 can't be computed — a v2
+    # failure must never affect the v1 signal).
+    model_probability_v2 = Column(Float, nullable=True)
+    ensemble_mean_v2 = Column(Float, nullable=True)
+    ensemble_std_v2 = Column(Float, nullable=True)
+    bias_applied_json = Column(String, nullable=True)   # {"gfs_seamless": -1.6, "ecmwf_ifs025": 0.0}
+
 
 class AILog(Base):
     """Log of all AI API calls."""
@@ -180,6 +189,34 @@ class PnlSnapshot(Base):
     is_running = Column(Boolean, default=True)
 
 
+class ModelBias(Base):
+    """Per-(city, model) additive daily-HIGH bias (forecast − ERA5 actual at the
+    bot's coords, GMT frame — the model-upgrade groundwork frame). Refreshed
+    nightly; bias_f is 0.0 (uncorrected) until n_days >= 20, and clamped ±5°F."""
+    __tablename__ = "model_bias"
+    id = Column(Integer, primary_key=True)
+    city = Column(String, index=True)
+    model = Column(String, index=True)
+    bias_f = Column(Float, default=0.0)
+    n_days = Column(Integer, default=0)
+    window_days = Column(Integer, default=30)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ForecastLog(Base):
+    """Persist-forward daily-high forecast per (city, model, target_date). The
+    ensemble API's past_days is unreliable (sparse members), so the bias window
+    is filled by logging each night's forecast and joining to ERA5 actuals as
+    they become available. One row per (city, model, target_date) — latest wins."""
+    __tablename__ = "forecast_log"
+    id = Column(Integer, primary_key=True)
+    city = Column(String, index=True)
+    model = Column(String, index=True)
+    target_date = Column(String, index=True)   # ISO 'YYYY-MM-DD'
+    forecast_high = Column(Float)
+    recorded_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
@@ -222,6 +259,11 @@ def ensure_schema():
                 ("settlement_value", "FLOAT"),
                 ("settled_at", "DATETIME"),
                 ("market_type", "VARCHAR DEFAULT 'btc'"),
+                # Model-upgrade v1 shadow columns (2026-07-01, audit model-v1).
+                ("model_probability_v2", "FLOAT"),
+                ("ensemble_mean_v2", "FLOAT"),
+                ("ensemble_std_v2", "FLOAT"),
+                ("bias_applied_json", "TEXT"),
             ]:
                 if col not in signal_columns:
                     try:
@@ -229,6 +271,14 @@ def ensure_schema():
                             conn.execute(text(f"ALTER TABLE signals ADD COLUMN {col} {coltype}"))
                     except Exception:
                         pass  # column already exists
+
+    # Model-upgrade v1 tables (2026-07-01): create if missing. create_all in
+    # init_db already handles new tables, but do it defensively here too so an
+    # older DB that skips init_db still gets them (idempotent).
+    try:
+        Base.metadata.create_all(bind=engine, tables=[ModelBias.__table__, ForecastLog.__table__])
+    except Exception:
+        pass
 
 
 def get_db():

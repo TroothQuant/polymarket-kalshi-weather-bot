@@ -39,6 +39,14 @@ class WeatherTradingSignal:
     ensemble_std: float = 0.0
     ensemble_members: int = 0
 
+    # Model-upgrade v1 SHADOW (2026-07-01): v2 = per-city/per-model bias-corrected +
+    # equal-model-weight GFS/ECMWF pool. NULL when v2 couldn't be computed. Logged
+    # alongside v1; v1 trades unless WEATHER_MODEL_V2_TRADING.
+    model_probability_v2: Optional[float] = None
+    ensemble_mean_v2: Optional[float] = None
+    ensemble_std_v2: Optional[float] = None
+    bias_applied_json: Optional[str] = None
+
     @property
     def passes_threshold(self) -> bool:
         """Check if signal passes the edge band [MIN, MAX] AND direction gate.
@@ -57,6 +65,80 @@ class WeatherTradingSignal:
         if settings.WEATHER_DISABLE_YES_ENTRIES and self.direction == "yes":
             return False
         return True
+
+
+def _model_yes_prob(forecast, market) -> float:
+    """Map the market's question to the right probability_* call on a forecast-like
+    object (raw, pre-clip). Shared by v1 (GFS EnsembleForecast) and v2 (PooledForecast)
+    so both compute the SAME way on their respective member sets. Extracted verbatim
+    from the v1 inline dispatch (2026-07-01) — v1 behavior is unchanged."""
+    strike_type = (getattr(market, "strike_type", None) or "").lower() or None
+    is_kalshi = (getattr(market, "platform", "") == "kalshi")
+    cap_shift = 1.0 if is_kalshi else 0.0
+    floor_shift = 1.0 if is_kalshi else 0.0
+    if strike_type and market.metric == "high":
+        if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
+            return forecast.probability_high_between(market.floor_strike, market.cap_strike + cap_shift)
+        elif strike_type == "greater" and market.floor_strike is not None:
+            return forecast.probability_high_above(market.floor_strike + floor_shift)
+        elif strike_type == "less" and market.cap_strike is not None:
+            return forecast.probability_high_below(market.cap_strike)
+        else:
+            if market.direction == "above":
+                return forecast.probability_high_above(market.threshold_f)
+            return forecast.probability_high_below(market.threshold_f)
+    elif strike_type and market.metric == "low":
+        if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
+            return forecast.probability_low_between(market.floor_strike, market.cap_strike + cap_shift)
+        elif strike_type == "greater" and market.floor_strike is not None:
+            return forecast.probability_low_above(market.floor_strike + floor_shift)
+        elif strike_type == "less" and market.cap_strike is not None:
+            return forecast.probability_low_below(market.cap_strike)
+        else:
+            if market.direction == "above":
+                return forecast.probability_low_above(market.threshold_f)
+            return forecast.probability_low_below(market.threshold_f)
+    else:
+        if market.metric == "high":
+            if market.direction == "above":
+                return forecast.probability_high_above(market.threshold_f)
+            return forecast.probability_high_below(market.threshold_f)
+        else:
+            if market.direction == "above":
+                return forecast.probability_low_above(market.threshold_f)
+            return forecast.probability_low_below(market.threshold_f)
+
+
+async def _compute_v2_shadow(market):
+    """Compute the v2 YES probability (bias-corrected, equal-model-weight GFS+ECMWF
+    pool) + display stats + bias JSON. Returns (prob_clipped, mean, std, bias_json)
+    or (None, None, None, None) if v2 can't be computed. A v2 failure NEVER affects
+    v1 — the caller just logs NULLs."""
+    try:
+        from backend.data.weather import fetch_multimodel_forecast, PooledForecast
+        from backend.core.model_bias import get_bias_cached, MODELS
+        import json as _json
+
+        raw = await fetch_multimodel_forecast(market.city_key, market.target_date, list(MODELS))
+        if not raw:
+            return None, None, None, None
+        highs, lows = raw["highs"], raw["lows"]
+        present = [m for m in MODELS if highs.get(m)]
+        if len(present) < 2:   # need a genuine multi-model pool, else it's just v1
+            return None, None, None, None
+        biases = {m: get_bias_cached(market.city_key, m) for m in present}
+        # Bias table is HIGH-temp only → correct highs; leave lows uncorrected.
+        corr_highs = {m: [h - biases[m] for h in highs[m]] for m in present}
+        corr_lows = {m: list(lows.get(m, [])) for m in present}
+        pooled = PooledForecast(market.city_key, getattr(market, "city_name", ""),
+                                market.target_date, corr_highs, corr_lows)
+        prob = max(0.05, min(0.95, _model_yes_prob(pooled, market)))
+        mean_v2 = pooled.mean_high if market.metric == "high" else pooled.mean_low
+        std_v2 = pooled.std_high if market.metric == "high" else pooled.std_low
+        return prob, mean_v2, std_v2, _json.dumps(biases)
+    except Exception as e:
+        logger.debug(f"v2 shadow compute failed for {getattr(market, 'city_key', '?')}: {e}")
+        return None, None, None, None
 
 
 async def generate_weather_signal(
@@ -98,72 +180,24 @@ async def generate_weather_signal(
     # 2. Polymarket / legacy path (no strike_type). Markets are
     #    cumulative thresholds; use the existing direction + threshold_f
     #    fields exactly as before.
-    strike_type = (getattr(market, "strike_type", None) or "").lower() or None
-    # Kalshi resolves on TRUNCATED integer temperatures, so each market's
-    # nominal floor/cap pair is broader than it looks in continuous space.
-    # Confirmed 2026-05-20 via inspect_kalshi_coverage_gap_2026-05-20.py +
-    # rules_primary text:
-    #   between(floor=89, cap=90) -> "89° to 90°" -> integers {89, 90}
-    #     -> continuous [89, 91)  -> probability_high_between(floor, cap+1)
-    #   greater(floor=96)         -> "97° or above" -> integer >= 97
-    #     -> continuous h >= 97   -> probability_high_above(floor+1)
-    #   less(cap=89)              -> "88° or below" -> integer <= 88
-    #     -> continuous h < 89    -> probability_high_below(cap)  (no shift)
-    # Without these shifts the model under-counts every bucket by exactly
-    # one integer of probability mass; coverage sums to ~0.65 instead of
-    # ~1.0 and NO-side edges are systematically inflated.
-    is_kalshi = (getattr(market, "platform", "") == "kalshi")
-    cap_shift = 1.0 if is_kalshi else 0.0   # 'between' cap extension
-    floor_shift = 1.0 if is_kalshi else 0.0  # 'greater' floor extension
-    if strike_type and market.metric == "high":
-        if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
-            model_yes_prob = forecast.probability_high_between(
-                market.floor_strike, market.cap_strike + cap_shift
-            )
-        elif strike_type == "greater" and market.floor_strike is not None:
-            model_yes_prob = forecast.probability_high_above(
-                market.floor_strike + floor_shift
-            )
-        elif strike_type == "less" and market.cap_strike is not None:
-            model_yes_prob = forecast.probability_high_below(market.cap_strike)
-        else:
-            # Unknown strike_type or missing bounds — fall back to the
-            # legacy direction-based path rather than fabricate a number.
-            if market.direction == "above":
-                model_yes_prob = forecast.probability_high_above(market.threshold_f)
-            else:
-                model_yes_prob = forecast.probability_high_below(market.threshold_f)
-    elif strike_type and market.metric == "low":
-        if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
-            model_yes_prob = forecast.probability_low_between(
-                market.floor_strike, market.cap_strike + cap_shift
-            )
-        elif strike_type == "greater" and market.floor_strike is not None:
-            model_yes_prob = forecast.probability_low_above(
-                market.floor_strike + floor_shift
-            )
-        elif strike_type == "less" and market.cap_strike is not None:
-            model_yes_prob = forecast.probability_low_below(market.cap_strike)
-        else:
-            if market.direction == "above":
-                model_yes_prob = forecast.probability_low_above(market.threshold_f)
-            else:
-                model_yes_prob = forecast.probability_low_below(market.threshold_f)
-    else:
-        # Legacy / Polymarket path: cumulative threshold by direction.
-        if market.metric == "high":
-            if market.direction == "above":
-                model_yes_prob = forecast.probability_high_above(market.threshold_f)
-            else:
-                model_yes_prob = forecast.probability_high_below(market.threshold_f)
-        else:  # "low"
-            if market.direction == "above":
-                model_yes_prob = forecast.probability_low_above(market.threshold_f)
-            else:
-                model_yes_prob = forecast.probability_low_below(market.threshold_f)
+    # v1 probability (uncorrected GFS-only), clipped. The dispatch is extracted to
+    # _model_yes_prob so the v2 shadow reuses the EXACT same logic on its members.
+    prob_v1 = max(0.05, min(0.95, _model_yes_prob(forecast, market)))
 
-    # Clip extreme probabilities (ensemble can be unanimous but don't bet 100%)
-    model_yes_prob = max(0.05, min(0.95, model_yes_prob))
+    # ── Model-upgrade v1 SHADOW (2026-07-01) ─────────────────────────────────
+    # Compute v2 (bias-corrected, equal-model-weight GFS+ECMWF pool) ALONGSIDE v1.
+    # v1 trades by default; v2 feeds edge/sizing only when WEATHER_MODEL_V2_TRADING.
+    # A v2 failure logs NULLs and leaves the v1 signal completely intact.
+    prob_v2 = mean_v2 = std_v2 = bias_json = None
+    if settings.WEATHER_MODEL_V2_SHADOW:
+        prob_v2, mean_v2, std_v2, bias_json = await _compute_v2_shadow(market)
+
+    # Active probability driving edge/direction/sizing/reasoning below. With the
+    # flag OFF (default) this is v1 → v1 behaviour is byte-identical, v2 is logged.
+    if settings.WEATHER_MODEL_V2_TRADING and prob_v2 is not None:
+        model_yes_prob = prob_v2
+    else:
+        model_yes_prob = prob_v1
 
     # Audit 2026-05-19 HIGH #15: use the implied midpoint probability for
     # edge math (matters on Kalshi where yes_ask + no_ask > 1). Falls back
@@ -298,6 +332,10 @@ async def generate_weather_signal(
         ensemble_mean=mean_val,
         ensemble_std=std_val,
         ensemble_members=forecast.num_members,
+        model_probability_v2=prob_v2,
+        ensemble_mean_v2=mean_v2,
+        ensemble_std_v2=std_v2,
+        bias_applied_json=bias_json,
     )
 
 
@@ -410,6 +448,11 @@ def _persist_weather_signals(signals: list):
                 sources=signal.sources,
                 reasoning=signal.reasoning,
                 executed=False,
+                # Model-upgrade v1 SHADOW columns (NULL when v2 unavailable).
+                model_probability_v2=signal.model_probability_v2,
+                ensemble_mean_v2=signal.ensemble_mean_v2,
+                ensemble_std_v2=signal.ensemble_std_v2,
+                bias_applied_json=signal.bias_applied_json,
             )
             db.add(db_signal)
 

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import func
 import logging
 
@@ -620,6 +621,15 @@ async def heartbeat_job():
             db.close()
 
 
+def _model_bias_refresh_job():
+    """Sync wrapper for the nightly model-bias refresh (runs in the executor)."""
+    try:
+        from backend.core.model_bias import refresh_all
+        refresh_all()
+    except Exception as e:
+        logger.warning(f"[model_bias] nightly refresh job failed: {e}")
+
+
 def start_scheduler():
     """Start the background scheduler for BTC 5-min trading."""
     global scheduler
@@ -694,6 +704,27 @@ def start_scheduler():
                 coalesce=True,
                 misfire_grace_time=60,
             )
+
+        # Model-upgrade v1 (2026-07-01): nightly per-(city,model) bias refresh +
+        # signal-grading backfill. Sync job → runs in the executor thread, off the
+        # scan hot path. Also fired ONCE at startup so the table + grading populate
+        # immediately. Fully self-isolating (swallows its own errors).
+        scheduler.add_job(
+            _model_bias_refresh_job,
+            CronTrigger(hour=8, minute=0),   # 08:00 UTC — ERA5 has the prior days by then
+            id="model_bias_refresh",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=3600,
+        )
+        scheduler.add_job(
+            _model_bias_refresh_job,
+            "date", run_date=datetime.utcnow(),
+            id="model_bias_initial",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
 
     scheduler.start()
     log_event("success", "Trading scheduler started", {
