@@ -238,6 +238,15 @@ async def fetch_polymarket_weather_markets(city_keys: Optional[List[str]] = None
                             "closed": "false",
                             "limit": 10,
                             "series_slug": series_slug,
+                            # Newest events FIRST (gamma's default is oldest-first),
+                            # so an unresolved-event backlog can never push the
+                            # CURRENT day's event past the limit=10 window and blind
+                            # the bot while it looks healthy. The `target_date <
+                            # date.today()` skip in _parse_polymarket_weather then
+                            # drops any stale events that remain. (gamma-window fix,
+                            # 2026-07-01.)
+                            "order": "id",
+                            "ascending": "false",
                         },
                     )
                     response.raise_for_status()
