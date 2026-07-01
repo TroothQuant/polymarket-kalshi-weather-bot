@@ -193,7 +193,12 @@ class Settings(BaseSettings):
     WEATHER_MODEL_BIAS_ENABLED: bool = True  # apply the nightly per-(city,model) bias table
     WEATHER_MODEL_V2_MODELS: str = "gfs_seamless,ecmwf_ifs025"  # GEM excluded (cold outlier)
     WEATHER_MODEL_BIAS_MIN_DAYS: int = 20   # below this n, bias=0.0 (uncorrected)
-    WEATHER_MODEL_BIAS_WINDOW_DAYS: int = 30
+    # 60d (not the spec's 30d): summer market-density is ~0.3 traded city-days/day,
+    # so a 30d window keeps EVERY city under the n>=20 activation floor (NYC peaked
+    # at 14) → the whole correction would sit inert. 60d matches the groundwork's own
+    # window and activates the two highest-value corrections (NYC n=24, LA n=21) while
+    # respecting the n>=20 safety. Seasonal temp bias is stable over 60d. Tune via env.
+    WEATHER_MODEL_BIAS_WINDOW_DAYS: int = 60
     WEATHER_MODEL_BIAS_CLAMP_F: float = 5.0  # clamp |bias| to this many °F
 
     # API / dashboard hardening (added 2026-05-20 per audit CRITICAL #2).

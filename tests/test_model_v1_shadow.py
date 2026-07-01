@@ -90,6 +90,26 @@ def test_compute_bias_clamp_and_n_fallback(monkeypatch):
     assert n2 == 10 and bias2 == 0.0          # under min-days → uncorrected
 
 
+# ── grading prefers authoritative trade settlement over the archive proxy ─────
+def test_grade_prefers_trade_settlement_over_archive():
+    db = _mem_db()
+    yest = (datetime.utcnow().date() - timedelta(days=1)).isoformat()
+    # Signal: NYC "high above 90F", model-favored side NO. Linked to a trade that
+    # settled YES (settlement_value=1.0). Archive says 85F (< 90 → YES would lose).
+    # The authoritative trade settlement (YES won) must override the archive.
+    db.add(db_mod.Signal(id=1, market_ticker="m1", platform="polymarket", market_type="weather",
+                         direction="no", timestamp=datetime.utcnow(),
+                         reasoning=f"[ACTIONABLE] NYC high above 90F on {yest} | Ensemble: 88.0F +/- 1.0F (31 members)"))
+    db.add(db_mod.Trade(market_ticker="m1", platform="polymarket", market_type="weather",
+                        signal_id=1, settled=True, settlement_value=1.0, result="win",
+                        timestamp=datetime.utcnow()))
+    db.commit()
+    model_bias.grade_weather_signals(db, {"nyc": {yest: 85.0}})   # archive would say YES lost
+    s = db.query(db_mod.Signal).get(1)
+    assert s.settlement_value == 1.0                 # from the TRADE, not the 85F archive
+    assert s.outcome_correct is False                # direction NO, but YES won → NO was wrong
+
+
 # ── v2 shadow failure isolation ──────────────────────────────────────────────
 def test_v2_shadow_none_on_fetch_failure(monkeypatch):
     async def fail(*a, **k):

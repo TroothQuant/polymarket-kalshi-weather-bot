@@ -25,7 +25,7 @@ import urllib.request
 from datetime import datetime, timedelta
 
 from backend.config import settings
-from backend.models.database import SessionLocal, ForecastLog, ModelBias, Signal
+from backend.models.database import SessionLocal, ForecastLog, ModelBias, Signal, Trade
 from backend.data.weather import CITY_CONFIG
 
 log = logging.getLogger("trading_bot")
@@ -93,7 +93,7 @@ def log_tomorrow_forecasts(db):
     db.commit()
 
 
-def seed_gfs_from_signals(db, lookback_days=35):
+def seed_gfs_from_signals(db, lookback_days=65):
     """One-time-ish: seed gfs_seamless forecast_log from the signals history (its
     reasoning carries the GFS ensemble mean) so GFS bias is usable immediately.
     Idempotent — only inserts (city, target_date) not already logged."""
@@ -206,12 +206,29 @@ def get_bias_cached(city, model):
 
 # ── Phase 3: grade weather signals for calibration ───────────────────────────
 def grade_weather_signals(db, actuals):
-    """Grade polymarket weather signals in the trailing window using ERA5 actuals.
-    Fixes both old bugs: grades the FULL scanned population (not just traded), and
-    maps the weather 'yes'/'no' direction to the actual outcome correctly. Idempotent."""
+    """Grade polymarket weather signals in the trailing window. Fixes both old bugs:
+    grades the FULL scanned population (not just traded), and maps the weather
+    'yes'/'no' direction to the outcome correctly.
+
+    Outcome truth, in priority order:
+      1. The linked TRADE's settlement_value (AUTHORITATIVE — the market's own NWS
+         settlement). This anchors the gate's Brier on correctly-labelled data.
+      2. ERA5 archive high at bot coords vs the signal's threshold (PROXY for the
+         untraded majority; carries a ~30% label-noise floor vs true settlement from
+         the station/local-day mismatch — but it's common to v1 and v2 so the
+         relative comparison holds). Idempotent."""
     window = settings.WEATHER_MODEL_BIAS_WINDOW_DAYS
     since = datetime.utcnow() - timedelta(days=window + 5)
     yesterday = (datetime.utcnow().date() - timedelta(days=1)).isoformat()
+
+    # signal_id -> authoritative settlement_value from settled trades.
+    settled_map = {}
+    for t in (db.query(Trade)
+              .filter(Trade.market_type == "weather", Trade.platform == "polymarket",
+                      Trade.settled == True, Trade.signal_id.isnot(None),  # noqa: E712
+                      Trade.settlement_value.isnot(None))):
+        settled_map[t.signal_id] = t.settlement_value
+
     graded = 0
     q = (db.query(Signal)
          .filter(Signal.market_type == "weather", Signal.platform == "polymarket",
@@ -222,12 +239,17 @@ def grade_weather_signals(db, actuals):
             continue
         city = _CITY_NAME_TO_KEY.get(h.group(1).strip().lower())
         thr_dir, threshold, tdate = h.group(2), float(h.group(3)), h.group(4)
-        if not city or tdate > yesterday:
+        if not city:
             continue
-        actual = actuals.get(city, {}).get(tdate)
-        if actual is None:
-            continue
-        yes_won = (actual > threshold) if thr_dir == "above" else (actual < threshold)
+        if s.id in settled_map:
+            yes_won = settled_map[s.id] == 1.0        # authoritative market settlement
+        else:
+            if tdate > yesterday:
+                continue
+            actual = actuals.get(city, {}).get(tdate)
+            if actual is None:
+                continue
+            yes_won = (actual > threshold) if thr_dir == "above" else (actual < threshold)
         s.settlement_value = 1.0 if yes_won else 0.0
         s.actual_outcome = "up" if yes_won else "down"
         # weather signal.direction is 'yes'/'no'; the model-favored side is correct
