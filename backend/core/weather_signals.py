@@ -368,13 +368,22 @@ async def scan_for_weather_signals() -> List[WeatherTradingSignal]:
             if signal:
                 signals.append(signal)
         except Exception as e:
-            logger.debug(f"Weather signal generation failed for {market.title}: {e}")
+            logger.warning(f"Weather signal generation failed for {market.title}: {e}")
 
     # Sort by absolute edge
     signals.sort(key=lambda s: abs(s.edge), reverse=True)
 
     actionable = [s for s in signals if s.passes_threshold]
     logger.info(f"WEATHER SCAN COMPLETE: {len(signals)} signals, {len(actionable)} actionable")
+    # Always-visible funnel (2026-07-01): markets found → signals → actionable →
+    # persisted. `persisted` counts non-zero-edge signals only (zero-edge signals,
+    # e.g. entry-price-band longshots, are found-but-NOT-persisted by design) — so
+    # "N signals but 0 rows in the DB" reads as expected, not a silent failure.
+    logger.info(
+        f"WEATHER FUNNEL: markets={len(markets)} signals={len(signals)} "
+        f"actionable={len(actionable)} "
+        f"persisted={sum(1 for s in signals if abs(s.edge) > 0)}"
+    )
 
     for signal in actionable[:5]:
         logger.info(f"  {signal.market.city_name}: {signal.market.metric} {signal.market.direction} "
