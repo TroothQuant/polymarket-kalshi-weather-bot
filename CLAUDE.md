@@ -303,6 +303,16 @@ Staged a forecast-conviction entry filter. `z = |ensemble_mean - bucket_threshol
 
 Conviction gate ARMED at z>=1.0 on 2026-06-15 (weather.env). Reversible to 0.0. First strategy change since G0 began — pre/post-gate settles differ.
 
+## Operational notes (added 2026-07-01) — 🟢 WEATHER BOT WENT LIVE (Stage 1, real money)
+
+The weather bot is **LIVE on real money** as of 2026-07-01 (Stage 1, ~$200 wallet). Paper continues on the NYC server as a benchmark; the **LIVE book runs on the operator's Mac** — the NYC server IP is geoblocked from Polymarket order placement, and the Mac's work VPN egresses Mexico (permitted).
+
+- **Where it runs:** Mac worktree `~/Projects/trooth-weather-live` (branch `weather-live-mac`), under **launchd LaunchAgents** — `com.trooth.weather-live` (bot), `com.trooth.live-dashboard` (`:8003` live dashboard), `com.trooth.cloudflared-live` (Mac Cloudflare tunnel → `bot.troothquant.com`). Env `~/.config/trooth/weather-live-mac.env` (`WEATHER_LIVE_TRADING=true`, `POLYMARKET_SIGNATURE_TYPE=3`), isolated `tradingbot_live.db`, wallet $204.45. Full paths + controls: `REPO_RECORD_MAP.md` → "Mac launchd services" + "Live trading".
+- **STANDING REQUIREMENT:** the live bot only runs while the **Mac is on, logged in, and the work VPN is up** (LaunchAgents, not daemons — the VPN's egress needs the login session). If the Mac sleeps / logs out / the VPN drops, the live book stops (the server paper bot is unaffected).
+- **Caps (Stage 1):** `WEATHER_LIVE_MAX_TRADE_USD=11`, exposure `$33`, daily-loss halt `$25`. **Pre-committed ratchet (execute on trigger, NO re-ask):** $33→$100 after the full autonomous FAK path completes clean end-to-end ≥1× + ~10 clean live settles + reconcile clean every cycle + dashboard cash==wallet + live P&L tracks paper + zero defects; then $100→~$180 after that regime holds another ~10 settles.
+- **How to STOP the live book:** set `WEATHER_LIVE_TRADING=false` in `weather-live-mac.env`, then `launchctl kickstart -k gui/$(id -u)/com.trooth.weather-live`; OR fully unload it with `launchctl bootout gui/$(id -u)/com.trooth.weather-live`. Reversible either way.
+- **First live scan** found 1 tradeable market (NYC 7/2 heat wave ~102.6°F) but placed **0 trades** (edge/conviction gate held) — the autonomous FAK path is unproven until the first actionable signal fires. Canonical: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-07-01.md`.
+
 ## Today's open carryovers
 
 Current state is NOT restated here (it rots — this section used to and went stale). **Canonical handoff:** `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/NAVIGATION.md` → the latest dated session log. **Code/state/infra map:** `REPO_RECORD_MAP.md` in the same folder.
