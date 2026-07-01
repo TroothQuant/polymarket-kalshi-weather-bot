@@ -340,16 +340,27 @@ async def scan_for_weather_signals() -> List[WeatherTradingSignal]:
     # capital, not the hardcoded INITIAL_BANKROLL constant (bug fix
     # 2026-05-21). Falls back to INITIAL_BANKROLL if the DB query fails.
     current_bankroll = settings.INITIAL_BANKROLL
+    _bankroll_read_ok = False
     try:
         _db = SessionLocal()
         try:
             _state = _db.query(BotState).first()
             if _state and _state.bankroll is not None:
                 current_bankroll = float(_state.bankroll)
+                _bankroll_read_ok = True
         finally:
             _db.close()
     except Exception as e:
         logger.warning(f"Could not fetch live bankroll for sizing, using initial: {e}")
+
+    # On the LIVE path never size against the INITIAL_BANKROLL fallback ($10k) —
+    # if the real bankroll couldn't be read, skip signal generation for this scan
+    # entirely (returns no actionable signals → no live entry). Paper is unchanged
+    # (it may keep sizing against the constant). Audit 5a, 2026-07-01.
+    if settings.WEATHER_LIVE_TRADING and not _bankroll_read_ok:
+        logger.warning("[live] bankroll read failed during signal scan — skipping "
+                       "signal generation (refusing to size against INITIAL_BANKROLL)")
+        return []
 
     for market in markets:
         try:

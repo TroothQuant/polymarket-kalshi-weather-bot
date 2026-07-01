@@ -27,6 +27,10 @@ class WeatherLiveTrader:
     """Real execution via Polymarket CLOB (py-clob-client). Instantiated only on
     the live path; constructing it requires py-clob-client + a funded wallet."""
 
+    # FAK statuses that unambiguously mean "no fill" — safe to treat as a routine
+    # 0-fill without an extra verification round-trip (audit 3b).
+    _KILL_STATUSES = {"unmatched", "canceled", "cancelled", "killed", "expired", "rejected"}
+
     def __init__(self, cfg=None):
         if cfg is None:
             from backend.config import settings as cfg  # singleton
@@ -74,6 +78,15 @@ class WeatherLiveTrader:
         # that would have crashed the FIRST live order; fixed 2026-06-24). To spend
         # ~size_usd at `price`, buy size_usd/price shares (cost = shares*price).
         shares = round(size_usd / price, 2)
+        if shares < 15:
+            # CLOB rejects orders under 15 shares. At the $11 cap this only bites
+            # above ~0.73 entry; refuse CLEANLY (execute_buy's try converts this to
+            # a no-fill → the scheduler writes NO row) instead of silently coupling
+            # the $ cap to the 0.70 entry ceiling and letting the order reject at
+            # the exchange (audit 5c, 2026-07-01).
+            raise ValueError(
+                f"live order {shares} shares < 15-share CLOB minimum "
+                f"(size_usd={size_usd} @ price={price}) — refusing")
         return {"token_id": str(token_id), "price": price, "size": shares,
                 "amount_usd": float(size_usd), "side": "BUY"}
 
@@ -104,6 +117,12 @@ class WeatherLiveTrader:
         size=cost, entry_price=fill_price recovers shares via size/entry_price.
         (size_usd / fallback_price kept for signature compatibility; unused.)
         """
+        # A non-dict response (list/None/str) is a PARSE FAILURE, not a fill.
+        # Guard first so `resp.get` can't raise AttributeError — which would escape
+        # the (ValueError, TypeError) except below and propagate out of execute_buy
+        # entirely (audit 3a, 2026-07-01).
+        if not isinstance(resp, dict):
+            return None
         try:
             making = float(resp.get("makingAmount") or 0)  # USDC paid
             taking = float(resp.get("takingAmount") or 0)  # conditional tokens received
@@ -128,8 +147,10 @@ class WeatherLiveTrader:
         from py_clob_client_v2.clob_types import OrderArgs, OrderType
         from py_clob_client_v2.order_builder.constants import BUY
 
-        args = self.build_order_args(token_id, size_usd, market_price)
         try:
+            # build_order_args is INSIDE the try so its <15-share guard (5c) and any
+            # construction error convert to a clean no-fill (→ caller writes no row).
+            args = self.build_order_args(token_id, size_usd, market_price)
             order_args = OrderArgs(token_id=args["token_id"], size=args["size"],
                                    price=args["price"], side=BUY)
             signed_order = self.client.create_order(order_args)
@@ -144,12 +165,62 @@ class WeatherLiveTrader:
         # FAK is filled-or-killed at submit; the response is authoritative, so no
         # poll/cancel. A zero fill -> _parse_fill returns None -> caller writes no row.
         fill = self._parse_fill(resp, order_id, size_usd, args["price"])
-        if fill is None:
-            log.info("Weather live FAK order filled 0 shares (killed) — non-fill, no row")
+        if fill is not None:
+            log.info(f"Weather live fill: ${fill['cost']:.2f} "
+                     f"({fill['shares']:.2f} sh @ {fill['fill_price']:.4f})")
+            return fill
+
+        # _parse_fill returned None. Treat it as a routine 0-fill ONLY when the
+        # exchange EXPLICITLY says so (known kill status, or no order id at all).
+        # Otherwise NEVER silently assume 0-fill on real money — verify once against
+        # the order record; if we still can't confirm, log LOUDLY so a real fill can
+        # never pass as a routine kill (audit 3b, 2026-07-01).
+        status_l = status.lower() if isinstance(status, str) else ""
+        if order_id is None or status_l in self._KILL_STATUSES:
+            log.info(f"Weather live FAK order filled 0 shares (status={status}) — non-fill, no row")
             return None
-        log.info(f"Weather live fill: ${fill['cost']:.2f} "
-                 f"({fill['shares']:.2f} sh @ {fill['fill_price']:.4f})")
-        return fill
+
+        verified = self._verify_fill_via_lookup(order_id)
+        if verified is not None:
+            log.warning(
+                f"Weather live FAK response was unparseable but the order lookup "
+                f"CONFIRMED a fill: ${verified['cost']:.2f} "
+                f"({verified['shares']:.2f} sh @ {verified['fill_price']:.4f})")
+            return verified
+        log.error(
+            f"Weather live FAK order {order_id} (status={status}): UNVERIFIED non-fill — "
+            f"parse failed AND the order lookup could not confirm a fill. NO row written; "
+            f"CHECK THE WALLET for an untracked position.")
+        return None
+
+    def _verify_fill_via_lookup(self, order_id) -> Optional[dict]:
+        """Best-effort: fetch the order record and build a fill ONLY from an
+        AUTHORITATIVE positive matched size. Any uncertainty → None (never fabricate
+        a position on real money). Wrapped so an SDK/network error can't raise into
+        execute_buy."""
+        try:
+            rec = self.client.get_order(order_id)
+        except Exception as e:
+            log.error(f"Weather live order-lookup for {order_id} failed: {e}")
+            return None
+        if not isinstance(rec, dict):
+            return None
+        matched = None
+        for k in ("size_matched", "sizeMatched", "matched_size"):
+            if rec.get(k) is not None:
+                try:
+                    matched = float(rec.get(k))
+                except (TypeError, ValueError):
+                    matched = None
+                break
+        try:
+            price = float(rec.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if not matched or matched <= 0 or price <= 0:
+            return None
+        return {"order_id": order_id, "fill_price": price, "shares": matched,
+                "cost": matched * price}
 
     def redeem_won(self, condition_id: str):
         """G2b SKELETON — claim winnings on a resolved-WON live position.

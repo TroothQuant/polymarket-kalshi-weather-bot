@@ -56,9 +56,12 @@ def _db():
 
 
 def _seed_loss(db, pnl, order_id="OLD", when=None):
+    # A settled trade always has a settlement_time; the daily-loss kill-switch now
+    # keys on settlement_time (audit 2), so set both.
+    ts = when or datetime.utcnow()
     db.add(Trade(market_ticker="m", platform="polymarket", market_type="weather",
                  direction="yes", entry_price=0.4, size=2.0, order_id=order_id,
-                 settled=True, pnl=pnl, timestamp=when or datetime.utcnow()))
+                 settled=True, pnl=pnl, timestamp=ts, settlement_time=ts))
     db.commit()
 
 

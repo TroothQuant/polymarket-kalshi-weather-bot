@@ -222,6 +222,26 @@ def ensure_schema():
             with conn.begin():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN market_type VARCHAR DEFAULT 'btc'"))
 
+    # G2-2 / F3 live columns (audit 6b, 2026-07-01): rebuild-safety. Additive +
+    # nullable — a no-op on the current live DB (the models already created them),
+    # but guarantees order_id/token_id exist if the trades table is ever rebuilt
+    # from an older schema.
+    for _col in ("order_id", "token_id"):
+        if _col not in columns:
+            with engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text(f"ALTER TABLE trades ADD COLUMN {_col} VARCHAR"))
+
+    # bot_state.reconcile_status (F3 live-reconcile surface for the dashboard).
+    try:
+        bot_state_columns = [col["name"] for col in inspector.get_columns("bot_state")]
+    except Exception:
+        bot_state_columns = []
+    if bot_state_columns and "reconcile_status" not in bot_state_columns:
+        with engine.connect() as conn:
+            with conn.begin():
+                conn.execute(text("ALTER TABLE bot_state ADD COLUMN reconcile_status VARCHAR"))
+
     # Add calibration columns to signals table
     try:
         signal_columns = [col["name"] for col in inspector.get_columns("signals")]

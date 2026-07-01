@@ -27,23 +27,27 @@ def _market():
 
 def test_yes_side_order_shape_and_size_in_shares():
     m = _market()
-    a = WeatherLiveTrader.build_order_args(m.token_id_yes, size_usd=2.0, market_price=m.yes_price)
+    # $11 (the real Stage-1 cap) at 0.30 → 0.32 → 34.4 shares (>= the 15 CLOB min).
+    a = WeatherLiveTrader.build_order_args(m.token_id_yes, size_usd=11.0, market_price=m.yes_price)
     assert a["token_id"] == "YESTOKEN"
     assert a["side"] == "BUY"
     assert a["price"] == 0.32                # 2-tick taker aggression: 0.30 + 0.02
-    # size is SHARES = size_usd / price (NOT USD). 2.0 / 0.32 = 6.25.
-    assert a["size"] == 6.25
-    assert a["amount_usd"] == 2.0
+    # size is SHARES = size_usd / price (NOT USD), and clears the 15-share min.
+    assert a["size"] >= 15
+    assert a["amount_usd"] == 11.0
     # the units identity: cost = size * price ~= the dollars we intended to spend
-    assert abs(a["size"] * a["price"] - 2.0) < 0.01
+    assert abs(a["size"] * a["price"] - 11.0) < 0.01
 
 
 def test_no_side_and_price_cap():
     m = _market()
-    a = WeatherLiveTrader.build_order_args(m.token_id_no, size_usd=2.0, market_price=0.985)
+    # $20 so it clears the 15-share min even at the 0.99 cap (15*0.99=$14.85);
+    # purpose here is the price cap, not sizing.
+    a = WeatherLiveTrader.build_order_args(m.token_id_no, size_usd=20.0, market_price=0.985)
     assert a["token_id"] == "NOTOKEN"
     assert a["price"] == 0.99                # +0.02 → 1.005 capped at 0.99
-    assert abs(a["size"] * a["price"] - 2.0) < 0.02
+    assert a["size"] >= 15
+    assert abs(a["size"] * a["price"] - 20.0) < 0.02
 
 
 def test_p0_guard_refuses_missing_token():
@@ -57,7 +61,7 @@ def test_zero_size_refused():
 
 
 def test_dryrun_touches_no_network_or_crypto():
-    a = WeatherLiveTrader.build_order_args("YESTOKEN", 2.0, 0.30)
+    a = WeatherLiveTrader.build_order_args("YESTOKEN", 11.0, 0.30)
     assert set(a.keys()) == {"token_id", "price", "size", "amount_usd", "side"}
     assert "py_clob_client" not in sys.modules
 

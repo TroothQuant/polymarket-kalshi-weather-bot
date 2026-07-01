@@ -221,7 +221,11 @@ def _live_daily_realized_loss(db) -> float:
         Trade.platform == "polymarket",
         Trade.settled == True,  # noqa: E712
         Trade.pnl < 0,
-        Trade.timestamp >= day_start,
+        # Key the daily halt on SETTLEMENT day, not entry day — a position opened
+        # yesterday that settles at a loss today must count toward today's halt
+        # (mirrors the BTC breaker at ~line 110). Using entry `timestamp` would let
+        # yesterday's losses escape today's kill-switch (audit 2, 2026-07-01).
+        Trade.settlement_time >= day_start,
     ).scalar() or 0.0
     return abs(float(total))
 
@@ -326,8 +330,22 @@ def _reconcile_live_positions() -> None:
         ).all()
         recorded = {t.token_id for t in rows}
         onchain_toks = set(onchain.keys())
-        ghosts = recorded - onchain_toks       # recorded but NOT on-chain
-        phantoms = onchain_toks - recorded     # on-chain but NOT recorded
+        # Unredeemed WON live positions still sit on-chain until the manual F1
+        # claim (redeem_won is not wired yet). Their rows are no longer 'pending',
+        # so they'd read as phantoms even though they're expected. Exclude recent
+        # (~48h) settled-won live tokens from the phantom set and surface them
+        # separately as "unclaimed-win" noise, not a divergence (audit 5b).
+        win_cutoff = datetime.utcnow() - timedelta(hours=48)
+        won_rows = db.query(Trade).filter(
+            Trade.order_id.isnot(None),
+            Trade.market_type == "weather",
+            Trade.result == "win",
+            Trade.token_id.isnot(None),
+            Trade.settlement_time >= win_cutoff,
+        ).all()
+        unclaimed_win_toks = {t.token_id for t in won_rows}
+        ghosts = recorded - onchain_toks                        # recorded but NOT on-chain
+        phantoms = (onchain_toks - recorded) - unclaimed_win_toks  # on-chain, unrecorded, not a known unclaimed win
         diverged = ghosts | phantoms
         for tok in list(_recon_divergence_counts):
             if tok not in diverged:
@@ -536,156 +554,167 @@ async def weather_scan_and_trade_job():
             if not live_entries_ok:
                 log_event("info", "[live] balance unavailable this cycle — skipping new entries (position review/settlement run separately)")
             for signal in (actionable[:MAX_TRADES_PER_SCAN] if live_entries_ok else []):
-                # Kalshi trade kill-switch (2026-05-20): defense-in-depth check.
-                # The pre-loop filter above should have removed all Kalshi
-                # signals when KALSHI_TRADING_ENABLED=False, but we leave this
-                # guard in case the filter path is ever bypassed.
-                platform = getattr(signal.market, "platform", "polymarket")
-                if platform == "kalshi" and not kalshi_trading_enabled:
-                    log_event(
-                        "info",
-                        f"Kalshi trading disabled — skipping {signal.market.market_id} "
-                        f"(edge {signal.edge:.0%}); set KALSHI_TRADING_ENABLED=true "
-                        f"in .env to re-enable after parity verification."
+                try:
+                    # Kalshi trade kill-switch (2026-05-20): defense-in-depth check.
+                    # The pre-loop filter above should have removed all Kalshi
+                    # signals when KALSHI_TRADING_ENABLED=False, but we leave this
+                    # guard in case the filter path is ever bypassed.
+                    platform = getattr(signal.market, "platform", "polymarket")
+                    if platform == "kalshi" and not kalshi_trading_enabled:
+                        log_event(
+                            "info",
+                            f"Kalshi trading disabled — skipping {signal.market.market_id} "
+                            f"(edge {signal.edge:.0%}); set KALSHI_TRADING_ENABLED=true "
+                            f"in .env to re-enable after parity verification."
+                        )
+                        continue
+
+                    existing = db.query(Trade).filter(
+                        Trade.market_ticker == signal.market.market_id,
+                    ).first()
+
+                    if existing:
+                        log_event(
+                            "info",
+                            f"Already traded {signal.market.market_id} "
+                            f"(trade #{existing.id}, settled={existing.settled}); skipping",
+                        )
+                        continue
+
+                    trade_size = min(signal.suggested_size, settings.WEATHER_MAX_TRADE_SIZE)
+                    trade_size = max(trade_size, MIN_TRADE_SIZE)
+
+                    if state.bankroll < MIN_TRADE_SIZE:
+                        log_event("warning", f"Bankroll too low: ${state.bankroll:.2f}")
+                        break
+
+                    if trades_executed >= MAX_TRADES_PER_SCAN:
+                        break
+
+                    # Per-day cap (added 2026-05-28): positions_today was counted at
+                    # scan start; trades_executed is what THIS scan has opened so far.
+                    # Breaks mid-scan once the daily budget is exhausted. Belt-and-
+                    # suspenders with the pre-loop early return above (same pattern as
+                    # the per-scan cap, which uses both a slice and this break).
+                    if positions_today + trades_executed >= max_per_day:
+                        log_event(
+                            "info",
+                            f"[blocked] WEATHER_MAX_NEW_POSITIONS_PER_DAY={max_per_day} reached "
+                            f"({positions_today} earlier today + {trades_executed} this scan); "
+                            f"deferring remaining candidate(s) to tomorrow."
+                        )
+                        break
+
+                    # Allocation cap break (CRITICAL #5, 2026-06-05): mirror of the
+                    # per-day-cap pattern above. weather_pending is the scan-start
+                    # snapshot of size-on-the-book; weather_alloc_running is what
+                    # THIS scan has opened so far. Breaks mid-scan once the dollar
+                    # budget would be exceeded by adding this candidate's stake.
+                    # Belt-and-suspenders with the pre-loop early return at ~line 249.
+                    if weather_pending + weather_alloc_running + trade_size > MAX_WEATHER_ALLOCATION:
+                        log_event(
+                            "info",
+                            f"[blocked] WEATHER_MAX_ALLOCATION_USD=${MAX_WEATHER_ALLOCATION:.0f} would be exceeded "
+                            f"(pending ${weather_pending:.0f} + ${weather_alloc_running:.0f} this scan + ${trade_size:.0f}); "
+                            f"deferring remaining candidate(s)."
+                        )
+                        break
+
+                    entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
+
+                    # ── G2-2 flag-gated LIVE execution ────────────────────────────
+                    # Flag OFF (default, all of G2) → action == "paper": entry_price
+                    # and trade_size pass through unchanged, order_id is None, and the
+                    # row write below is byte-for-byte the original paper behaviour.
+                    decision = resolve_weather_live(
+                        signal, trade_size, entry_price, db, settings, _live_trader_factory)
+                    if decision.action == "halt":
+                        log_event(
+                            "warning",
+                            f"[live] daily realized-loss (${settings.WEATHER_LIVE_DAILY_LOSS_STOP_USD:.0f}) "
+                            f"or total-exposure (${settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD:.0f}) cap "
+                            f"reached — halting new live opens for the day.")
+                        break
+                    if decision.action == "skip":
+                        # Missing token id, or the live order did not fill: write NO
+                        # row, deduct NO bankroll, move on (no phantom paper row).
+                        log_event(
+                            "warning",
+                            f"[live] {signal.market.market_id} not opened "
+                            f"(missing token id or order unfilled) — no row written.")
+                        continue
+                    # "paper" → unchanged; "fill" → ACTUAL fill price/cost + order_id.
+                    entry_price = decision.entry_price
+                    trade_size = decision.size
+                    order_id = decision.order_id
+
+                    # Use the signal's platform so Kalshi trades save as "kalshi"
+                    # (was hardcoded to "polymarket" before the Kalshi rollout 2026-05-19).
+                    trade = Trade(
+                        market_ticker=signal.market.market_id,
+                        platform=getattr(signal.market, "platform", "polymarket"),
+                        event_slug=signal.market.slug,
+                        market_type="weather",
+                        direction=signal.direction,
+                        entry_price=entry_price,
+                        size=trade_size,
+                        model_probability=signal.model_probability,
+                        market_price_at_entry=signal.market_probability,
+                        edge_at_entry=signal.edge,
+                        order_id=order_id,  # NULL on paper; CLOB id on a live fill
+                        # F3: store the bought outcome's CLOB token id on live fills
+                        # (NULL on paper) so reconciliation can match data-api/positions.
+                        token_id=((signal.market.token_id_yes if signal.direction == "yes"
+                                   else signal.market.token_id_no) if order_id else None),
                     )
+
+                    db.add(trade)
+                    db.flush()
+
+                    # Link to signal record
+                    matching_signal = db.query(Signal).filter(
+                        Signal.market_ticker == signal.market.market_id,
+                        Signal.market_type == "weather",
+                        Signal.executed == False,
+                    ).order_by(Signal.timestamp.desc()).first()
+                    if matching_signal:
+                        matching_signal.executed = True
+                        trade.signal_id = matching_signal.id
+
+                    # Deduct the stake from bankroll at entry (migrated 2026-05-19
+                    # to share-purchase cash flow). The full stake `size` is locked
+                    # up in shares now; bankroll holds only cash. Settlement adds
+                    # back `size + pnl` (= payout).
+                    state.bankroll -= trade_size
+
+                    state.total_trades += 1
+                    trades_executed += 1
+                    weather_alloc_running += trade_size
+
+                    log_event("trade",
+                        f"WX {signal.market.city_name}: {signal.direction.upper()} "
+                        f"${trade_size:.0f} @ {entry_price:.0%} | "
+                        f"{signal.market.metric} {signal.market.direction} {signal.market.threshold_f:.0f}F",
+                        {
+                            "slug": signal.market.slug,
+                            "direction": signal.direction,
+                            "size": trade_size,
+                            "edge": signal.edge,
+                            "entry_price": entry_price,
+                            "city": signal.market.city_name,
+                        }
+                    )
+
+                    # Persist THIS candidate now — a booked row (especially a
+                    # real-money live fill) must survive a LATER candidate raising
+                    # (audit 1 CRITICAL, 2026-07-01). Paper rows commit here too,
+                    # which is benign and keeps the rollback below from discarding
+                    # earlier candidates' committed work.
+                    db.commit()
+                except Exception as _cand_err:
+                    db.rollback()
+                    log_event("error", f"[scan] candidate {getattr(signal.market, 'market_id', '?')} errored — skipping: {_cand_err}")
                     continue
-
-                existing = db.query(Trade).filter(
-                    Trade.market_ticker == signal.market.market_id,
-                ).first()
-
-                if existing:
-                    log_event(
-                        "info",
-                        f"Already traded {signal.market.market_id} "
-                        f"(trade #{existing.id}, settled={existing.settled}); skipping",
-                    )
-                    continue
-
-                trade_size = min(signal.suggested_size, settings.WEATHER_MAX_TRADE_SIZE)
-                trade_size = max(trade_size, MIN_TRADE_SIZE)
-
-                if state.bankroll < MIN_TRADE_SIZE:
-                    log_event("warning", f"Bankroll too low: ${state.bankroll:.2f}")
-                    break
-
-                if trades_executed >= MAX_TRADES_PER_SCAN:
-                    break
-
-                # Per-day cap (added 2026-05-28): positions_today was counted at
-                # scan start; trades_executed is what THIS scan has opened so far.
-                # Breaks mid-scan once the daily budget is exhausted. Belt-and-
-                # suspenders with the pre-loop early return above (same pattern as
-                # the per-scan cap, which uses both a slice and this break).
-                if positions_today + trades_executed >= max_per_day:
-                    log_event(
-                        "info",
-                        f"[blocked] WEATHER_MAX_NEW_POSITIONS_PER_DAY={max_per_day} reached "
-                        f"({positions_today} earlier today + {trades_executed} this scan); "
-                        f"deferring remaining candidate(s) to tomorrow."
-                    )
-                    break
-
-                # Allocation cap break (CRITICAL #5, 2026-06-05): mirror of the
-                # per-day-cap pattern above. weather_pending is the scan-start
-                # snapshot of size-on-the-book; weather_alloc_running is what
-                # THIS scan has opened so far. Breaks mid-scan once the dollar
-                # budget would be exceeded by adding this candidate's stake.
-                # Belt-and-suspenders with the pre-loop early return at ~line 249.
-                if weather_pending + weather_alloc_running + trade_size > MAX_WEATHER_ALLOCATION:
-                    log_event(
-                        "info",
-                        f"[blocked] WEATHER_MAX_ALLOCATION_USD=${MAX_WEATHER_ALLOCATION:.0f} would be exceeded "
-                        f"(pending ${weather_pending:.0f} + ${weather_alloc_running:.0f} this scan + ${trade_size:.0f}); "
-                        f"deferring remaining candidate(s)."
-                    )
-                    break
-
-                entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
-
-                # ── G2-2 flag-gated LIVE execution ────────────────────────────
-                # Flag OFF (default, all of G2) → action == "paper": entry_price
-                # and trade_size pass through unchanged, order_id is None, and the
-                # row write below is byte-for-byte the original paper behaviour.
-                decision = resolve_weather_live(
-                    signal, trade_size, entry_price, db, settings, _live_trader_factory)
-                if decision.action == "halt":
-                    log_event(
-                        "warning",
-                        f"[live] daily realized-loss (${settings.WEATHER_LIVE_DAILY_LOSS_STOP_USD:.0f}) "
-                        f"or total-exposure (${settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD:.0f}) cap "
-                        f"reached — halting new live opens for the day.")
-                    break
-                if decision.action == "skip":
-                    # Missing token id, or the live order did not fill: write NO
-                    # row, deduct NO bankroll, move on (no phantom paper row).
-                    log_event(
-                        "warning",
-                        f"[live] {signal.market.market_id} not opened "
-                        f"(missing token id or order unfilled) — no row written.")
-                    continue
-                # "paper" → unchanged; "fill" → ACTUAL fill price/cost + order_id.
-                entry_price = decision.entry_price
-                trade_size = decision.size
-                order_id = decision.order_id
-
-                # Use the signal's platform so Kalshi trades save as "kalshi"
-                # (was hardcoded to "polymarket" before the Kalshi rollout 2026-05-19).
-                trade = Trade(
-                    market_ticker=signal.market.market_id,
-                    platform=getattr(signal.market, "platform", "polymarket"),
-                    event_slug=signal.market.slug,
-                    market_type="weather",
-                    direction=signal.direction,
-                    entry_price=entry_price,
-                    size=trade_size,
-                    model_probability=signal.model_probability,
-                    market_price_at_entry=signal.market_probability,
-                    edge_at_entry=signal.edge,
-                    order_id=order_id,  # NULL on paper; CLOB id on a live fill
-                    # F3: store the bought outcome's CLOB token id on live fills
-                    # (NULL on paper) so reconciliation can match data-api/positions.
-                    token_id=((signal.market.token_id_yes if signal.direction == "yes"
-                               else signal.market.token_id_no) if order_id else None),
-                )
-
-                db.add(trade)
-                db.flush()
-
-                # Link to signal record
-                matching_signal = db.query(Signal).filter(
-                    Signal.market_ticker == signal.market.market_id,
-                    Signal.market_type == "weather",
-                    Signal.executed == False,
-                ).order_by(Signal.timestamp.desc()).first()
-                if matching_signal:
-                    matching_signal.executed = True
-                    trade.signal_id = matching_signal.id
-
-                # Deduct the stake from bankroll at entry (migrated 2026-05-19
-                # to share-purchase cash flow). The full stake `size` is locked
-                # up in shares now; bankroll holds only cash. Settlement adds
-                # back `size + pnl` (= payout).
-                state.bankroll -= trade_size
-
-                state.total_trades += 1
-                trades_executed += 1
-                weather_alloc_running += trade_size
-
-                log_event("trade",
-                    f"WX {signal.market.city_name}: {signal.direction.upper()} "
-                    f"${trade_size:.0f} @ {entry_price:.0%} | "
-                    f"{signal.market.metric} {signal.market.direction} {signal.market.threshold_f:.0f}F",
-                    {
-                        "slug": signal.market.slug,
-                        "direction": signal.direction,
-                        "size": trade_size,
-                        "edge": signal.edge,
-                        "entry_price": entry_price,
-                        "city": signal.market.city_name,
-                    }
-                )
-
             state.last_run = datetime.utcnow()
             db.commit()
 

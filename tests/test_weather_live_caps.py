@@ -57,7 +57,8 @@ def test_daily_loss_kill_switch_halts():
     db = _db()
     db.add(Trade(order_id="L1", market_type="weather", platform="polymarket",
                  settled=True, pnl=-10.0, size=2.0, result="loss",
-                 timestamp=datetime.utcnow())); db.commit()
+                 timestamp=datetime.utcnow(),
+                 settlement_time=datetime.utcnow())); db.commit()  # daily halt keys on settlement day (audit 2)
     rec = []
     d = resolve_weather_live(_signal(), 2.0, 0.40, db, _settings(), _factory(rec))
     assert d.action == "halt" and rec == []    # kill-switch tripped, no order attempted

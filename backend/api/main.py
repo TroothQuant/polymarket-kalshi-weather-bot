@@ -1214,6 +1214,14 @@ async def reset_bot(
 ):
     from backend.core.scheduler import log_event
 
+    # A LIVE book must NEVER be resettable via the API — reset deletes trade rows
+    # (including live order_id positions) and zeroes bankroll to INITIAL_BANKROLL.
+    # Hard 403 while WEATHER_LIVE_TRADING is on, auth token or not (audit 4b).
+    if getattr(settings, "WEATHER_LIVE_TRADING", False):
+        raise HTTPException(
+            status_code=403,
+            detail="reset is disabled while WEATHER_LIVE_TRADING is on (live book)")
+
     try:
         trades_deleted = db.query(Trade).delete()
         state = db.query(BotState).first()
