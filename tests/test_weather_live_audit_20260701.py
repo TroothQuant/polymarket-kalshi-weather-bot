@@ -54,7 +54,10 @@ class _FakeClient:
         self._order_rec = order_rec
         self.get_order_calls = []
 
-    def create_order(self, order_args):
+    def get_tick_size(self, token_id):
+        return "0.01"
+
+    def create_market_order(self, order_args, options=None):
         return {"signed": True}
 
     def post_order(self, signed, order_type):

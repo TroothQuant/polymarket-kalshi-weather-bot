@@ -22,6 +22,19 @@ from typing import Optional
 
 log = logging.getLogger("trading_bot")
 
+# CLOB MARKET-order rounding per tick size (mirrors py_clob_client_v2 ROUNDING_CONFIG).
+# A marketable FAK BUY is rounded as a MARKET order: maker (USDC) is ALWAYS <= 2 dp,
+# and the taker (shares) to the tick's amount precision; price rounds DOWN to tick.
+# Building it as a LIMIT order instead (maker<=4dp / taker<=2dp) is what got every
+# real order rejected 2026-07-03 ("invalid amounts, maker max 2 / taker max 4 dp").
+_MK_ROUND = {"0.1": (1, 3), "0.01": (2, 4), "0.001": (3, 5), "0.0001": (4, 6)}
+
+
+def _round_down(x: float, dp: int) -> float:
+    """Floor to `dp` decimals — used on the SPEND side so cost never rounds UP."""
+    from math import floor
+    return floor(x * (10 ** dp)) / (10 ** dp)
+
 
 class WeatherLiveTrader:
     """Real execution via Polymarket CLOB (py-clob-client). Instantiated only on
@@ -63,32 +76,41 @@ class WeatherLiveTrader:
 
     # ── pure construction logic (no deps, no network — the dry-run unit) ──────
     @staticmethod
-    def build_order_args(token_id: str, size_usd: float, market_price: float) -> dict:
-        """Return the order spec WITHOUT signing or posting. 2-tick taker
-        aggression (+0.02, capped 0.99) so the BUY crosses the spread and fills
-        as a taker — same as the Claude bot. Refuses a missing token_id (P0
-        guard: never guess)."""
+    def build_order_args(token_id: str, size_usd: float, market_price: float,
+                         tick_size: str = "0.01") -> dict:
+        """Return the ROUNDED market-BUY spec WITHOUT signing or posting, using the
+        CLOB's MARKET-order rounding for the token's tick (FAK-precision fix,
+        2026-07-03): maker (USDC) <= 2 dp, taker (shares) <= the tick's amount
+        precision, price rounded DOWN to tick. +2-tick taker aggression so the FAK
+        BUY crosses the spread. Spend is round DOWN → the maker (cost) NEVER exceeds
+        `size_usd` (the per-trade cap). The >=15-share CLOB minimum is re-checked
+        AFTER rounding. Refuses a missing token_id (P0 guard: never guess)."""
         if not token_id:
             raise ValueError("live order requires a token_id (P0 guard) — refusing market")
         if size_usd <= 0:
             raise ValueError("live order requires size_usd > 0")
-        price = min(round(market_price + 0.02, 2), 0.99)
-        # py-clob OrderArgs.size is SHARES (conditional tokens), NOT USD, and there
-        # is NO `amount` field — passing amount= raises TypeError (the latent bug
-        # that would have crashed the FIRST live order; fixed 2026-06-24). To spend
-        # ~size_usd at `price`, buy size_usd/price shares (cost = shares*price).
-        shares = round(size_usd / price, 2)
+        price_dp, taker_dp = _MK_ROUND.get(str(tick_size), (2, 4))
+        tick = float(tick_size)
+        # +2-tick aggression, rounded DOWN to tick precision, clamped to (tick, 1-tick).
+        price = _round_down(market_price + 2 * tick, price_dp)
+        price = min(price, _round_down(1 - tick, price_dp))
+        price = max(price, tick)
+        if price <= 0:
+            raise ValueError("live order computed a non-positive price — refusing")
+        # maker = USDC spend, rounded DOWN to 2 dp so cost can never exceed the cap
+        # AND never carries >2 decimals (the CLOB's market-buy maker limit).
+        maker_usd = _round_down(float(size_usd), 2)
+        # taker = shares = maker/price, rounded DOWN to the tick's amount precision.
+        shares = _round_down(maker_usd / price, taker_dp)
         if shares < 15:
-            # CLOB rejects orders under 15 shares. At the $11 cap this only bites
-            # above ~0.73 entry; refuse CLEANLY (execute_buy's try converts this to
-            # a no-fill → the scheduler writes NO row) instead of silently coupling
-            # the $ cap to the 0.70 entry ceiling and letting the order reject at
-            # the exchange (audit 5c, 2026-07-01).
+            # CLOB rejects orders under 15 shares; refuse CLEANLY (execute_buy's try
+            # converts this to a no-fill → the scheduler writes NO row). AFTER rounding
+            # per the 2026-07-03 fix (audit 5c origin).
             raise ValueError(
                 f"live order {shares} shares < 15-share CLOB minimum "
                 f"(size_usd={size_usd} @ price={price}) — refusing")
         return {"token_id": str(token_id), "price": price, "size": shares,
-                "amount_usd": float(size_usd), "side": "BUY"}
+                "amount_usd": maker_usd, "side": "BUY"}
 
     def get_balance(self) -> Optional[float]:
         """Actual USDC collateral balance (atomic /1e6). None on failure."""
@@ -144,20 +166,34 @@ class WeatherLiveTrader:
         FAK matches the existing +2-tick taker intent: we always wanted an
         immediate taker fill, never a resting order. A thin book fills LESS than
         requested but records it ACCURATELY (no phantom)."""
-        from py_clob_client_v2.clob_types import OrderArgs, OrderType
+        from py_clob_client_v2.clob_types import (
+            MarketOrderArgs, OrderType, PartialCreateOrderOptions)
         from py_clob_client_v2.order_builder.constants import BUY
 
         try:
-            # build_order_args is INSIDE the try so its <15-share guard (5c) and any
-            # construction error convert to a clean no-fill (→ caller writes no row).
-            args = self.build_order_args(token_id, size_usd, market_price)
-            order_args = OrderArgs(token_id=args["token_id"], size=args["size"],
-                                   price=args["price"], side=BUY)
-            signed_order = self.client.create_order(order_args)
+            # Resolve the token's tick size (the SDK tolerates Number-or-String), then
+            # build the tick-aware rounded spec + re-check the 15-share min BEFORE
+            # posting. build_order_args is INSIDE the try so its guards convert to a
+            # clean no-fill (→ caller writes no row).
+            try:
+                tick_size = str(self.client.get_tick_size(token_id))
+            except Exception:
+                tick_size = "0.01"
+            args = self.build_order_args(token_id, size_usd, market_price, tick_size)
+            # A marketable FAK BUY MUST be built as a MARKET order (amount=USDC) so the
+            # SDK rounds maker<=2dp / taker<=4dp to MATCH the CLOB. Building it as a
+            # LIMIT order (size=shares) rounds the other way and the CLOB rejects it
+            # ("invalid amounts") — the 2026-07-03 first-real-signal failure.
+            order_args = MarketOrderArgs(
+                token_id=args["token_id"], amount=args["amount_usd"],
+                side=BUY, price=args["price"], order_type=OrderType.FAK)
+            signed_order = self.client.create_market_order(
+                order_args, options=PartialCreateOrderOptions(tick_size=tick_size))
             resp = self.client.post_order(signed_order, OrderType.FAK)
             order_id = (resp.get("orderID") or resp.get("id")) if isinstance(resp, dict) else None
             status = resp.get("status") if isinstance(resp, dict) else None
-            log.info(f"Weather live CLOB FAK order submitted: {order_id} (status={status})")
+            log.info(f"Weather live CLOB FAK market-BUY submitted: {order_id} "
+                     f"(status={status}, ${args['amount_usd']:.2f} @ <={args['price']}, tick={tick_size})")
         except Exception as e:
             log.error(f"Weather live CLOB order failed: {e}")
             return None
