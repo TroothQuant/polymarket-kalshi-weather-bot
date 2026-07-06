@@ -68,3 +68,38 @@ def test_return_shape_unchanged():
     a = W.build_order_args("TOK", 11.0, 0.40, "0.01")
     assert set(a.keys()) == {"token_id", "price", "size", "amount_usd", "side"}
     assert a["side"] == "BUY"
+
+
+# ── FAK orderbook instrumentation (2026-07-06, observability) ─────────────────
+class _OBClient:
+    def __init__(self, ob, raise_it=False):
+        self._ob = ob; self._raise = raise_it
+    def get_order_book(self, token_id):
+        if self._raise:
+            raise RuntimeError("boom")
+        return self._ob
+
+
+def _trader_ob(ob, raise_it=False):
+    t = W.__new__(W)
+    t.client = _OBClient(ob, raise_it)
+    return t
+
+
+def test_orderbook_snapshot_empty_book():
+    assert "NO ASKS" in _trader_ob({"asks": []})._orderbook_snapshot("TOK", 0.52)
+
+
+def test_orderbook_snapshot_best_ask_and_fillable():
+    # asks 0.50(100) fillable, 0.53(200)/0.60(500) above our 0.52 order price → not.
+    ob = {"asks": [{"price": "0.60", "size": "500"},
+                   {"price": "0.53", "size": "200"},
+                   {"price": "0.50", "size": "100"}]}
+    s = _trader_ob(ob)._orderbook_snapshot("TOK", 0.52)
+    assert "best_ask=0.500" in s and "sz=100.0" in s
+    assert "fillable<=px0.520=100.0sh" in s
+    assert "n_asks=3" in s
+
+
+def test_orderbook_snapshot_never_raises():
+    assert "unavailable" in _trader_ob({}, raise_it=True)._orderbook_snapshot("TOK", 0.5)

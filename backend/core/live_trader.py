@@ -155,6 +155,30 @@ class WeatherLiveTrader:
         return {"order_id": order_id, "fill_price": making / taking,
                 "shares": taking, "cost": making}
 
+    def _orderbook_snapshot(self, token_id, order_price) -> str:
+        """OBSERVABILITY ONLY (no trading effect): best ask, size at best ask, and
+        fillable ask depth at/below our order price — so a 'no match' FAK is
+        diagnosable after the fact (empty book vs best-ask-above-us vs too-thin
+        size). Asks are NOT ascending-sorted, so best ask = min price. Never
+        raises; returns a one-line note (2026-07-06)."""
+        try:
+            ob = self.client.get_order_book(token_id)
+            asks = (ob.get("asks") or []) if isinstance(ob, dict) else []
+            levels = []
+            for a in asks:
+                try:
+                    levels.append((float(a["price"]), float(a["size"])))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            if not levels:
+                return "ob: NO ASKS (empty book)"
+            best_p, best_s = min(levels, key=lambda x: x[0])
+            fillable = sum(s for p, s in levels if p <= order_price)
+            return (f"ob: best_ask={best_p:.3f} sz={best_s:.1f} | "
+                    f"fillable<=px{order_price:.3f}={fillable:.1f}sh | n_asks={len(levels)}")
+        except Exception as e:
+            return f"ob: unavailable ({e})"
+
     def execute_buy(self, token_id: str, size_usd: float, market_price: float) -> Optional[dict]:
         """Post a FAK (fill-and-kill) BUY at the +2-tick taker price: it fills
         immediately against the book and KILLS any unfilled remainder — no
@@ -180,6 +204,11 @@ class WeatherLiveTrader:
             except Exception:
                 tick_size = "0.01"
             args = self.build_order_args(token_id, size_usd, market_price, tick_size)
+            # Observability (2026-07-06): snapshot the book we're about to cross, so a
+            # 'no match' kill is diagnosable. Does NOT affect the order.
+            log.info(f"Weather live FAK attempt {str(token_id)[:12]}… "
+                     f"${args['amount_usd']:.2f} @ <={args['price']} | "
+                     f"{self._orderbook_snapshot(token_id, args['price'])}")
             # A marketable FAK BUY MUST be built as a MARKET order (amount=USDC) so the
             # SDK rounds maker<=2dp / taker<=4dp to MATCH the CLOB. Building it as a
             # LIMIT order (size=shares) rounds the other way and the CLOB rejects it
