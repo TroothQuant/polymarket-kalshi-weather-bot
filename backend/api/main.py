@@ -165,6 +165,8 @@ class TradeResponse(BaseModel):
     size: float
     timestamp: datetime
     settled: bool
+    settlement_time: Optional[datetime] = None
+    settlement_value: Optional[float] = None
     result: str
     pnl: Optional[float]
     edge_at_entry: Optional[float] = None
@@ -545,6 +547,8 @@ async def get_trades(
             size=t.size,
             timestamp=t.timestamp,
             settled=t.settled,
+            settlement_time=t.settlement_time,
+            settlement_value=t.settlement_value,
             result=t.result,
             pnl=t.pnl,
             edge_at_entry=_compute_edge(t),
