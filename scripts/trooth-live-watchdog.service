@@ -1,0 +1,8 @@
+[Unit]
+Description=TROOTH weather LIVE liveness watchdog (external checker, ntfy alerts)
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/root/.config/trooth/weather-live-mac.env
+ExecStart=/root/trooth-weather-live/.venv/bin/python /root/trooth-weather-live/scripts/watchdog_liveness.py

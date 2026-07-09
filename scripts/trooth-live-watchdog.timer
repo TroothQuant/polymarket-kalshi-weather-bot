@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the weather LIVE liveness watchdog every 5 minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Unit=trooth-live-watchdog.service
+
+[Install]
+WantedBy=timers.target

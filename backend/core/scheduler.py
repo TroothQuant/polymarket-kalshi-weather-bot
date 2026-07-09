@@ -9,6 +9,7 @@ import logging
 
 from backend.config import settings
 from backend.models.database import SessionLocal, Trade, BotState, Signal, PnlSnapshot
+from backend.core.notify import notify_push  # JOB 1 (2026-07-09): ntfy push alerts
 from backend.core.signals import scan_for_signals
 
 logging.basicConfig(level=logging.INFO)
@@ -400,20 +401,140 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
     if _live_daily_realized_loss(db) >= settings.WEATHER_LIVE_DAILY_LOSS_STOP_USD:
         return LiveDecision("halt", entry_price, trade_size, None)
 
-    # Hard per-trade dollar cap.
-    live_size = min(trade_size, settings.WEATHER_LIVE_MAX_TRADE_USD)
+    # AGGRESSIVE-HYBRID pricing (v2, 2026-07-09). limit_price = the model's
+    # probability for OUR side minus the minimum-edge floor — the MOST we will
+    # ever pay; within it we sweep + rest maximally aggressively so we never miss
+    # a fillable trade over pennies. `model_probability` is the ensemble YES prob.
+    min_edge_floor = getattr(settings, "WEATHER_LIVE_MIN_EDGE_FLOOR", 0.05)
+    model_p_side = (signal.model_probability if signal.direction == "yes"
+                    else 1.0 - signal.model_probability)
+    limit_price = model_p_side - min_edge_floor
+
+    # 15-share guard + min-size bump ("never miss a fillable trade over pennies"):
+    # size the stake UP to >=15 shares' worth at limit_price so a below-cap Kelly
+    # size can never produce a sub-15-share order. The guard fires (clean skip with
+    # a filter note) ONLY when even the FULL per-trade cap can't clear 15 shares.
+    min_for_15 = 15.0 * limit_price + 0.05
+    if limit_price <= 0 or min_for_15 > settings.WEATHER_LIVE_MAX_TRADE_USD:
+        return LiveDecision("guard_skip", limit_price, trade_size, None)
+
+    # Hard per-trade dollar cap, floored to clear the 15-share minimum.
+    live_size = min(max(trade_size, min_for_15), settings.WEATHER_LIVE_MAX_TRADE_USD)
 
     # OI1 hard TOTAL open-exposure cap. Summed open live stake + this trade must
     # not exceed the ceiling (set <= funded wallet balance). Blocks pile-in.
     if _live_total_open_exposure(db) + live_size > settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD:
         return LiveDecision("halt", entry_price, trade_size, None)
 
-    fill = live_trader_factory().execute_buy(token_id, live_size, entry_price)
+    fill = live_trader_factory().execute_aggressive_hybrid(token_id, live_size, limit_price)
     if fill is None:
-        return LiveDecision("skip", entry_price, trade_size, None)  # unfilled → NO row
+        return LiveDecision("skip", limit_price, trade_size, None)  # hard failure → NO row
 
-    # Confirmed fill — write the row with the ACTUAL fill economics + order_id.
-    return LiveDecision("fill", fill["fill_price"], fill["cost"], fill["order_id"])
+    if fill["filled_shares"] > 0:
+        # Immediate TAKE → write the row for the filled portion NOW. Any resting
+        # remainder is managed cross-cycle by manage_live_resting_orders.
+        return LiveDecision("fill", fill["fill_price"], fill["filled_cost"], fill["order_id"])
+
+    # Pure REST (0 immediate take): the GTC order sits top-of-book for the next
+    # seller. No row yet; manage_live_resting_orders records it when it fills.
+    return LiveDecision("rested", limit_price, trade_size, fill["order_id"])
+
+
+def _resting_at_settlement_approach(target_date) -> bool:
+    """True if a resting order's market is at/after its weather day (resolution
+    imminent) → cancel the resting bid (never open fresh exposure into a resolving
+    market). Unknown/unparseable date → False (leave it; reconcile is the backstop)."""
+    if not target_date:
+        return False
+    try:
+        from datetime import date as _date
+        if isinstance(target_date, str):
+            td = _date.fromisoformat(target_date[:10])
+        elif isinstance(target_date, datetime):
+            td = target_date.date()
+        else:
+            td = target_date  # already a date
+        return datetime.utcnow().date() >= td
+    except Exception:
+        return False
+
+
+def manage_live_resting_orders(trader, db, market_by_token, settings) -> set:
+    """AGGRESSIVE-HYBRID cross-cycle lifecycle (v2, 2026-07-09). For every resting
+    live BUY order: (1) record late fills as Trade rows (mapping token→market from
+    this cycle's markets, or a prior row for the same order — pure-rest fills with
+    no prior row are still caught LOUDLY by the F3 phantom reconcile, never
+    silent); (2) cancel orders whose market is at settlement approach. Returns the
+    set of token_ids that STILL have a live resting order, so the entry loop
+    dedupes (never double-open a resting market). Never raises — resting-order
+    management must never take down the scan."""
+    resting_tokens: set = set()
+    if not settings.WEATHER_LIVE_TRADING:
+        return resting_tokens
+    try:
+        orders = trader.list_open_weather_orders()
+    except Exception as e:
+        log_event("warning", f"[live] resting-order list failed ({e}) — skipping management this cycle")
+        return resting_tokens
+    for o in orders:
+        try:
+            order_id = o.get("id") or o.get("orderID") or o.get("order_id")
+            token = str(o.get("asset_id") or o.get("token_id") or o.get("tokenID") or "")
+            if not order_id or not token:
+                continue
+            try:
+                price = float(o.get("price") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            matched = trader._matched_shares(o)
+
+            prior = db.query(Trade).filter(Trade.order_id == order_id).all()
+            recorded = 0.0
+            for t in prior:
+                if t.entry_price:
+                    recorded += (t.size / t.entry_price)
+            meta = market_by_token.get(token)
+            if meta is None and prior:
+                p0 = prior[0]
+                meta = {"market_id": p0.market_ticker, "slug": p0.event_slug,
+                        "direction": p0.direction, "model_probability": p0.model_probability,
+                        "market_probability": p0.market_price_at_entry,
+                        "edge": p0.edge_at_entry, "target_date": None}
+
+            delta = matched - recorded
+            if delta >= 1.0 and price > 0 and meta is not None:
+                db.add(Trade(
+                    market_ticker=meta["market_id"], platform="polymarket",
+                    event_slug=meta.get("slug"), market_type="weather",
+                    direction=meta["direction"], entry_price=price,
+                    size=round(delta * price, 6),
+                    model_probability=meta.get("model_probability"),
+                    market_price_at_entry=meta.get("market_probability"),
+                    edge_at_entry=meta.get("edge"),
+                    order_id=order_id, token_id=token,
+                ))
+                db.commit()
+                log_event("success",
+                          f"[live] resting fill recorded: {delta:.1f} sh @ {price:.3f} on "
+                          f"{meta['market_id']} (order {str(order_id)[:10]}…)")
+                notify_push(  # watchdog C: a resting order caught a seller
+                    "Weather LIVE fill (rested)",
+                    f"{delta:.1f} sh @ {price:.3f} on {meta['market_id']} "
+                    f"({meta.get('direction','?').upper()}) — resting order filled.",
+                    priority="high", tags="moneybag")
+
+            # Settlement-approach cancel (only when we can date the market).
+            if meta is not None and _resting_at_settlement_approach(meta.get("target_date")):
+                if trader.cancel(order_id):
+                    log_event("info",
+                              f"[live] cancelled resting {str(order_id)[:10]}… on "
+                              f"{meta['market_id']} @ settlement approach")
+                continue  # cancelled → not a live resting token anymore
+
+            resting_tokens.add(token)
+        except Exception as e:
+            log_event("warning", f"[live] resting-order manage error ({e})")
+    return resting_tokens
 
 
 async def weather_scan_and_trade_job():
@@ -553,6 +674,33 @@ async def weather_scan_and_trade_job():
             # settled market on later days (which makes no sense for daily resolution).
             if not live_entries_ok:
                 log_event("info", "[live] balance unavailable this cycle — skipping new entries (position review/settlement run separately)")
+
+            # AGGRESSIVE-HYBRID (v2, 2026-07-09): manage resting orders BEFORE
+            # opening new ones — record late fills, cancel at settlement approach,
+            # and collect the set of tokens already resting so we never double-open
+            # (the Trade-row dedup below can't see a pure-rest order that has no row
+            # yet). Live-only; never raises into the scan.
+            resting_tokens: set = set()
+            if settings.WEATHER_LIVE_TRADING and live_entries_ok:
+                market_by_token = {}
+                for s in signals:
+                    m = s.market
+                    tok = (m.token_id_yes if s.direction == "yes" else m.token_id_no)
+                    if tok:
+                        market_by_token[str(tok)] = {
+                            "market_id": m.market_id, "slug": getattr(m, "slug", None),
+                            "direction": s.direction,
+                            "model_probability": s.model_probability,
+                            "market_probability": getattr(s, "market_probability", None),
+                            "edge": s.edge,
+                            "target_date": getattr(m, "target_date", None),
+                        }
+                try:
+                    resting_tokens = manage_live_resting_orders(
+                        _live_trader_factory(), db, market_by_token, settings)
+                except Exception as e:
+                    log_event("warning", f"[live] resting-order management failed ({e})")
+
             for signal in (actionable[:MAX_TRADES_PER_SCAN] if live_entries_ok else []):
                 try:
                     # Kalshi trade kill-switch (2026-05-20): defense-in-depth check.
@@ -579,6 +727,18 @@ async def weather_scan_and_trade_job():
                             f"Already traded {signal.market.market_id} "
                             f"(trade #{existing.id}, settled={existing.settled}); skipping",
                         )
+                        continue
+
+                    # Resting-order dedup (v2): a pure-rest GTC order has no Trade
+                    # row yet, so the row-based dedup above can't see it. Skip
+                    # re-opening a market that already has a live resting order.
+                    our_tok = (signal.market.token_id_yes if signal.direction == "yes"
+                               else signal.market.token_id_no)
+                    if our_tok and str(our_tok) in resting_tokens:
+                        log_event(
+                            "info",
+                            f"[live] {signal.market.market_id} already resting (live GTC) "
+                            f"— not double-opening.")
                         continue
 
                     trade_size = min(signal.suggested_size, settings.WEATHER_MAX_TRADE_SIZE)
@@ -635,13 +795,34 @@ async def weather_scan_and_trade_job():
                             f"or total-exposure (${settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD:.0f}) cap "
                             f"reached — halting new live opens for the day.")
                         break
-                    if decision.action == "skip":
-                        # Missing token id, or the live order did not fill: write NO
-                        # row, deduct NO bankroll, move on (no phantom paper row).
+                    if decision.action == "guard_skip":
+                        # Watchdog B: actionable but structurally un-submittable at
+                        # the cap (15-share min). Clean skip WITH the reason — never
+                        # a silent miss (this replaces today's sub-15-share refusals).
+                        lp = decision.entry_price
+                        _msg = (f"{signal.market.market_id} actionable but skipped: "
+                                f"15 x limit ${15.0 * lp:.2f} > cap "
+                                f"${settings.WEATHER_LIVE_MAX_TRADE_USD:.0f} (sub-15-share guard).")
+                        log_event("alert", f"[UNFILLED] {_msg}")
+                        notify_push("Weather live: UNFILLED (guard)", _msg,
+                                    priority="high", tags="warning")  # watchdog B
+                        continue
+                    if decision.action == "rested":
+                        # Aggressive-hybrid took 0 immediately; the GTC limit is now
+                        # resting top-of-book for the next seller. Expected, not a
+                        # failure — no row until it fills (manage records it).
                         log_event(
-                            "warning",
-                            f"[live] {signal.market.market_id} not opened "
-                            f"(missing token id or order unfilled) — no row written.")
+                            "info",
+                            f"[live] {signal.market.market_id} resting GTC @ {decision.entry_price:.3f} "
+                            f"(order {str(decision.order_id)[:10]}…) — first in queue, 0 immediate take.")
+                        continue
+                    if decision.action == "skip":
+                        # Watchdog B: hard construction/post failure or missing token.
+                        _msg = (f"{signal.market.market_id} actionable but NOT opened "
+                                f"(order build/post failed or missing token id).")
+                        log_event("alert", f"[UNFILLED] {_msg}")
+                        notify_push("Weather live: UNFILLED (error)", _msg,
+                                    priority="high", tags="rotating_light")  # watchdog B
                         continue
                     # "paper" → unchanged; "fill" → ACTUAL fill price/cost + order_id.
                     entry_price = decision.entry_price
@@ -704,6 +885,15 @@ async def weather_scan_and_trade_job():
                             "city": signal.market.city_name,
                         }
                     )
+                    # Watchdog C: push on a LIVE (real-money) take fill — the
+                    # first natural aggressive-hybrid fill is the moment we've been
+                    # waiting for. order_id present == live (NULL on paper).
+                    if order_id:
+                        notify_push(
+                            "Weather LIVE fill (take)",
+                            f"{signal.market.city_name} {signal.direction.upper()} "
+                            f"${trade_size:.2f} @ {entry_price:.3f} on {signal.market.market_id}.",
+                            priority="high", tags="moneybag")
 
                     # Persist THIS candidate now — a booked row (especially a
                     # real-money live fill) must survive a LATER candidate raising
@@ -766,6 +956,17 @@ async def settlement_job():
                     "losses": losses,
                     "pnl": total_pnl
                 })
+                # Watchdog C: push only when a LIVE (real-money) position settled.
+                live_settled = [t for t in settled if getattr(t, "order_id", None)]
+                if live_settled:
+                    lw = sum(1 for t in live_settled if t.result == "win")
+                    ll = sum(1 for t in live_settled if t.result == "loss")
+                    lpnl = sum(t.pnl for t in live_settled if t.pnl is not None)
+                    notify_push(
+                        "Weather LIVE settled",
+                        f"{len(live_settled)} live: {lw}W/{ll}L, P&L ${lpnl:+.2f}. "
+                        f"(WON needs manual F1 redeem within 48h.)",
+                        priority="high", tags="moneybag")
 
                 for trade in settled:
                     result_prefix = "+" if trade.pnl and trade.pnl > 0 else ""
