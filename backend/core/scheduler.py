@@ -369,7 +369,8 @@ def _reconcile_live_positions() -> None:
         db.close()
 
 
-def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_trader_factory) -> LiveDecision:
+def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_trader_factory,
+                         resting_notional: float = 0.0, resting_ok: bool = True) -> LiveDecision:
     """Decide paper-vs-live for one weather candidate. Pure except for the
     injected db / live_trader_factory, so it unit-tests with mocks.
 
@@ -421,9 +422,16 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
     # Hard per-trade dollar cap, floored to clear the 15-share minimum.
     live_size = min(max(trade_size, min_for_15), settings.WEATHER_LIVE_MAX_TRADE_USD)
 
-    # OI1 hard TOTAL open-exposure cap. Summed open live stake + this trade must
-    # not exceed the ceiling (set <= funded wallet balance). Blocks pile-in.
-    if _live_total_open_exposure(db) + live_size > settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD:
+    # BUG 1 fail-closed: if resting exposure is UNKNOWN (open-orders list failed),
+    # do NOT open — we can't prove we're under the cap.
+    if not resting_ok:
+        return LiveDecision("exposure_skip", entry_price, trade_size, None)
+
+    # OI1 hard TOTAL open-exposure cap. Filled open stake (DB pending) + UNFILLED
+    # resting-order notional (BUG 1, 2026-07-10) + this trade must not exceed the
+    # ceiling. Resting orders were previously uncounted → could breach the cap.
+    if (_live_total_open_exposure(db) + resting_notional + live_size
+            > settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD):
         return LiveDecision("halt", entry_price, trade_size, None)
 
     fill = live_trader_factory().execute_aggressive_hybrid(token_id, live_size, limit_price)
@@ -459,23 +467,29 @@ def _resting_at_settlement_approach(target_date) -> bool:
         return False
 
 
-def manage_live_resting_orders(trader, db, market_by_token, settings) -> set:
-    """AGGRESSIVE-HYBRID cross-cycle lifecycle (v2, 2026-07-09). For every resting
-    live BUY order: (1) record late fills as Trade rows (mapping token→market from
-    this cycle's markets, or a prior row for the same order — pure-rest fills with
-    no prior row are still caught LOUDLY by the F3 phantom reconcile, never
-    silent); (2) cancel orders whose market is at settlement approach. Returns the
-    set of token_ids that STILL have a live resting order, so the entry loop
-    dedupes (never double-open a resting market). Never raises — resting-order
-    management must never take down the scan."""
+def manage_live_resting_orders(trader, db, market_by_token, settings):
+    """AGGRESSIVE-HYBRID cross-cycle lifecycle (v2, 2026-07-09; BUG-1 fix 2026-07-10).
+    For every resting live BUY order: (1) record late fills as Trade rows (mapping
+    token→market from this cycle's markets, or a prior row for the same order —
+    pure-rest fills with no prior row are still caught LOUDLY by the F3 phantom
+    reconcile); (2) cancel orders whose market is at settlement approach.
+
+    Returns (resting_tokens, resting_notional, ok):
+      - resting_tokens: tokens that STILL have a live resting order (entry-loop dedupe).
+      - resting_notional: sum of price*(size − size_matched) over live resting BUYs —
+        the UNCOUNTED exposure the $33 cap must now include (BUG 1).
+      - ok: False if the open-orders LIST failed → caller FAILS CLOSED (skips new
+        entries this cycle) because resting exposure is unknown.
+    Never raises — resting-order management must never take down the scan."""
     resting_tokens: set = set()
+    resting_notional = 0.0
     if not settings.WEATHER_LIVE_TRADING:
-        return resting_tokens
+        return resting_tokens, 0.0, True
     try:
         orders = trader.list_open_weather_orders()
     except Exception as e:
-        log_event("warning", f"[live] resting-order list failed ({e}) — skipping management this cycle")
-        return resting_tokens
+        log_event("warning", f"[live] resting-order list failed ({e}) — resting exposure UNKNOWN, failing closed (no new entries this cycle)")
+        return resting_tokens, 0.0, False
     for o in orders:
         try:
             order_id = o.get("id") or o.get("orderID") or o.get("order_id")
@@ -532,9 +546,16 @@ def manage_live_resting_orders(trader, db, market_by_token, settings) -> set:
                 continue  # cancelled → not a live resting token anymore
 
             resting_tokens.add(token)
+            # BUG 1: this order's remaining notional counts toward the exposure cap.
+            try:
+                osz = float(o.get("original_size") or o.get("size") or 0)
+            except (TypeError, ValueError):
+                osz = 0.0
+            remaining = max(0.0, osz - matched)
+            resting_notional += price * remaining
         except Exception as e:
             log_event("warning", f"[live] resting-order manage error ({e})")
-    return resting_tokens
+    return resting_tokens, resting_notional, True
 
 
 async def weather_scan_and_trade_job():
@@ -681,6 +702,8 @@ async def weather_scan_and_trade_job():
             # (the Trade-row dedup below can't see a pure-rest order that has no row
             # yet). Live-only; never raises into the scan.
             resting_tokens: set = set()
+            resting_notional = 0.0
+            resting_ok = True
             if settings.WEATHER_LIVE_TRADING and live_entries_ok:
                 market_by_token = {}
                 for s in signals:
@@ -696,10 +719,12 @@ async def weather_scan_and_trade_job():
                             "target_date": getattr(m, "target_date", None),
                         }
                 try:
-                    resting_tokens = manage_live_resting_orders(
+                    resting_tokens, resting_notional, resting_ok = manage_live_resting_orders(
                         _live_trader_factory(), db, market_by_token, settings)
                 except Exception as e:
-                    log_event("warning", f"[live] resting-order management failed ({e})")
+                    # Unexpected manage failure → fail CLOSED (resting exposure unknown).
+                    log_event("warning", f"[live] resting-order management failed ({e}) — failing closed")
+                    resting_ok = False
 
             for signal in (actionable[:MAX_TRADES_PER_SCAN] if live_entries_ok else []):
                 try:
@@ -787,7 +812,8 @@ async def weather_scan_and_trade_job():
                     # and trade_size pass through unchanged, order_id is None, and the
                     # row write below is byte-for-byte the original paper behaviour.
                     decision = resolve_weather_live(
-                        signal, trade_size, entry_price, db, settings, _live_trader_factory)
+                        signal, trade_size, entry_price, db, settings, _live_trader_factory,
+                        resting_notional=resting_notional, resting_ok=resting_ok)
                     if decision.action == "halt":
                         log_event(
                             "warning",
@@ -806,6 +832,13 @@ async def weather_scan_and_trade_job():
                         log_event("alert", f"[UNFILLED] {_msg}")
                         notify_push("Weather live: UNFILLED (guard)", _msg,
                                     priority="high", tags="warning")  # watchdog B
+                        continue
+                    if decision.action == "exposure_skip":
+                        # BUG 1 fail-closed: resting exposure unknown this cycle.
+                        log_event(
+                            "warning",
+                            f"[live] {signal.market.market_id} skipped — resting-order "
+                            f"exposure unknown (open-orders list failed); failing closed.")
                         continue
                     if decision.action == "rested":
                         # Aggressive-hybrid took 0 immediately; the GTC limit is now

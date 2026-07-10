@@ -124,3 +124,28 @@ def test_flag_off_is_paper():
     d = resolve_weather_live(_signal(), 2.0, 0.40, _db(),
                              _settings(WEATHER_LIVE_TRADING=False), _factory(rec))
     assert d.action == "paper" and rec == []
+
+
+# ── BUG 1 (resting-order exposure), added 2026-07-10 ──────────────────────────
+def test_resting_notional_counts_toward_cap_halts():
+    # No DB positions, but $30 of resting orders + bumped new (~$5.30) > $33 cap → halt.
+    rec = []
+    d = resolve_weather_live(_signal(), 2.0, 0.40, _db(),
+                             _settings(WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD=33.0),
+                             _factory(rec), resting_notional=30.0, resting_ok=True)
+    assert d.action == "halt" and rec == []
+
+
+def test_resting_plus_new_within_cap_proceeds():
+    rec = []
+    d = resolve_weather_live(_signal(), 2.0, 0.40, _db(),
+                             _settings(WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD=33.0),
+                             _factory(rec), resting_notional=10.0, resting_ok=True)
+    assert d.action == "fill"          # 0 db + 10 resting + ~5.30 new = ~15.3 <= 33
+
+
+def test_exposure_skip_when_resting_unknown_fail_closed():
+    rec = []
+    d = resolve_weather_live(_signal(), 2.0, 0.40, _db(), _settings(),
+                             _factory(rec), resting_notional=0.0, resting_ok=False)
+    assert d.action == "exposure_skip" and rec == []

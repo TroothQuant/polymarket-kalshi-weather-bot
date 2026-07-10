@@ -77,3 +77,64 @@ def test_matched_shares_reads_variants():
     assert WLT._matched_shares({}) == 0.0
     assert WLT._matched_shares(None) == 0.0
     assert WLT._matched_shares({"size_matched": "bad"}) == 0.0
+
+
+# ── BUG 2 (cancel) + BUG 3 (actual fill economics), added 2026-07-10 ──────────
+class _MockClient:
+    def __init__(self, trades=None, cancel_resp=None):
+        self._trades = trades or []
+        self._cancel_resp = cancel_resp if cancel_resp is not None else {"canceled": []}
+        self.cancel_calls = []
+
+    def cancel_orders(self, hashes):
+        self.cancel_calls.append(hashes)
+        return self._cancel_resp
+
+    def get_trades(self, params=None):
+        return self._trades
+
+
+def _trader_with_client(client):
+    t = WLT.__new__(WLT)          # bypass __init__ (no network / no key)
+    t.client = client
+    return t
+
+
+def test_cancel_uses_cancel_orders_list_of_hashes():
+    c = _MockClient(cancel_resp={"canceled": ["0xabc"]})
+    t = _trader_with_client(c)
+    assert t.cancel("0xabc") is True
+    assert c.cancel_calls == [["0xabc"]]      # BUG-2: list of hashes, NOT cancel_order(str)
+
+
+def test_cancel_false_when_not_confirmed():
+    t = _trader_with_client(_MockClient(cancel_resp={"canceled": []}))
+    assert t.cancel("0xabc") is False
+
+
+def test_actual_fill_sums_taker_trades_vwap():
+    # BUG-3: the aggressive take sweeps BELOW the limit → real avg < limit.
+    trades = [
+        {"taker_order_id": "0xORD", "price": "0.70", "size": "10"},
+        {"taker_order_id": "0xORD", "price": "0.80", "size": "5"},
+        {"taker_order_id": "0xOTHER", "price": "0.99", "size": "100"},
+    ]
+    t = _trader_with_client(_MockClient(trades=trades))
+    r = t._actual_fill_via_trades("0xORD")
+    assert r["shares"] == pytest.approx(15.0)
+    assert r["cost"] == pytest.approx(11.0)           # 7 + 4
+    assert r["fill_price"] == pytest.approx(11.0 / 15.0)  # VWAP 0.7333, not the limit
+
+
+def test_actual_fill_matches_trade2_real_economics():
+    # The real trade #2: 15.07 sh @ 0.735 (recorded wrongly at limit 0.899).
+    trades = [{"taker_order_id": "0x4b6f88f6", "price": "0.735", "size": "15.07"}]
+    r = _trader_with_client(_MockClient(trades=trades))._actual_fill_via_trades("0x4b6f88f6")
+    assert r["shares"] == pytest.approx(15.07)
+    assert r["cost"] == pytest.approx(15.07 * 0.735, abs=1e-6)
+    assert r["fill_price"] == pytest.approx(0.735)
+
+
+def test_actual_fill_none_triggers_fallback():
+    # No matching taker trade → None → execute() falls back to limit price + WARNING.
+    assert _trader_with_client(_MockClient(trades=[]))._actual_fill_via_trades("0xORD") is None

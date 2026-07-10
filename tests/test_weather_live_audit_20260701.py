@@ -162,7 +162,7 @@ def test_booked_fill_survives_later_candidate_error(monkeypatch):
     monkeypatch.setattr(ws, "scan_for_weather_signals", fake_scan)
 
     # Candidate M1 → confirmed fill; candidate M2 → raises mid-processing.
-    def fake_resolve(signal, trade_size, entry_price, db, settings_, factory):
+    def fake_resolve(signal, trade_size, entry_price, db, settings_, factory, **kwargs):
         if signal.market.market_id == "M1":
             return LiveDecision("fill", 0.42, 1.68, "F1")
         raise RuntimeError("boom on candidate 2")

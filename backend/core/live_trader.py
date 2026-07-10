@@ -190,14 +190,55 @@ class WeatherLiveTrader:
         return out
 
     def cancel(self, order_id) -> bool:
-        """Cancel one resting order. True on success. Never raises."""
+        """Cancel one resting order. True on success. Never raises.
+
+        BUG-2 fix (2026-07-10): the SDK's cancel_order takes an OrderPayload;
+        cancel_orders takes a LIST OF HASH STRINGS — which is what we have. The
+        old cancel_order(str) raised 'str has no attribute orderID' and silently
+        failed every settlement-cancel."""
         try:
-            self.client.cancel_order(order_id)
-            log.info(f"Weather live cancelled resting order {order_id}")
-            return True
+            resp = self.client.cancel_orders([order_id])
+            canceled = (resp.get("canceled") or []) if isinstance(resp, dict) else []
+            ok = str(order_id) in [str(c) for c in canceled]
+            if ok:
+                log.info(f"Weather live cancelled resting order {order_id}")
+            else:
+                log.warning(f"Weather live cancel_orders({order_id}) not confirmed: {resp}")
+            return ok
         except Exception as e:
-            log.warning(f"Weather live cancel_order({order_id}) failed: {e}")
+            log.warning(f"Weather live cancel_orders({order_id}) failed: {e}")
             return False
+
+    def _actual_fill_via_trades(self, order_id) -> Optional[dict]:
+        """BUG-3 fix (2026-07-10): ACTUAL taker fill economics from the CLOB trades
+        endpoint (the aggressive TAKE sweeps the book, so the true avg price is
+        BELOW our limit). Sums CONFIRMED trades whose taker_order_id == our order.
+        Returns {fill_price(avg), shares, cost} or None (caller falls back to the
+        limit price with a loud WARNING — conservative overstatement, never under)."""
+        try:
+            from py_clob_client_v2.clob_types import TradeParams
+            trs = self.client.get_trades(TradeParams())
+        except Exception as e:
+            log.warning(f"Weather live get_trades failed for {order_id}: {e}")
+            return None
+        tot_sh = 0.0
+        tot_cost = 0.0
+        for tr in (trs or []):
+            if not isinstance(tr, dict):
+                continue
+            if str(tr.get("taker_order_id", "")).lower() != str(order_id).lower():
+                continue
+            try:
+                px = float(tr.get("price") or 0)
+                sz = float(tr.get("size") or 0)
+            except (TypeError, ValueError):
+                continue
+            if px > 0 and sz > 0:
+                tot_sh += sz
+                tot_cost += px * sz
+        if tot_sh > 0:
+            return {"fill_price": tot_cost / tot_sh, "shares": tot_sh, "cost": tot_cost}
+        return None
 
     def execute_aggressive_hybrid(self, token_id: str, size_usd: float,
                                   limit_price: float) -> Optional[dict]:
@@ -258,16 +299,33 @@ class WeatherLiveTrader:
             if isinstance(st, str) and st.lower() in ("matched", "filled", "complete"):
                 break
         price = args["price"]
-        filled_cost = round(filled * price, 6) if filled > 0 else 0.0
+        fill_price = None
+        filled_cost = 0.0
+        if filled > 0:
+            # BUG-3 fix: record the ACTUAL swept price, not the limit. Fall back to
+            # the limit price with a loud WARNING if actuals can't be fetched
+            # (conservative — overstates cost, never understates).
+            actual = self._actual_fill_via_trades(order_id)
+            if actual and abs(actual["shares"] - filled) <= max(1.0, 0.05 * filled):
+                fill_price = actual["fill_price"]
+                filled = actual["shares"]
+                filled_cost = round(actual["cost"], 6)
+            else:
+                fill_price = price
+                filled_cost = round(filled * price, 6)
+                log.warning(
+                    f"Weather live HYBRID: actual fill economics unavailable for "
+                    f"{order_id} (actual={actual}); recording at LIMIT {price} "
+                    f"(conservative overstatement).")
         resting = max(0.0, args["size"] - filled)
         if filled > 0:
-            log.info(f"Weather live HYBRID take: {filled:.2f} sh @ ~{price} "
+            log.info(f"Weather live HYBRID take: {filled:.2f} sh @ {fill_price:.4f} "
                      f"(${filled_cost:.2f}); {resting:.2f} sh resting")
         else:
             log.info(f"Weather live HYBRID: 0 immediate take, {resting:.2f} sh resting @ {price}")
         return {"order_id": order_id, "price": price, "tick": tick_size,
                 "filled_shares": filled, "filled_cost": filled_cost,
-                "fill_price": price if filled > 0 else None,
+                "fill_price": fill_price,
                 "resting_shares": resting, "status": status}
 
     def get_balance(self) -> Optional[float]:
