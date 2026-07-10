@@ -1,0 +1,7 @@
+[Unit]
+Description=TROOTH daily live heartbeat (proof-of-life to ntfy)
+After=network-online.target
+[Service]
+Type=oneshot
+EnvironmentFile=/root/.config/trooth/weather-live-mac.env
+ExecStart=/root/trooth-weather-live/.venv/bin/python /root/trooth-weather-live/scripts/daily_heartbeat.py

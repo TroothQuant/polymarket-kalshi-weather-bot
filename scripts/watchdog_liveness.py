@@ -43,7 +43,40 @@ def is_active(unit):
                           capture_output=True, text=True).stdout.strip() == "active"
 
 
+ENV_FILE = "/root/.config/trooth/weather-live-mac.env"
+
+
+def tripwire_check():
+    """Auto-PAUSE the live book on a CONFIRMED reconcile divergence (the F3
+    reconcile already grace-filters transient data-api lag, so a non-'ok' status =
+    real-position accounting is wrong). Don't keep trading unattended on bad
+    accounting. Safe-side: a false pause loses trades, never money. Fires once
+    (no-op once already paused). 2026-07-10 (away-week tripwire)."""
+    try:
+        live = any(ln.strip() == "WEATHER_LIVE_TRADING=true" for ln in open(ENV_FILE))
+    except Exception:
+        return
+    if not live:
+        return  # already paused — nothing to trip
+    try:
+        c = sqlite3.connect(DB, timeout=8)
+        row = c.execute("SELECT reconcile_status FROM bot_state LIMIT 1").fetchone()
+        c.close()
+        recon = row[0] if row else None
+    except Exception:
+        return
+    if recon and recon != "ok":
+        subprocess.run(["sed", "-i",
+                        "s/^WEATHER_LIVE_TRADING=true$/WEATHER_LIVE_TRADING=false/", ENV_FILE])
+        subprocess.run(["systemctl", "restart", "trooth-weather-live"])
+        push("TRIPWIRE: reconcile divergence - LIVE PAUSED",
+             f"reconcile_status='{recon}' → set WEATHER_LIVE_TRADING=false + restarted. "
+             f"Real-position accounting is off; investigate before re-enabling.",
+             prio="urgent", tags="rotating_light")
+
+
 def main():
+    tripwire_check()
     fails = []
     for u in UNITS:
         if not is_active(u):

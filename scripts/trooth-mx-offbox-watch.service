@@ -1,0 +1,8 @@
+[Unit]
+Description=TROOTH off-box liveness — NYC watches the MX live box (ntfy on box-down)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=NTFY_TOPIC=trooth-live-120d6426e0
+ExecStart=/usr/bin/python3 /home/trooth/scripts/mx_offbox_watch.py

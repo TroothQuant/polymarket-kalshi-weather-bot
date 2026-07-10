@@ -1,0 +1,8 @@
+[Unit]
+Description=Daily live heartbeat at 13:00 UTC
+[Timer]
+OnCalendar=*-*-* 13:00:00 UTC
+Persistent=true
+Unit=trooth-live-heartbeat.service
+[Install]
+WantedBy=timers.target
