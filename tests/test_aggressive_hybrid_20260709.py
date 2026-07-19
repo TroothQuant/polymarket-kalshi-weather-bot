@@ -138,3 +138,19 @@ def test_actual_fill_matches_trade2_real_economics():
 def test_actual_fill_none_triggers_fallback():
     # No matching taker trade → None → execute() falls back to limit price + WARNING.
     assert _trader_with_client(_MockClient(trades=[]))._actual_fill_via_trades("0xORD") is None
+
+
+# ── taker fee (task #42 / P0-3d, 2026-07-19) ─────────────────────────────────
+def test_taker_fee_formula_trade2():
+    # 0.05 * price * (1-price) * shares; exact on trade #2 (~$0.1466 @0.735/15.07)
+    fee = WLT.taker_fee(0.735, 15.07)
+    assert fee == pytest.approx(0.1468, abs=1e-3)
+    # fee-inclusive cost basis → won-NO pnl ≈ +3.84 (payout 15.07 − cost)
+    cost = 15.07 * 0.735 + fee
+    assert (15.07 - cost) == pytest.approx(3.84, abs=0.02)
+
+
+def test_taker_fee_zero_edges():
+    assert WLT.taker_fee(0.0, 100) == 0.0
+    assert WLT.taker_fee(1.0, 100) == 0.0
+    assert WLT.taker_fee("bad", 10) == 0.0

@@ -145,6 +145,17 @@ class WeatherLiveTrader:
                 "amount_usd": _round_down(shares * price, 2), "side": "BUY"}
 
     @staticmethod
+    def taker_fee(price: float, shares: float) -> float:
+        """Polymarket taker fee = 0.05 × price × (1 − price) × shares. Empirically
+        exact on trade #2 ($0.1466). Also the term to subtract in live edge math
+        (runbook #11): net edge = gross_edge − fee/shares = gross − 0.05·p·(1−p)."""
+        try:
+            p = float(price)
+            return 0.05 * p * (1.0 - p) * float(shares)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
     def _matched_shares(rec: dict) -> float:
         """AUTHORITATIVE filled-share count from an order record (get_order /
         get_open_orders). 0.0 if unknown/none — never guess a fill."""
@@ -317,6 +328,12 @@ class WeatherLiveTrader:
                     f"Weather live HYBRID: actual fill economics unavailable for "
                     f"{order_id} (actual={actual}); recording at LIMIT {price} "
                     f"(conservative overstatement).")
+            # Fee-aware cost basis (task #42, 2026-07-19): Polymarket taker fee =
+            # 0.05 × price × (1−price) × shares (empirically exact on trade #2:
+            # $0.1466 predicted == on-chain). Fold into the cost so `size` == real
+            # USDC out and settlement P&L is net-of-fee.
+            fee = self.taker_fee(fill_price, filled)
+            filled_cost = round(filled_cost + fee, 6)
         resting = max(0.0, args["size"] - filled)
         if filled > 0:
             log.info(f"Weather live HYBRID take: {filled:.2f} sh @ {fill_price:.4f} "

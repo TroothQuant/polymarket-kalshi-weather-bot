@@ -333,16 +333,18 @@ def _reconcile_live_positions() -> None:
         onchain_toks = set(onchain.keys())
         # Unredeemed WON live positions still sit on-chain until the manual F1
         # claim (redeem_won is not wired yet). Their rows are no longer 'pending',
-        # so they'd read as phantoms even though they're expected. Exclude recent
-        # (~48h) settled-won live tokens from the phantom set and surface them
-        # separately as "unclaimed-win" noise, not a divergence (audit 5b).
-        win_cutoff = datetime.utcnow() - timedelta(hours=48)
+        # so they'd read as phantoms even though they're expected.
+        # P0-2 (2026-07-19): exclude EVERY settled-win token still on-chain from the
+        # phantom set, regardless of age — an unredeemed win is benign at any age
+        # (alert-only, never a CONFIRMED divergence). The old 48h cutoff let a win
+        # age into a "phantom" and the tripwire PAUSED the live book for ~6 days
+        # (the away-week failure). Any on-chain token that matches a settled-win row
+        # is a known unclaimed win, not a divergence.
         won_rows = db.query(Trade).filter(
             Trade.order_id.isnot(None),
             Trade.market_type == "weather",
             Trade.result == "win",
             Trade.token_id.isnot(None),
-            Trade.settlement_time >= win_cutoff,
         ).all()
         unclaimed_win_toks = {t.token_id for t in won_rows}
         ghosts = recorded - onchain_toks                        # recorded but NOT on-chain
@@ -381,6 +383,14 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
     # Belt-and-suspenders: this job only builds weather rows, but guard the live
     # path on market_type too so a future caller can never reach it with non-weather.
     market_type = getattr(signal.market, "market_type", "weather")
+    # P0-1 pause honesty (2026-07-19): on the LIVE deployment, a false live-trading
+    # flag means PAUSED → HALT (never write unmarked sim rows into the live DB /
+    # :8003 dashboard — the away-week phantom-#3–#9 failure). The PAPER deployment
+    # (WEATHER_LIVE_DEPLOYMENT unset) keeps its normal paper-simulate behavior.
+    if (getattr(settings, "WEATHER_LIVE_DEPLOYMENT", False)
+            and platform == "polymarket" and market_type == "weather"
+            and not settings.WEATHER_LIVE_TRADING):
+        return LiveDecision("halt_paused", entry_price, trade_size, None)
     if not (settings.WEATHER_LIVE_TRADING and platform == "polymarket"
             and market_type == "weather"):
         return LiveDecision("paper", entry_price, trade_size, None)
@@ -814,6 +824,14 @@ async def weather_scan_and_trade_job():
                     decision = resolve_weather_live(
                         signal, trade_size, entry_price, db, settings, _live_trader_factory,
                         resting_notional=resting_notional, resting_ok=resting_ok)
+                    if decision.action == "halt_paused":
+                        # P0-1: live deployment is PAUSED (flag false) → write NO row,
+                        # simulate NOTHING. The dashboard must never show sim as live.
+                        log_event(
+                            "info",
+                            "[live] PAUSED (WEATHER_LIVE_TRADING=false on the live deployment) "
+                            "— entries halted, no rows written.")
+                        break
                     if decision.action == "halt":
                         log_event(
                             "warning",

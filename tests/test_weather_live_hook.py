@@ -163,3 +163,26 @@ def test_killswitch_ignores_paper_losses():
     d = resolve_weather_live(_signal(), 50.0, 0.40, db, _settings(stop=10.0),
                              lambda: _MockTrader(_TAKE))
     assert d.action == "fill"
+
+
+# ── P0-1 pause honesty (2026-07-19) ──────────────────────────────────────────
+def test_live_deployment_paused_halts_no_sim_row():
+    # LIVE deployment + flag off → HALT (no paper-sim rows into the live DB).
+    s = _settings(live=False); s.WEATHER_LIVE_DEPLOYMENT = True
+    d = resolve_weather_live(_signal(), 50.0, 0.40, _db(), s, lambda: None)
+    assert d.action == "halt_paused"
+
+
+def test_paper_deployment_flag_off_still_paper():
+    # PAPER deployment (no WEATHER_LIVE_DEPLOYMENT) + flag off → paper (unchanged).
+    s = _settings(live=False)
+    d = resolve_weather_live(_signal(), 50.0, 0.40, _db(), s, lambda: None)
+    assert d.action == "paper"
+
+
+def test_live_deployment_flag_on_still_trades():
+    # LIVE deployment + flag ON → normal live path (not halted by P0-1).
+    s = _settings(live=True); s.WEATHER_LIVE_DEPLOYMENT = True
+    t = _MockTrader(_TAKE)
+    d = resolve_weather_live(_signal(), 50.0, 0.40, _db(), s, lambda: t)
+    assert d.action == "fill"
