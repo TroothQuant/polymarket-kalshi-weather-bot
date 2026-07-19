@@ -29,6 +29,19 @@ class Settings(BaseSettings):
     WEATHER_LIVE_DAILY_LOSS_STOP_USD: float = 10.0  # daily realized-loss kill-switch (live only)
     WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD: float = 25.0  # OI1: hard cap on summed OPEN live exposure (> per-trade so 1 order fits); set <= funded wallet balance at G1
     WEATHER_LIVE_CITIES: str = "nyc"                    # OI1: live path restricted to these cities (defense-in-depth on WEATHER_CITIES)
+    WEATHER_LIVE_MIN_EDGE_FLOOR: float = 0.05           # min gross edge to rest/take (model_p_side - price); the ladder target = model_p_side - this
+    # ── REST-PRICE LADDER (BUILD 2, 2026-07-19) — STAGED, DEFAULT OFF ──────────
+    # Flag-gated; decision core lives in live_trader.py (pure static methods,
+    # fully unit-tested). NOT wired into the scheduler hot path yet — while
+    # WEATHER_LIVE_LADDER is False the live path is UNCHANGED (AGGRESSIVE-HYBRID).
+    # Ladder PARAMS get set from the liquidity census (Cowork, Wed 2026-07-22);
+    # these are placeholders until then. Do NOT flip this flag without census
+    # params + a soak — it changes real-money execution.
+    WEATHER_LIVE_LADDER: bool = False
+    WEATHER_LIVE_LADDER_STEPS: int = 3                  # rungs from near-mid to the aggressive target
+    WEATHER_LIVE_LADDER_STEP_SECONDS: int = 60          # dwell time per rung while unfilled
+    WEATHER_LIVE_LADDER_BAND: float = 0.045             # 4.5c LP-rewards zone (must match rewardsMaxSpread)
+    WEATHER_LIVE_LADDER_REWARDS_MIN_SHARES: int = 20    # size the rewards rung to >= this to qualify for LP rewards
     CLOB_HOST: str = "https://clob.polymarket.com"
     POLYMARKET_CHAIN_ID: int = 137                  # Polygon
     POLYMARKET_SIGNATURE_TYPE: int = 0             # match the wallet type set at G1

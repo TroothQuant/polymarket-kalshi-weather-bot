@@ -155,6 +155,113 @@ class WeatherLiveTrader:
         except (TypeError, ValueError):
             return 0.0
 
+    # ── REST-PRICE LADDER (BUILD 2, 2026-07-19) — pure decision core ──────────
+    # Flag-gated by settings.WEATHER_LIVE_LADDER (default False); NOT yet wired
+    # into the live scheduler hot path. Dependency-free static units (no network,
+    # no signing, no posting) so the whole ladder is unit-testable exactly like
+    # build_limit_order_args. While the flag is off the AGGRESSIVE-HYBRID path is
+    # unchanged. Wiring + census-derived params land after Cowork's 2026-07-22
+    # census analysis. Motivation (session_log_2026-07-19): live GTC bids rested
+    # at model_p_side-0.05 far from the real mid and never filled — the ladder
+    # rests near mid first (earning LP rewards), then steps toward the aggressive
+    # limit while unfilled, with a mandatory protective reprice-down on staleness.
+
+    @staticmethod
+    def ladder_rungs(mid: float, target_price: float, band: float = 0.045,
+                     n_steps: int = 3, tick_size: str = "0.01") -> list:
+        """Monotonic BUY-bid price schedule: rest near the real `mid` first (the
+        LP-rewards rung, within `band` of mid), then step toward `target_price`
+        (= model_p_side - min_edge_floor, the MOST we will ever pay) over
+        `n_steps` rungs while unfilled.
+
+        Every rung rounds DOWN to tick and is clamped so it NEVER exceeds
+        `target_price` (never overpay) and stays within (tick, 1-tick). The first
+        rung is the least-aggressive price within `band` of mid on our side; when
+        the target already sits inside the band the ladder collapses to fewer
+        rungs. Deduplicated after rounding (adjacent rungs can round together).
+        Returns [] on degenerate input (non-positive mid or target)."""
+        if mid <= 0 or target_price <= 0:
+            return []
+        price_dp, _ = _MK_ROUND.get(str(tick_size), (2, 4))
+        tick = float(tick_size)
+        hi = _round_down(1 - tick, price_dp)
+
+        def _clamp(p: float) -> float:
+            p = _round_down(p, price_dp)
+            p = min(p, target_price, hi)
+            return max(p, tick)
+
+        # First rung = the real mid when the edge floor allows resting there
+        # (target >= mid), else the target itself. When target < mid, resting
+        # nearer mid would pay ABOVE model_p_side - floor (negative net edge), so
+        # the ladder collapses to a single rung at target — "inside the band WHEN
+        # the edge floor allows" (spec). `min(mid, target)` expresses both cases.
+        first = min(mid, target_price)
+        n = max(1, int(n_steps))
+        rungs: list = []
+        for i in range(n + 1):
+            p = _clamp(first + (i / n) * (target_price - first))
+            if p not in rungs:
+                rungs.append(p)
+        return rungs
+
+    @staticmethod
+    def is_rewards_rung(price: float, mid: float, band: float = 0.045) -> bool:
+        """True iff a resting order at `price` sits within the `band` LP-rewards
+        zone of `mid` (rewards require resting within rewardsMaxSpread of mid)."""
+        return abs(float(price) - float(mid)) <= band + 1e-9
+
+    @staticmethod
+    def rewards_band_size(price: float, size_usd: float, cap_usd: float,
+                          rewards_min_shares: int = 20,
+                          tick_size: str = "0.01") -> dict:
+        """Size the rewards rung to >= `rewards_min_shares` (20) so it qualifies
+        for LP rewards, WITHOUT breaching the per-trade `cap_usd`. Returns
+        {shares, amount_usd, rewards_eligible}.
+
+        rewards_eligible is False when 20 shares would cost more than the cap — we
+        then fall back to the largest cap-fitting size. The hard 15-share CLOB
+        minimum still applies (shares < 15 → not tradeable; caller refuses)."""
+        price_dp, taker_dp = _MK_ROUND.get(str(tick_size), (2, 4))
+        if price <= 0 or cap_usd <= 0:
+            return {"shares": 0.0, "amount_usd": 0.0, "rewards_eligible": False}
+        want_usd = min(float(size_usd), float(cap_usd))
+        shares = _round_down(want_usd / price, taker_dp)
+        # Bump toward the rewards floor when the cap can afford it.
+        if shares < rewards_min_shares and rewards_min_shares * price <= cap_usd + 1e-9:
+            shares = _round_down(float(rewards_min_shares), taker_dp)
+        eligible = shares >= rewards_min_shares
+        return {"shares": shares, "amount_usd": _round_down(shares * price, 2),
+                "rewards_eligible": eligible}
+
+    @staticmethod
+    def protective_action(resting_price: float, new_model_p_side: float,
+                          min_edge_floor: float = 0.05,
+                          tick_size: str = "0.01") -> dict:
+        """PROTECTIVE LEG (the half that matters most): re-evaluate a resting BUY
+        bid against a REFRESHED model probability. Edge at the resting price =
+        new_model_p_side - resting_price and must still clear `min_edge_floor`.
+
+        Returns {action, new_price}:
+          - 'hold'    : resting_price still clears the floor — leave it.
+          - 'reprice' : stale high bid — drop to new_price = model_p_side - floor
+                        (rounded DOWN to tick, >= 1 tick).
+          - 'cancel'  : no price >= 1 tick clears the floor — pull the order.
+        A stale bid left up is adverse-selection bait, so anything that is not a
+        clean 'hold' reprices DOWN or cancels immediately (never up)."""
+        price_dp, _ = _MK_ROUND.get(str(tick_size), (2, 4))
+        tick = float(tick_size)
+        new_target = new_model_p_side - min_edge_floor
+        if resting_price <= new_target + 1e-9:
+            return {"action": "hold", "new_price": _round_down(resting_price, price_dp)}
+        # +1e-9 before flooring so an exact-tick target (e.g. 0.82-0.05=0.7699…
+        # in binary float) lands on 0.77, not a spurious tick lower. Still never
+        # exceeds the true target beyond rounding noise.
+        new_price = _round_down(new_target + 1e-9, price_dp)
+        if new_price < tick:
+            return {"action": "cancel", "new_price": None}
+        return {"action": "reprice", "new_price": new_price}
+
     @staticmethod
     def _matched_shares(rec: dict) -> float:
         """AUTHORITATIVE filled-share count from an order record (get_order /
