@@ -46,37 +46,93 @@ def is_active(unit):
 ENV_FILE = "/root/.config/trooth/weather-live-mac.env"
 
 
-def tripwire_check():
-    """Auto-PAUSE the live book on a CONFIRMED reconcile divergence (the F3
-    reconcile already grace-filters transient data-api lag, so a non-'ok' status =
-    real-position accounting is wrong). Don't keep trading unattended on bad
-    accounting. Safe-side: a false pause loses trades, never money. Fires once
-    (no-op once already paused). 2026-07-10 (away-week tripwire)."""
+OPERATOR_ALLOWLIST = "/root/.config/trooth/operator_tokens.txt"
+RECON_ALERT_STATE = "/root/.local/state/trooth/reconcile_alert.json"
+
+
+def _read_operator_allowlist():
+    """Tokens the operator has marked as their own manual positions (one token id
+    per line; '#' comments ok). Classifies as 'operator-manual', not truly-unknown."""
     try:
-        live = any(ln.strip() == "WEATHER_LIVE_TRADING=true" for ln in open(ENV_FILE))
+        return {ln.split("#")[0].strip() for ln in open(OPERATOR_ALLOWLIST)
+                if ln.split("#")[0].strip()}
     except Exception:
+        return set()
+
+
+def reconcile_alert_check():
+    """ALERT-ONLY reconcile-divergence monitor (2026-07-19, downgraded from auto-
+    pause — which false-fired twice on benign divergences). NEVER pauses. Classifies
+    every on-chain-not-recorded token as redeemable-win / operator-manual /
+    TRULY-UNKNOWN and RE-PUSHES HOURLY while unresolved (like watchdog D), so a real
+    unrecorded bot fill (truly-unknown) can never hide as one missed push. Clears
+    its state when the divergence resolves. Never raises."""
+    try:
+        import sys, time, json
+        if "/root/trooth-weather-live" not in sys.path:
+            sys.path.insert(0, "/root/trooth-weather-live")
+        from backend.config import settings
+        from backend.core.scheduler import _fetch_onchain_positions
+        funder = getattr(settings, "POLYMARKET_FUNDER_ADDRESS", None)
+        if not funder:
+            return
+        onchain = set(_fetch_onchain_positions(funder).keys())
+    except Exception as e:
+        push("Weather LIVE reconcile check FAILED", f"could not fetch on-chain to classify divergence: {e}",
+             prio="high", tags="warning")
         return
-    if not live:
-        return  # already paused — nothing to trip
+
+    def _save(state):
+        try:
+            os.makedirs(os.path.dirname(RECON_ALERT_STATE), exist_ok=True)
+            json.dump(state, open(RECON_ALERT_STATE, "w"))
+        except Exception:
+            pass
+    def _load():
+        try:
+            return json.load(open(RECON_ALERT_STATE))
+        except Exception:
+            return {}
+
     try:
         c = sqlite3.connect(DB, timeout=8)
-        row = c.execute("SELECT reconcile_status FROM bot_state LIMIT 1").fetchone()
+        recorded = {r[0] for r in c.execute("SELECT token_id FROM trades WHERE result='pending' AND token_id IS NOT NULL")}
+        won = {r[0] for r in c.execute("SELECT token_id FROM trades WHERE result='win' AND token_id IS NOT NULL")}
         c.close()
-        recon = row[0] if row else None
     except Exception:
         return
-    if recon and recon != "ok":
-        subprocess.run(["sed", "-i",
-                        "s/^WEATHER_LIVE_TRADING=true$/WEATHER_LIVE_TRADING=false/", ENV_FILE])
-        subprocess.run(["systemctl", "restart", "trooth-weather-live"])
-        push("TRIPWIRE: reconcile divergence - LIVE PAUSED",
-             f"reconcile_status='{recon}' → set WEATHER_LIVE_TRADING=false + restarted. "
-             f"Real-position accounting is off; investigate before re-enabling.",
-             prio="urgent", tags="rotating_light")
+    allow = _read_operator_allowlist()
+    divergent = onchain - recorded
+    if not divergent:
+        _save({})  # resolved → clear
+        return
+    classes = []
+    unknown = 0
+    for tok in sorted(divergent):
+        if tok in won:
+            classes.append(("redeemable-win", tok))
+        elif tok in allow:
+            classes.append(("operator-manual", tok))
+        else:
+            classes.append(("TRULY-UNKNOWN", tok)); unknown += 1
+    summary = "/".join(sorted({cl for cl, _ in classes}))
+    now = time.time()
+    st = _load()
+    due = (st.get("summary") != summary) or (now - st.get("last", 0) >= 3600)
+    if due:
+        prio = "urgent" if unknown else "high"
+        body = "; ".join(f"{cl} {tok[:14]}…" for cl, tok in classes)
+        note = (" ⚠ TRULY-UNKNOWN = possible UNRECORDED BOT FILL — investigate now."
+                if unknown else " (benign; close/redeem or allowlist to clear).")
+        push(f"Weather LIVE reconcile divergence: {summary}",
+             f"{len(divergent)} on-chain position(s) not recorded — {body}.{note} "
+             f"Alert-only (bot NOT paused); re-pushes hourly until resolved.",
+             prio=prio, tags="warning")
+        _save({"summary": summary, "last": now})
 
 
 def main():
-    tripwire_check()
+    reconcile_alert_check()
     fails = []
     for u in UNITS:
         if not is_active(u):
