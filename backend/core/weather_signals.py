@@ -385,6 +385,18 @@ async def scan_for_weather_signals() -> List[WeatherTradingSignal]:
 
     logger.info(f"Found {len(markets)} total weather temperature markets")
 
+    # Batch-warm the v1 forecast cache with ONE Open-Meteo call per date (all
+    # cities) instead of one call per market — keeps the server IP under the
+    # per-IP rate limit after the 5->11 city expansion (2026-07-20). Best-effort;
+    # per-city fetch_ensemble_forecast() remains the fallback.
+    try:
+        from backend.data.weather import prefetch_v1_forecasts_batched
+        _pairs = {(m.city_key, m.target_date) for m in markets if getattr(m, "city_key", None)}
+        if _pairs:
+            await prefetch_v1_forecasts_batched(list(_pairs))
+    except Exception as _e:
+        logger.warning(f"Forecast prefetch skipped: {_e}")
+
     # Fetch current bankroll once per scan so Kelly sizing tracks actual
     # capital, not the hardcoded INITIAL_BANKROLL constant (bug fix
     # 2026-05-21). Falls back to INITIAL_BANKROLL if the DB query fails.

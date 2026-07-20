@@ -217,7 +217,10 @@ class PooledForecast:
 
 # Simple cache: (city_key, target_date_str) -> (timestamp, EnsembleForecast)
 _forecast_cache: Dict[str, tuple] = {}
-_CACHE_TTL = 900  # 15 minutes
+_CACHE_TTL = 3600  # 60 min (raised 2026-07-20: cut Open-Meteo 429s after 5->11 city expansion)
+_NEG_TTL = 180  # 3-min cooldown after a failed/429 forecast fetch, so a
+# rate-limited (city,date) is not re-hammered by every market in the scan
+_neg_cache: Dict[str, float] = {}
 # Multi-model (v2 shadow) cache — separate so v1's cache is untouched.
 _multimodel_cache: Dict[str, tuple] = {}
 
@@ -244,6 +247,9 @@ async def fetch_ensemble_forecast(city_key: str, target_date: Optional[date] = N
         cached_time, cached_forecast = _forecast_cache[cache_key]
         if now - cached_time < _CACHE_TTL:
             return cached_forecast
+    neg_t = _neg_cache.get(cache_key)
+    if neg_t is not None and now - neg_t < _NEG_TTL:
+        return None  # recently failed — cool down instead of re-hitting the API
 
     city = CITY_CONFIG[city_key]
 
@@ -306,6 +312,7 @@ async def fetch_ensemble_forecast(city_key: str, target_date: Optional[date] = N
             return forecast
 
     except Exception as e:
+        _neg_cache[cache_key] = now
         logger.warning(f"Failed to fetch ensemble forecast for {city_key}: {e}")
         return None
 
@@ -431,3 +438,103 @@ async def fetch_nws_observed_temperature(city_key: str, target_date: Optional[da
     except Exception as e:
         logger.warning(f"Failed to fetch NWS observations for {city_key}: {e}")
         return None
+
+
+async def prefetch_v1_forecasts_batched(pairs) -> None:
+    """Warm _forecast_cache for many (city_key, target_date) pairs using ONE
+    Open-Meteo call PER DATE (all cities comma-batched) instead of one call per
+    city/market. Cuts a scan's forecast calls from ~(cities*dates*markets) to
+    ~(dates), which keeps the server IP under Open-Meteo's per-IP rate limit
+    after the 5->11 city expansion (2026-07-20).
+
+    Best-effort and side-effect-only: it populates the SAME cache keys that
+    fetch_ensemble_forecast() reads, so all existing call sites are unchanged and
+    any failure simply leaves the per-city fetch to run as the fallback. An
+    order/identity guard (returned latitude must match the requested city) blocks
+    the one dangerous failure mode — assigning a city the wrong location's data.
+    """
+    now = time.time()
+    by_date: Dict[date, list] = {}
+    for city_key, target_date in pairs:
+        if city_key not in CITY_CONFIG:
+            continue
+        if target_date is None:
+            target_date = date.today()
+        cache_key = f"{city_key}_{target_date.isoformat()}"
+        cached = _forecast_cache.get(cache_key)
+        if cached and now - cached[0] < _CACHE_TTL:
+            continue  # already warm
+        by_date.setdefault(target_date, [])
+        if city_key not in by_date[target_date]:
+            by_date[target_date].append(city_key)
+
+    for target_date, cities in by_date.items():
+        if not cities:
+            continue
+        lats = ",".join(str(CITY_CONFIG[c]["lat"]) for c in cities)
+        lons = ",".join(str(CITY_CONFIG[c]["lon"]) for c in cities)
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                response = await client.get(
+                    "https://ensemble-api.open-meteo.com/v1/ensemble",
+                    params={
+                        "latitude": lats, "longitude": lons,
+                        "daily": "temperature_2m_max,temperature_2m_min",
+                        "temperature_unit": "fahrenheit",
+                        "start_date": target_date.isoformat(),
+                        "end_date": target_date.isoformat(),
+                        "models": "gfs_seamless",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as e:
+            # Cool down every city in this failed batch so the per-city fallback
+            # doesn't immediately re-hammer the same rate-limited endpoint.
+            for _c in cities:
+                _neg_cache[f"{_c}_{target_date.isoformat()}"] = now
+            logger.warning(f"Batched forecast prefetch failed for {target_date} "
+                           f"({len(cities)} cities): {e}")
+            continue
+
+        if isinstance(payload, dict):
+            payload = [payload]  # single-city responses come back as an object
+        if not isinstance(payload, list) or len(payload) != len(cities):
+            logger.warning(f"Batched forecast prefetch: response count mismatch for "
+                           f"{target_date} (got {len(payload) if isinstance(payload, list) else 'n/a'}, "
+                           f"want {len(cities)}); leaving per-city fallback")
+            continue
+
+        warmed = 0
+        for city_key, loc in zip(cities, payload):
+            loc = loc or {}
+            city = CITY_CONFIG[city_key]
+            resp_lat = loc.get("latitude")
+            # Order/identity guard: the API preserves request order, but never
+            # trust a mislabelled row into the cache — that would mis-forecast a city.
+            if resp_lat is None or abs(float(resp_lat) - float(city["lat"])) > 0.5:
+                logger.warning(f"Batched prefetch: latitude guard tripped for {city_key} "
+                               f"(resp {resp_lat} vs {city['lat']}); skipping, per-city fallback")
+                continue
+            daily = loc.get("daily", {})
+            member_highs, member_lows = [], []
+            for key, values in daily.items():
+                if not isinstance(values, list) or not values:
+                    continue
+                val = values[0]
+                if val is None:
+                    continue
+                if "temperature_2m_max" in key:
+                    member_highs.append(float(val))
+                elif "temperature_2m_min" in key:
+                    member_lows.append(float(val))
+            if not member_highs:
+                continue
+            forecast = EnsembleForecast(
+                city_key=city_key, city_name=city["name"], target_date=target_date,
+                member_highs=member_highs, member_lows=member_lows,
+            )
+            _forecast_cache[f"{city_key}_{target_date.isoformat()}"] = (now, forecast)
+            warmed += 1
+        logger.info(f"Batched forecast prefetch: warmed {warmed}/{len(cities)} cities "
+                    f"for {target_date} in 1 call")
