@@ -65,6 +65,9 @@ class Trade(Base):
     model_probability = Column(Float)
     market_price_at_entry = Column(Float)
     edge_at_entry = Column(Float)
+    # Realistic-fills hybrid (2026-07-20): how the paper trade was filled —
+    # 'instant' (swept at entry) or 'rest_fill' (a resting order later crossed).
+    fill_type = Column(String, nullable=True)
 
 
 class BtcPriceSnapshot(Base):
@@ -217,6 +220,32 @@ class ForecastLog(Base):
     recorded_at = Column(DateTime, default=datetime.utcnow)
 
 
+class PaperRestingOrder(Base):
+    """Simulated resting BUY order for the paper realistic-fills hybrid (2026-07-20).
+    When an instant sweep leaves an unfilled remainder, we rest it at the entry
+    limit price; later scans fill it if the real book's best_ask crosses down to
+    <= our rest price (proxy for a seller hitting our bid — conservative, same
+    spirit as the live take+rest). Cancelled (rest_expired) at settlement approach."""
+    __tablename__ = "paper_resting_orders"
+    id = Column(Integer, primary_key=True, index=True)
+    signal_id = Column(Integer, nullable=True, index=True)
+    market_ticker = Column(String, index=True)
+    platform = Column(String, default="polymarket")
+    event_slug = Column(String, nullable=True)
+    condition_id = Column(String, nullable=True)
+    direction = Column(String)                  # "yes" | "no"
+    rest_price = Column(Float)                   # entry limit (cap) we rest at
+    remaining_shares = Column(Float)             # unfilled shares still resting
+    city_name = Column(String, nullable=True)
+    target_date = Column(String, index=True)     # ISO 'YYYY-MM-DD' (settlement day)
+    model_probability = Column(Float, nullable=True)
+    market_price_at_entry = Column(Float, nullable=True)
+    edge_at_entry = Column(Float, nullable=True)
+    status = Column(String, default="resting", index=True)  # resting|filled|expired
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)
@@ -244,6 +273,14 @@ def ensure_schema():
         with engine.connect() as conn:
             with conn.begin():
                 conn.execute(text("ALTER TABLE trades ADD COLUMN market_type VARCHAR DEFAULT 'btc'"))
+
+    if "fill_type" not in columns:   # realistic-fills hybrid (2026-07-20)
+        try:
+            with engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text("ALTER TABLE trades ADD COLUMN fill_type VARCHAR"))
+        except Exception:
+            pass
 
     # Add calibration columns to signals table
     try:
@@ -277,6 +314,12 @@ def ensure_schema():
     # older DB that skips init_db still gets them (idempotent).
     try:
         Base.metadata.create_all(bind=engine, tables=[ModelBias.__table__, ForecastLog.__table__])
+    except Exception:
+        pass
+
+    # Realistic-fills resting-order table (2026-07-20): create if missing.
+    try:
+        Base.metadata.create_all(bind=engine, tables=[PaperRestingOrder.__table__])
     except Exception:
         pass
 

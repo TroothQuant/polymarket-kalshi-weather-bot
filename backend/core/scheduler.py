@@ -9,7 +9,7 @@ from sqlalchemy import func
 import logging
 
 from backend.config import settings
-from backend.models.database import SessionLocal, Trade, BotState, Signal, PnlSnapshot
+from backend.models.database import SessionLocal, Trade, BotState, Signal, PnlSnapshot, PaperRestingOrder
 from backend.core.signals import scan_for_signals
 
 logging.basicConfig(level=logging.INFO)
@@ -66,6 +66,107 @@ def log_event(event_type: str, message: str, data: dict = None):
 def get_recent_events(limit: int = 50) -> List[dict]:
     """Get recent events for terminal display."""
     return event_log[-limit:]
+
+
+# ── Realistic-fills hybrid: paper resting orders (2026-07-20) ─────────────────
+def _tag_signal(db, market_id: str, tag: str) -> None:
+    """Append a [tag] marker to the latest unexecuted weather Signal for a market
+    (durable, queryable outcome label — unfilled_no_liquidity / book_unavailable /
+    rested)."""
+    sig = db.query(Signal).filter(
+        Signal.market_ticker == market_id,
+        Signal.market_type == "weather",
+        Signal.executed == False,
+    ).order_by(Signal.timestamp.desc()).first()
+    if sig and f"[{tag}]" not in (sig.reasoning or ""):
+        sig.reasoning = (sig.reasoning or "") + f" [{tag}]"
+
+
+def _create_resting_order(db, signal, rest_price: float, remaining_shares: float) -> None:
+    """Rest the unfilled remainder of a signal's intended entry at the limit price
+    (the take+rest hybrid). Deduped: one open rest per (market, direction)."""
+    m = signal.market
+    existing = db.query(PaperRestingOrder).filter(
+        PaperRestingOrder.market_ticker == m.market_id,
+        PaperRestingOrder.direction == signal.direction,
+        PaperRestingOrder.status == "resting",
+    ).first()
+    if existing:
+        return
+    db.add(PaperRestingOrder(
+        signal_id=getattr(signal, "signal_id", None),
+        market_ticker=m.market_id,
+        platform=getattr(m, "platform", "polymarket"),
+        event_slug=m.slug,
+        condition_id=getattr(m, "condition_id", "") or "",
+        direction=signal.direction,
+        rest_price=rest_price,
+        remaining_shares=remaining_shares,
+        city_name=getattr(m, "city_name", ""),
+        target_date=m.target_date.isoformat() if getattr(m, "target_date", None) else None,
+        model_probability=signal.model_probability,
+        market_price_at_entry=signal.market_probability,
+        edge_at_entry=signal.edge,
+        status="resting",
+    ))
+
+
+def process_paper_resting_orders(db, state) -> None:
+    """Every scan: fill open paper resting orders against the REAL book (best_ask
+    crossed down to <= our rest price) and expire rests whose settlement day has
+    arrived. APPROXIMATION: 'ask crossed our limit' proxies a seller hitting our
+    resting bid — conservative, same spirit as the live take+rest hybrid. Only
+    active when WEATHER_PAPER_REALISTIC_FILLS. Robust: never raises to the scan."""
+    if not settings.WEATHER_PAPER_REALISTIC_FILLS:
+        return
+    from backend.core.execution_realism import resolve_token_id, fetch_book, realistic_fill
+    today = datetime.utcnow().date().isoformat()
+    rests = db.query(PaperRestingOrder).filter(PaperRestingOrder.status == "resting").all()
+    for ro in rests:
+        try:
+            # Expire at settlement approach (the target day has arrived/passed).
+            if ro.target_date and ro.target_date <= today:
+                ro.status = "expired"
+                ro.updated_at = datetime.utcnow()
+                log_event("info",
+                    f"[rest_expired] WX {ro.city_name}: {ro.direction.upper()} "
+                    f"{ro.remaining_shares:.0f}sh @ {ro.rest_price:.3f} (settlement approach)",
+                    {"reason": "rest_expired", "market": ro.market_ticker})
+                continue
+            token = resolve_token_id(ro.condition_id, ro.direction)
+            book = fetch_book(token) if token else None
+            if book is None:
+                continue   # book_unavailable this scan — leave resting
+            size_usd = ro.remaining_shares * ro.rest_price
+            fill = realistic_fill(book, cap_price=ro.rest_price, size_usd=size_usd)
+            if fill is None:
+                continue   # best_ask still above our rest — stay resting
+            if state.bankroll < fill["cost"]:
+                continue   # can't afford — stay resting
+            db.add(Trade(
+                market_ticker=ro.market_ticker, platform=ro.platform, event_slug=ro.event_slug,
+                market_type="weather", direction=ro.direction,
+                entry_price=fill["effective_entry_price"], size=fill["cost"],
+                model_probability=ro.model_probability,
+                market_price_at_entry=ro.market_price_at_entry, edge_at_entry=ro.edge_at_entry,
+                fill_type="rest_fill", signal_id=ro.signal_id,
+            ))
+            state.bankroll -= fill["cost"]
+            state.total_trades += 1
+            ro.remaining_shares = max(0.0, ro.remaining_shares - fill["filled_shares"])
+            ro.updated_at = datetime.utcnow()
+            if ro.remaining_shares * ro.rest_price < 0.5:   # dust remainder → done
+                ro.status = "filled"
+            log_event("trade",
+                f"WX {ro.city_name}: REST_FILL {ro.direction.upper()} "
+                f"{fill['filled_shares']:.1f}sh @ {fill['fill_price']:.3f} "
+                f"(fee ${fill['fee']:.3f}{', partial' if ro.status == 'resting' else ''})",
+                {"reason": "rest_fill", "market": ro.market_ticker,
+                 "filled_shares": fill["filled_shares"], "fee": fill["fee"],
+                 "city": ro.city_name})
+        except Exception as e:
+            log_event("error", f"resting-order processing failed for {ro.market_ticker}: {e}")
+    db.commit()
 
 
 async def scan_and_trade_job():
@@ -217,10 +318,6 @@ async def weather_scan_and_trade_job():
             "actionable": len(actionable),
         })
 
-        if not actionable:
-            log_event("info", "No actionable weather signals")
-            return
-
         db = SessionLocal()
         try:
             state = db.query(BotState).first()
@@ -230,6 +327,15 @@ async def weather_scan_and_trade_job():
 
             if not state.is_running:
                 log_event("info", "Bot is paused, skipping weather trades")
+                return
+
+            # Realistic-fills hybrid (2026-07-20): fill/expire paper resting orders
+            # against the real book EVERY scan — must run even when there are no new
+            # actionable signals this cycle (that's when a rest usually fills).
+            process_paper_resting_orders(db, state)
+
+            if not actionable:
+                log_event("info", "No actionable weather signals (resting orders processed)")
                 return
 
             MAX_TRADES_PER_SCAN = 3
@@ -380,40 +486,49 @@ async def weather_scan_and_trade_job():
                     )
                     break
 
-                entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
+                cap = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
+                entry_price = cap
+                fill_type = "instant"
 
-                # Realistic fills (2026-07-20, paper server only): fetch the REAL
-                # CLOB book and fill ONLY against actual asks at/below this cap
-                # (partial at real ask sizes, price = swept VWAP, 5% taker fee
-                # folded into the cost basis). No fillable ask -> NO trade row;
-                # the signal is tagged unfilled_no_liquidity. Flag OFF = the
-                # historical fantasy-fill at the gamma outcomePrice (unchanged).
+                # Realistic-fills TAKE+REST hybrid (2026-07-20, paper server only).
+                # Instant sweep against the REAL book at/below cap; the UNFILLED
+                # remainder RESTS at the cap (filled by a later scan if best_ask
+                # crosses down). book fetch failure -> book_unavailable (distinct
+                # from a fetched-but-thin book). Flag OFF = fantasy-fill unchanged.
                 if (settings.WEATHER_PAPER_REALISTIC_FILLS
                         and getattr(signal.market, "platform", "polymarket") == "polymarket"):
                     from backend.core.execution_realism import (
                         resolve_token_id, fetch_book, realistic_fill)
                     token = resolve_token_id(
                         getattr(signal.market, "condition_id", ""), signal.direction)
-                    book = fetch_book(token) if token else {"asks": []}
-                    fill = realistic_fill(book, cap_price=entry_price, size_usd=trade_size)
+                    book = fetch_book(token) if token else None
+                    if book is None:
+                        # Couldn't see the book — cannot assess. No trade, no rest.
+                        log_event("info",
+                            f"[book_unavailable] WX {signal.market.city_name}: "
+                            f"{signal.direction.upper()} book fetch failed (${trade_size:.0f})",
+                            {"slug": signal.market.slug, "direction": signal.direction,
+                             "reason": "book_unavailable", "city": signal.market.city_name})
+                        _tag_signal(db, signal.market.market_id, "book_unavailable")
+                        continue
+                    fill = realistic_fill(book, cap_price=cap, size_usd=trade_size)
+                    # Rest the unfilled remainder (whole size if no instant fill).
+                    req_sh = (fill["requested_shares"] if fill else trade_size / cap)
+                    filled_sh = fill["filled_shares"] if fill else 0.0
+                    remaining_sh = max(0.0, req_sh - filled_sh)
+                    if remaining_sh * cap >= 0.5:            # skip dust rests
+                        _create_resting_order(db, signal, cap, remaining_sh)
                     if fill is None:
                         log_event("info",
-                            f"[unfilled_no_liquidity] WX {signal.market.city_name}: "
-                            f"{signal.direction.upper()} no ask <= {entry_price:.3f} "
-                            f"(req ${trade_size:.0f})",
+                            f"[rested] WX {signal.market.city_name}: {signal.direction.upper()} "
+                            f"{req_sh:.0f}sh @ {cap:.3f} (no instant ask <= cap; resting)",
                             {"slug": signal.market.slug, "direction": signal.direction,
-                             "reason": "unfilled_no_liquidity", "cap": entry_price,
+                             "reason": "rested_no_instant_fill", "cap": cap,
                              "city": signal.market.city_name})
-                        unf = db.query(Signal).filter(
-                            Signal.market_ticker == signal.market.market_id,
-                            Signal.market_type == "weather",
-                            Signal.executed == False,
-                        ).order_by(Signal.timestamp.desc()).first()
-                        if unf and "unfilled_no_liquidity" not in (unf.reasoning or ""):
-                            unf.reasoning = (unf.reasoning or "") + " [unfilled_no_liquidity]"
+                        _tag_signal(db, signal.market.market_id, "rested")
                         continue
                     entry_price = fill["effective_entry_price"]  # fee-inclusive cost basis
-                    trade_size = fill["cost"]                    # actual $ deployed (partial)
+                    trade_size = fill["cost"]                    # instant-take portion
 
                 # Use the signal's platform so Kalshi trades save as "kalshi"
                 # (was hardcoded to "polymarket" before the Kalshi rollout 2026-05-19).
@@ -428,6 +543,7 @@ async def weather_scan_and_trade_job():
                     model_probability=signal.model_probability,
                     market_price_at_entry=signal.market_probability,
                     edge_at_entry=signal.edge,
+                    fill_type=fill_type,
                 )
 
                 db.add(trade)

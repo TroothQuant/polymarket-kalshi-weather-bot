@@ -102,15 +102,18 @@ def realistic_fill(book: dict, cap_price: float, size_usd: float) -> Optional[di
     }
 
 
-def fetch_book(token_id: str, client: Optional[httpx.Client] = None) -> dict:
+def fetch_book(token_id: str, client: Optional[httpx.Client] = None) -> Optional[dict]:
     """CLOB order book for a token. Returns {'asks':[{price,size}], 'bids':[...]}
-    (asks sorted ascending). Empty book on any failure (-> unfilled)."""
+    (asks sorted ascending) on success — possibly with EMPTY asks (a real, fetched,
+    thin book). Returns **None** on a fetch FAILURE (non-200 or exception) so the
+    caller can distinguish `book_unavailable` from `unfilled_no_liquidity` (a
+    fetched book with no ask <= cap)."""
     own = client is None
     c = client or httpx.Client(timeout=15.0)
     try:
         r = c.get(f"{CLOB_HOST}/book", params={"token_id": token_id}, headers=_UA)
         if r.status_code != 200:
-            return {"asks": [], "bids": []}
+            return None
         b = r.json()
         asks = sorted(
             ({"price": float(a["price"]), "size": float(a["size"])}
@@ -123,7 +126,7 @@ def fetch_book(token_id: str, client: Optional[httpx.Client] = None) -> dict:
         return {"asks": asks, "bids": bids}
     except Exception as e:
         log.warning(f"realistic-fill: book fetch failed for {token_id}: {e}")
-        return {"asks": [], "bids": []}
+        return None
     finally:
         if own:
             c.close()
