@@ -201,6 +201,16 @@ class Settings(BaseSettings):
     WEATHER_MODEL_BIAS_WINDOW_DAYS: int = 60
     WEATHER_MODEL_BIAS_CLAMP_F: float = 5.0  # clamp |bias| to this many °F
 
+    # ── Realistic paper fills (2026-07-20, paper server only) ──────────────────
+    # When True, at entry the bot fetches the REAL CLOB book and fills only
+    # against actual asks at/below the entry-price cap (partial fills at real ask
+    # sizes, price = swept VWAP, 5% taker fee folded into cost basis). No fillable
+    # ask -> NO trade row (signal tagged unfilled_no_liquidity). When False the
+    # bot keeps its historical fantasy-fill (fill at the gamma outcomePrice).
+    # REGIME BREAK: paper P&L before 2026-07-20 is fantasy-fill and NOT comparable
+    # to the realistic-fills era. See backend/core/execution_realism.py.
+    WEATHER_PAPER_REALISTIC_FILLS: bool = False
+
     # API / dashboard hardening (added 2026-05-20 per audit CRITICAL #2).
     # The FastAPI app used to bind 0.0.0.0 with CORS=* and no auth on the
     # mutating endpoints (/api/bot/reset, /api/bot/start|stop, /api/simulate-

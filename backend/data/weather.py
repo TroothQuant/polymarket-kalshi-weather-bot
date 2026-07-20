@@ -54,6 +54,30 @@ CITY_CONFIG: Dict[str, dict] = {
         "nws_office": "BOU",
         "nws_gridpoint": "BOU/62,60",
     },
+    # ── 6 gated stations (added 2026-07-20 after the station-bias backtest) ──
+    # coords = the EXACT Polymarket settlement airport (verified from each
+    # market's resolutionSource); forecasting reads lat/lon so it anchors to the
+    # settlement point. nws_station holds the ICAO for reference (cosmetic).
+    # Intl markets quote °C (parser converts →°F). Per-station backtest bias is
+    # seeded in model_bias.STATION_BIAS_SEED_F.
+    "san_francisco": {
+        "name": "San Francisco", "lat": 37.6213, "lon": -122.3790, "nws_station": "KSFO",
+    },
+    "toronto": {
+        "name": "Toronto", "lat": 43.6772, "lon": -79.6306, "nws_station": "CYYZ",
+    },
+    "london": {
+        "name": "London", "lat": 51.5053, "lon": 0.0553, "nws_station": "EGLC",
+    },
+    "milan": {
+        "name": "Milan", "lat": 45.6306, "lon": 8.7281, "nws_station": "LIMC",
+    },
+    "jeddah": {
+        "name": "Jeddah", "lat": 21.6796, "lon": 39.1565, "nws_station": "OEJN",
+    },
+    "wuhan": {
+        "name": "Wuhan", "lat": 30.7783, "lon": 114.2081, "nws_station": "ZHHH",
+    },
 }
 
 

@@ -178,6 +178,21 @@ import time as _time
 _bias_cache = {"ts": 0.0, "data": {}}
 _BIAS_CACHE_TTL = 300  # 5 min
 
+# Static per-station bias seed for the 6 gated stations added 2026-07-20.
+# Value = mean(GFS forecast − station METAR) °F from the 90-day station-bias
+# backtest (parity_data_2026-07-22/station_bias_backtest.csv). This is measured
+# vs the ACTUAL settlement station (METAR), which is the correct truth — so for
+# these stations it OVERRIDES the nightly ERA5-based table (ERA5-at-coords is the
+# ~station-anchoring artifact the Kalshi work flagged). corrected = raw − bias.
+STATION_BIAS_SEED_F = {
+    "san_francisco": 1.19,
+    "toronto":      -0.12,
+    "london":        0.15,
+    "milan":        -0.42,
+    "jeddah":       -1.70,
+    "wuhan":        -0.73,
+}
+
 
 def get_bias_cached(city, model):
     """Bias lookup for the scan hot path — reads the whole ModelBias table once per
@@ -185,6 +200,9 @@ def get_bias_cached(city, model):
     same enable/min-n rules as get_bias. 0.0 on any failure."""
     if not settings.WEATHER_MODEL_BIAS_ENABLED:
         return 0.0
+    # Gated stations use the authoritative METAR-based backtest bias (any model).
+    if city in STATION_BIAS_SEED_F:
+        return STATION_BIAS_SEED_F[city]
     now = _time.time()
     if now - _bias_cache["ts"] > _BIAS_CACHE_TTL:
         data = {}

@@ -18,6 +18,14 @@ CITY_ALIASES = {
     "los angeles": "los_angeles",
     "la": "los_angeles",
     "denver": "denver",
+    # 6 gated international/expansion stations (added 2026-07-20 — station-bias
+    # backtest passed the forecastability gate). °C markets; parser converts to °F.
+    "san francisco": "san_francisco",
+    "toronto": "toronto",
+    "london": "london",
+    "milan": "milan",
+    "jeddah": "jeddah",
+    "wuhan": "wuhan",
 }
 
 # Gamma /events filter: `series_slug=<value>` (snake_case) returns all open
@@ -30,6 +38,13 @@ CITY_SERIES_MAP = {
     "miami":       "miami-daily-weather",
     "los_angeles": "los-angeles-daily-weather",
     "denver":      "denver-daily-weather",
+    # 6 gated stations (2026-07-20). Slugs verified live against gamma.
+    "san_francisco": "san-francisco-daily-weather",
+    "toronto":       "toronto-daily-weather",
+    "london":        "london-daily-weather",
+    "milan":         "milan-daily-weather",
+    "jeddah":        "jeddah-daily-weather",
+    "wuhan":         "wuhan-daily-weather",
 }
 
 # Month name to number
@@ -59,6 +74,9 @@ class WeatherMarket:
     no_price: float          # Price the bot would PAY to buy NO  (the ask)
     volume: float = 0.0
     closed: bool = False
+    # gamma conditionId — needed to resolve CLOB token_ids for realistic fills
+    # (gamma's event list does not populate clobTokenIds). Added 2026-07-20.
+    condition_id: str = ""
     # Kalshi bucket-semantics fields (2026-05-20 — diagnostic in
     # scripts/inspect_kalshi_bucket_semantics_2026-05-20.py confirmed
     # Kalshi's KXHIGH series uses narrow point-buckets, not cumulative
@@ -111,11 +129,12 @@ def _parse_weather_market_title(title: str) -> Optional[dict]:
     title_lower = title.lower()
 
     # 1. Reject internal range buckets — these don't fit a single-threshold model.
-    if re.search(r'\d+\s*-\s*\d+\s*°?\s*f', title_lower) or "between" in title_lower:
+    #    [cf] so °C (international) ranges are rejected too (added 2026-07-20).
+    if re.search(r'\d+\s*-\s*\d+\s*°?\s*[cf]', title_lower) or "between" in title_lower:
         return None
 
     # 2. Must be temperature-related.
-    if not any(kw in title_lower for kw in ["temperature", "temp", "°f", "degrees", "high", "low"]):
+    if not any(kw in title_lower for kw in ["temperature", "temp", "°f", "°c", "degrees", "high", "low"]):
         return None
 
     # 3. Extract city from the question text.
@@ -133,11 +152,12 @@ def _parse_weather_market_title(title: str) -> Optional[dict]:
 
     # 4. Classify edge type — direction comes from the bucket phrasing, not
     #    from substring-matching "low" (which also matches "below").
-    LOW_EDGE = re.compile(r'°?\s*f?\s*or\s+(below|lower|less)\b', re.IGNORECASE)
+    # [cf]? so both "77°F or below" and "25°C or higher" match (2026-07-20).
+    LOW_EDGE = re.compile(r'°?\s*[cf]?\s*or\s+(below|lower|less)\b', re.IGNORECASE)
     HIGH_EDGE = re.compile(
-        r'(°?\s*f?\s*or\s+(higher|above|more|greater)\b'
-        r'|\babove\s+\d+\s*°?\s*f'
-        r'|\bmore\s+than\s+\d+\s*°?\s*f)',
+        r'(°?\s*[cf]?\s*or\s+(higher|above|more|greater)\b'
+        r'|\babove\s+\d+\s*°?\s*[cf]'
+        r'|\bmore\s+than\s+\d+\s*°?\s*[cf])',
         re.IGNORECASE,
     )
     if LOW_EDGE.search(title_lower):
@@ -145,16 +165,21 @@ def _parse_weather_market_title(title: str) -> Optional[dict]:
     elif HIGH_EDGE.search(title_lower):
         direction = "above"
     else:
-        logger.warning(f"weather parser: unrecognised bucket pattern, skipping: {title!r}")
+        logger.debug(f"weather parser: unrecognised bucket pattern, skipping: {title!r}")
         return None
 
-    # 5. Threshold temperature — first integer followed by an optional °F.
-    temp_match = re.search(r'(\d+)\s*°?\s*f', title_lower)
-    if not temp_match:
+    # 5. Threshold temperature — first integer + °C/°F unit. International markets
+    #    quote °C; the whole pipeline is °F-internal, so convert °C→°F here
+    #    (2026-07-20). Falls back to a bare "N degrees" (assumed °F, US legacy).
+    temp_match = re.search(r'(\d+)\s*°?\s*([cf])\b', title_lower)
+    if temp_match:
+        val, unit = float(temp_match.group(1)), temp_match.group(2)
+    else:
         temp_match = re.search(r'(\d+)\s*degrees', title_lower)
-    if not temp_match:
-        return None
-    threshold_f = float(temp_match.group(1))
+        if not temp_match:
+            return None
+        val, unit = float(temp_match.group(1)), "f"
+    threshold_f = val * 9.0 / 5.0 + 32.0 if unit == "c" else val
 
     # 6. Metric: derive from "highest"/"lowest" phrase in title to avoid the
     #    "below" → contains-"low" substring bug. Daily-high events always
@@ -335,4 +360,5 @@ def _parse_polymarket_weather(
         yes_price=yes_price,
         no_price=no_price,
         volume=volume,
+        condition_id=str(market_data.get("conditionId", "") or ""),
     )

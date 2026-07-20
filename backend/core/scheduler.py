@@ -382,6 +382,39 @@ async def weather_scan_and_trade_job():
 
                 entry_price = signal.market.yes_price if signal.direction == "yes" else signal.market.no_price
 
+                # Realistic fills (2026-07-20, paper server only): fetch the REAL
+                # CLOB book and fill ONLY against actual asks at/below this cap
+                # (partial at real ask sizes, price = swept VWAP, 5% taker fee
+                # folded into the cost basis). No fillable ask -> NO trade row;
+                # the signal is tagged unfilled_no_liquidity. Flag OFF = the
+                # historical fantasy-fill at the gamma outcomePrice (unchanged).
+                if (settings.WEATHER_PAPER_REALISTIC_FILLS
+                        and getattr(signal.market, "platform", "polymarket") == "polymarket"):
+                    from backend.core.execution_realism import (
+                        resolve_token_id, fetch_book, realistic_fill)
+                    token = resolve_token_id(
+                        getattr(signal.market, "condition_id", ""), signal.direction)
+                    book = fetch_book(token) if token else {"asks": []}
+                    fill = realistic_fill(book, cap_price=entry_price, size_usd=trade_size)
+                    if fill is None:
+                        log_event("info",
+                            f"[unfilled_no_liquidity] WX {signal.market.city_name}: "
+                            f"{signal.direction.upper()} no ask <= {entry_price:.3f} "
+                            f"(req ${trade_size:.0f})",
+                            {"slug": signal.market.slug, "direction": signal.direction,
+                             "reason": "unfilled_no_liquidity", "cap": entry_price,
+                             "city": signal.market.city_name})
+                        unf = db.query(Signal).filter(
+                            Signal.market_ticker == signal.market.market_id,
+                            Signal.market_type == "weather",
+                            Signal.executed == False,
+                        ).order_by(Signal.timestamp.desc()).first()
+                        if unf and "unfilled_no_liquidity" not in (unf.reasoning or ""):
+                            unf.reasoning = (unf.reasoning or "") + " [unfilled_no_liquidity]"
+                        continue
+                    entry_price = fill["effective_entry_price"]  # fee-inclusive cost basis
+                    trade_size = fill["cost"]                    # actual $ deployed (partial)
+
                 # Use the signal's platform so Kalshi trades save as "kalshi"
                 # (was hardcoded to "polymarket" before the Kalshi rollout 2026-05-19).
                 trade = Trade(
