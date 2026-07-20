@@ -550,11 +550,18 @@ async def prefetch_v1_forecasts_batched(pairs) -> None:
             loc = loc or {}
             city = CITY_CONFIG[city_key]
             resp_lat = loc.get("latitude")
+            resp_lon = loc.get("longitude")
             # Order/identity guard: the API preserves request order, but never
             # trust a mislabelled row into the cache — that would mis-forecast a city.
-            if resp_lat is None or abs(float(resp_lat) - float(city["lat"])) > 0.5:
-                logger.warning(f"Batched prefetch: latitude guard tripped for {city_key} "
-                               f"(resp {resp_lat} vs {city['lat']}); skipping, per-city fallback")
+            # Check BOTH lat and lon: several cities share a latitude (NYC/Ankara/
+            # Beijing/Madrid ~40N; many CN cities cluster), so latitude alone cannot
+            # disambiguate a (hypothetical) misordered response.
+            if (resp_lat is None or resp_lon is None
+                    or abs(float(resp_lat) - float(city["lat"])) > 0.5
+                    or abs(float(resp_lon) - float(city["lon"])) > 0.5):
+                logger.warning(f"Batched prefetch: coord guard tripped for {city_key} "
+                               f"(resp {resp_lat},{resp_lon} vs {city['lat']},{city['lon']}); "
+                               f"skipping, per-city fallback")
                 continue
             daily = loc.get("daily", {})
             member_highs, member_lows = [], []
