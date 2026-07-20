@@ -338,7 +338,7 @@ async def weather_scan_and_trade_job():
                 log_event("info", "No actionable weather signals (resting orders processed)")
                 return
 
-            MAX_TRADES_PER_SCAN = 3
+            MAX_TRADES_PER_SCAN = 25  # raised 2026-07-20 for paper data collection (48 cities)
             MIN_TRADE_SIZE = 10
             # Max total exposure to weather markets (configurable via .env or
             # WEATHER_MAX_ALLOCATION_USD in config.py). Bumped from $500 →
