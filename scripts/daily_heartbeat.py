@@ -24,9 +24,18 @@ def main():
     settled_today = c.execute("SELECT COUNT(*) n FROM trades WHERE substr(settlement_time,1,10)=?", (today,)).fetchone()["n"]
     recon = c.execute("SELECT reconcile_status FROM bot_state LIMIT 1").fetchone()["reconcile_status"] or "ok"
     c.close()
-    push(f"TROOTH live heartbeat {today}",
+    # P1 (parity §6 / carryover a, 2026-07-20): MODE must lead line 1 — a week of
+    # heartbeats never surfaced "you are paused and simulating." Mode is read from
+    # the SAME env the bot trades on (EnvironmentFile=weather-live-mac.env), so it
+    # cannot disagree with the actual live-trading flag.
+    _TRUE = ("1", "true", "yes", "on")
+    trading = os.environ.get("WEATHER_LIVE_TRADING", "").strip().lower() in _TRUE
+    deployed = os.environ.get("WEATHER_LIVE_DEPLOYMENT", "").strip().lower() in _TRUE
+    mode = "LIVE" if trading else ("PAUSED" if deployed else "PAPER")
+    push(f"[{mode}] TROOTH live heartbeat {today}",
+         f"MODE: {mode} (WEATHER_LIVE_TRADING={'on' if trading else 'off'})\n"
          f"bankroll ${bank:.2f} | open {op} (${exposure:.2f} exp) | fills today {fills_today} | "
          f"settled today {settled_today} | reconcile {recon}")
-    print("heartbeat sent")
+    print(f"heartbeat sent (mode={mode})")
 
 if __name__ == "__main__": main()
