@@ -67,26 +67,32 @@ class WeatherTradingSignal:
         return True
 
 
-def _model_yes_prob(forecast, market) -> float:
+def _model_yes_prob(forecast, market, bias: float = 0.0) -> float:
     """Map the market's question to the right probability_* call on a forecast-like
     object (raw, pre-clip). Shared by v1 (GFS EnsembleForecast) and v2 (PooledForecast)
     so both compute the SAME way on their respective member sets. Extracted verbatim
-    from the v1 inline dispatch (2026-07-01) — v1 behavior is unchanged."""
+    from the v1 inline dispatch (2026-07-01).
+
+    `bias` (default 0.0) shifts HIGH-temp thresholds to apply a per-station forecast
+    bias on the v1 path: P(actual_high ≥ thr) = P(raw ≥ thr + bias). Only HIGH
+    thresholds are shifted (the station bias is a daily-HIGH bias — same high-only
+    scope as the v2 shadow's member correction). v2 passes 0 (it corrects members
+    directly). bias=0 → byte-identical to the pre-2026-07-20 behavior."""
     strike_type = (getattr(market, "strike_type", None) or "").lower() or None
     is_kalshi = (getattr(market, "platform", "") == "kalshi")
     cap_shift = 1.0 if is_kalshi else 0.0
     floor_shift = 1.0 if is_kalshi else 0.0
     if strike_type and market.metric == "high":
         if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
-            return forecast.probability_high_between(market.floor_strike, market.cap_strike + cap_shift)
+            return forecast.probability_high_between(market.floor_strike + bias, market.cap_strike + cap_shift + bias)
         elif strike_type == "greater" and market.floor_strike is not None:
-            return forecast.probability_high_above(market.floor_strike + floor_shift)
+            return forecast.probability_high_above(market.floor_strike + floor_shift + bias)
         elif strike_type == "less" and market.cap_strike is not None:
-            return forecast.probability_high_below(market.cap_strike)
+            return forecast.probability_high_below(market.cap_strike + bias)
         else:
             if market.direction == "above":
-                return forecast.probability_high_above(market.threshold_f)
-            return forecast.probability_high_below(market.threshold_f)
+                return forecast.probability_high_above(market.threshold_f + bias)
+            return forecast.probability_high_below(market.threshold_f + bias)
     elif strike_type and market.metric == "low":
         if strike_type == "between" and market.floor_strike is not None and market.cap_strike is not None:
             return forecast.probability_low_between(market.floor_strike, market.cap_strike + cap_shift)
@@ -101,8 +107,8 @@ def _model_yes_prob(forecast, market) -> float:
     else:
         if market.metric == "high":
             if market.direction == "above":
-                return forecast.probability_high_above(market.threshold_f)
-            return forecast.probability_high_below(market.threshold_f)
+                return forecast.probability_high_above(market.threshold_f + bias)
+            return forecast.probability_high_below(market.threshold_f + bias)
         else:
             if market.direction == "above":
                 return forecast.probability_low_above(market.threshold_f)
@@ -180,9 +186,14 @@ async def generate_weather_signal(
     # 2. Polymarket / legacy path (no strike_type). Markets are
     #    cumulative thresholds; use the existing direction + threshold_f
     #    fields exactly as before.
-    # v1 probability (uncorrected GFS-only), clipped. The dispatch is extracted to
-    # _model_yes_prob so the v2 shadow reuses the EXACT same logic on its members.
-    prob_v1 = max(0.05, min(0.95, _model_yes_prob(forecast, market)))
+    # v1 probability, clipped. The dispatch is extracted to _model_yes_prob so the
+    # v2 shadow reuses the EXACT same logic on its members. Gated stations (2026-
+    # 07-20) apply their static METAR backtest bias on the v1 TRADING path via a
+    # HIGH-threshold shift (STATION_BIAS_SEED_F); all other cities pass 0.0 →
+    # unchanged uncorrected-GFS v1. (US cities' bias stays v2-shadow-only.)
+    from backend.core.model_bias import STATION_BIAS_SEED_F
+    _v1_bias = STATION_BIAS_SEED_F.get(market.city_key, 0.0)
+    prob_v1 = max(0.05, min(0.95, _model_yes_prob(forecast, market, bias=_v1_bias)))
 
     # ── Model-upgrade v1 SHADOW (2026-07-01) ─────────────────────────────────
     # Compute v2 (bias-corrected, equal-model-weight GFS+ECMWF pool) ALONGSIDE v1.

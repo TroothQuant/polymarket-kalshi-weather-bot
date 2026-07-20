@@ -8,7 +8,7 @@ ask side), adapted for weather:
   * uses the weather TAKER FEE 0.05*p*(1-p)*shares (same as the live book), not
     the sports flat-bps model.
 
-Gated by settings.WEATHER_REALISTIC_FILLS (paper server only). When OFF the
+Gated by settings.WEATHER_PAPER_REALISTIC_FILLS (paper server only). When OFF the
 paper bot keeps its historical fantasy-fill (fill at the gamma outcomePrice,
 zero slippage). When ON, a signal with no fillable ask <= cap produces NO trade
 row (logged unfilled_no_liquidity).
