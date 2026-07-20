@@ -67,3 +67,6 @@ secrets/
 *.db.bak_*
 data/backups/*.db.pre_*
 data/backups/*.db.bak_*
+
+# Source rollback snapshots (redundant with git history; kept on disk, not tracked)
+*.bak_*
