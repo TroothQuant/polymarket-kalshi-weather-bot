@@ -29,6 +29,13 @@ class WeatherTradingSignal:
     kelly_fraction: float = 0.0
     suggested_size: float = 0.0
 
+    # Single-source actionable decision (2026-07-21 gate-leak fix). Set from the
+    # SAME boolean that builds the [ACTIONABLE]/[FILTERED] reasoning tag in
+    # generate_weather_signal (edge band + not yes_blocked + conviction z >=
+    # WEATHER_MIN_CONVICTION_Z). passes_threshold returns this, so a [FILTERED]
+    # signal can never reach the fill / resting-order path.
+    is_actionable: bool = False
+
     # Metadata
     sources: List[str] = field(default_factory=list)
     reasoning: str = ""
@@ -58,13 +65,11 @@ class WeatherTradingSignal:
         YES direction when WEATHER_DISABLE_YES_ENTRIES=True: blocked entirely
         pending NOMADS-backtest diagnosis of the YES/above failure mode.
         """
-        if abs(self.edge) < settings.WEATHER_MIN_EDGE_THRESHOLD:
-            return False
-        if abs(self.edge) > settings.WEATHER_MAX_EDGE_THRESHOLD:
-            return False
-        if settings.WEATHER_DISABLE_YES_ENTRIES and self.direction == "yes":
-            return False
-        return True
+        # SINGLE-SOURCED 2026-07-21: return the exact boolean that built the
+        # [ACTIONABLE]/[FILTERED] tag. Do NOT recompute the condition here -- the
+        # split (tag counted conviction z, this property did not) was the gate
+        # leak that let SF #94 trade at conviction z=0.8 < 1.0 floor.
+        return self.is_actionable
 
 
 def _model_yes_prob(forecast, market, bias: float = 0.0) -> float:
@@ -338,6 +343,7 @@ async def generate_weather_signal(
         confidence=confidence,
         kelly_fraction=suggested_size / bankroll if bankroll > 0 else 0,
         suggested_size=suggested_size,
+        is_actionable=actionable,
         sources=[f"open_meteo_ensemble_{forecast.num_members}m"],
         reasoning=reasoning,
         ensemble_mean=mean_val,

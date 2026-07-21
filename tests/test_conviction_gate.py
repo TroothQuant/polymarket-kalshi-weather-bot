@@ -48,3 +48,21 @@ def test_floor_two_filters_low_z(monkeypatch):
     assert "[FILTERED]" in sig.reasoning        # low-z signal filtered out
     assert "conviction z=" in sig.reasoning     # the gate note fired
     assert "< 2.0 floor" in sig.reasoning
+
+
+def test_filtered_low_z_does_not_pass_threshold(monkeypatch):
+    """Gate-leak regression (2026-07-21): a signal FILTERED by the conviction gate
+    must NOT pass_threshold -- else the realistic-fills execution path (which selects
+    on passes_threshold) would still trade/rest it, as it did for SF #94 (z=0.8<1.0)."""
+    sig = _gen(monkeypatch, 2.0)                 # armed; _forecast() z ~0.45 < 2.0
+    assert sig is not None
+    assert "[FILTERED]" in sig.reasoning          # tag says filtered
+    assert sig.passes_threshold is False          # execution agrees -> no trade, no rest
+
+
+def test_actionable_passes_threshold(monkeypatch):
+    """Complement: a non-filtered signal must pass_threshold (execution == tag)."""
+    sig = _gen(monkeypatch, 0.0)                  # no-op floor -> actionable
+    assert sig is not None
+    assert "[ACTIONABLE]" in sig.reasoning
+    assert sig.passes_threshold is True
