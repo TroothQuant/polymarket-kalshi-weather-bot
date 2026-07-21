@@ -79,17 +79,64 @@ def _upsert_forecast(db, city, model, target_date_iso, high):
         row.recorded_at = datetime.utcnow()
 
 
+def _model_forecast_highs_batched(cities, target_date_iso, model):
+    """Mean daily-high (F) for MANY cities in ONE ensemble call, per model/date.
+    cities = list of (city_key, lat, lon). Returns {city_key: mean_high}.
+
+    Batched 2026-07-21 (reuses the dfbe3d0 scan-path pattern): comma-joined coords
+    + lat/lon order-guard so a misordered multi-location row can't be mislabelled.
+    Best-effort: any failure returns {} so the nightly/startup job simply logs
+    nothing that round (retries next run) instead of bursting 96 serial 429s."""
+    if not cities:
+        return {}
+    lats = ",".join(str(c[1]) for c in cities)
+    lons = ",".join(str(c[2]) for c in cities)
+    q = urllib.parse.urlencode({"latitude": lats, "longitude": lons,
+                                "daily": "temperature_2m_max", "temperature_unit": "fahrenheit",
+                                "start_date": target_date_iso, "end_date": target_date_iso,
+                                "models": model})
+    try:
+        with urllib.request.urlopen(f"https://ensemble-api.open-meteo.com/v1/ensemble?{q}", timeout=90) as r:
+            payload = json.load(r)
+    except Exception as e:
+        log.warning(f"[model_bias] batched forecast fetch failed ({model}, {len(cities)} cities): {e}")
+        return {}
+    if isinstance(payload, dict):
+        payload = [payload]  # single-location responses come back as an object
+    if not isinstance(payload, list) or len(payload) != len(cities):
+        log.warning(f"[model_bias] batched forecast count mismatch ({model}): got "
+                    f"{len(payload) if isinstance(payload, list) else 'n/a'} want {len(cities)}")
+        return {}
+    out = {}
+    for (ckey, lat, lon), loc in zip(cities, payload):
+        loc = loc or {}
+        rlat, rlon = loc.get("latitude"), loc.get("longitude")
+        if (rlat is None or rlon is None
+                or abs(float(rlat) - float(lat)) > 0.5 or abs(float(rlon) - float(lon)) > 0.5):
+            log.warning(f"[model_bias] coord guard tripped for {ckey} ({model})")
+            continue
+        vals = [float(s[0]) for k, s in loc.get("daily", {}).items()
+                if k != "time" and "temperature_2m_max" in k and s and s[0] is not None]
+        if vals:
+            out[ckey] = statistics.mean(vals)
+    return out
+
+
 def log_tomorrow_forecasts(db):
-    """Persist tomorrow's per-model forecast high for each city (window fills forward)."""
+    """Persist tomorrow's per-model forecast high for each city (window fills forward).
+
+    Batched 2026-07-21: ONE ensemble call per model (all cities) instead of 96
+    serial calls (48 cities x 2 models) -> restart + nightly are quota-safe. Same
+    {city, model, tomorrow, mean_high} rows persisted; behavior-neutral."""
     tomorrow = (datetime.utcnow().date() + timedelta(days=1)).isoformat()
-    for city, cfg in CITY_CONFIG.items():
-        for model in MODELS:
+    cities = [(city, cfg["lat"], cfg["lon"]) for city, cfg in CITY_CONFIG.items()]
+    for model in MODELS:
+        highs = _model_forecast_highs_batched(cities, tomorrow, model)
+        for city, fh in highs.items():
             try:
-                fh = _model_forecast_high(cfg["lat"], cfg["lon"], tomorrow, model)
-                if fh is not None:
-                    _upsert_forecast(db, city, model, tomorrow, fh)
+                _upsert_forecast(db, city, model, tomorrow, fh)
             except Exception as e:
-                log.warning(f"[model_bias] forecast log failed {city}/{model}: {e}")
+                log.warning(f"[model_bias] forecast upsert failed {city}/{model}: {e}")
     db.commit()
 
 

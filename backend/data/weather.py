@@ -2,7 +2,7 @@
 import httpx
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 from typing import Dict, List, Optional
 import statistics
 import time
@@ -16,24 +16,18 @@ CITY_CONFIG: Dict[str, dict] = {
         "lat": 40.7128,
         "lon": -74.0060,
         "nws_station": "KNYC",
-        "nws_office": "OKX",
-        "nws_gridpoint": "OKX/33,37",
     },
     "chicago": {
         "name": "Chicago",
         "lat": 41.8781,
         "lon": -87.6298,
         "nws_station": "KORD",
-        "nws_office": "LOT",
-        "nws_gridpoint": "LOT/75,72",
     },
     "miami": {
         "name": "Miami",
         "lat": 25.7617,
         "lon": -80.1918,
         "nws_station": "KMIA",
-        "nws_office": "MFL",
-        "nws_gridpoint": "MFL/75,53",
     },
     # Coords match KLAX (NWS settlement station for Polymarket).
     # Previously used downtown 34.0522/-118.2437 — 9.6°F too warm vs the
@@ -43,16 +37,12 @@ CITY_CONFIG: Dict[str, dict] = {
         "lat": 33.9425,
         "lon": -118.4081,
         "nws_station": "KLAX",
-        "nws_office": "LOX",
-        "nws_gridpoint": "LOX/154,44",
     },
     "denver": {
         "name": "Denver",
         "lat": 39.7392,
         "lon": -104.9903,
         "nws_station": "KDEN",
-        "nws_office": "BOU",
-        "nws_gridpoint": "BOU/62,60",
     },
     # ── 6 gated stations (added 2026-07-20 after the station-bias backtest) ──
     # coords = the EXACT Polymarket settlement airport (verified from each
@@ -265,10 +255,6 @@ _neg_cache: Dict[str, float] = {}
 _multimodel_cache: Dict[str, tuple] = {}
 
 
-def _celsius_to_fahrenheit(c: float) -> float:
-    return c * 9.0 / 5.0 + 32.0
-
-
 async def fetch_ensemble_forecast(city_key: str, target_date: Optional[date] = None) -> Optional[EnsembleForecast]:
     """
     Fetch ensemble forecast from Open-Meteo Ensemble API (free, 31-member GFS).
@@ -426,57 +412,6 @@ async def fetch_multimodel_forecast(city_key: str, target_date: Optional[date] =
         return result
     except Exception as e:
         logger.warning(f"Multi-model fetch failed for {city_key}: {e}")
-        return None
-
-
-async def fetch_nws_observed_temperature(city_key: str, target_date: Optional[date] = None) -> Optional[Dict[str, float]]:
-    """
-    Fetch observed temperature from NWS API for settlement.
-    Returns dict with 'high' and 'low' in Fahrenheit, or None if not available.
-    """
-    if city_key not in CITY_CONFIG:
-        return None
-
-    city = CITY_CONFIG[city_key]
-    if target_date is None:
-        target_date = date.today()
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            # NWS observations endpoint
-            station = city["nws_station"]
-            url = f"https://api.weather.gov/stations/{station}/observations"
-            headers = {"User-Agent": "(trading-bot, contact@example.com)"}
-
-            # Get observations for the target date
-            start = datetime.combine(target_date, datetime.min.time()).isoformat() + "Z"
-            end = datetime.combine(target_date + timedelta(days=1), datetime.min.time()).isoformat() + "Z"
-
-            response = await client.get(url, params={"start": start, "end": end}, headers=headers)
-            response.raise_for_status()
-            data = response.json()
-
-            features = data.get("features", [])
-            if not features:
-                return None
-
-            temps = []
-            for obs in features:
-                props = obs.get("properties", {})
-                temp_c = props.get("temperature", {}).get("value")
-                if temp_c is not None:
-                    temps.append(_celsius_to_fahrenheit(temp_c))
-
-            if not temps:
-                return None
-
-            return {
-                "high": max(temps),
-                "low": min(temps),
-            }
-
-    except Exception as e:
-        logger.warning(f"Failed to fetch NWS observations for {city_key}: {e}")
         return None
 
 

@@ -323,6 +323,18 @@ def ensure_schema():
     except Exception:
         pass
 
+    # Resting-order signal_id link (2026-07-21): graduation-ledger traceability.
+    # create_all above already gives a FRESH table the column; this idempotent
+    # ALTER back-fills an existing paper_resting_orders table that predates it.
+    try:
+        ro_cols = [c["name"] for c in inspect(engine).get_columns("paper_resting_orders")]
+        if "signal_id" not in ro_cols:
+            with engine.connect() as conn:
+                with conn.begin():
+                    conn.execute(text("ALTER TABLE paper_resting_orders ADD COLUMN signal_id INTEGER"))
+    except Exception:
+        pass
+
 
 def get_db():
     """Get database session."""

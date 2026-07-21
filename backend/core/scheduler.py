@@ -82,7 +82,7 @@ def _tag_signal(db, market_id: str, tag: str) -> None:
         sig.reasoning = (sig.reasoning or "") + f" [{tag}]"
 
 
-def _create_resting_order(db, signal, rest_price: float, remaining_shares: float) -> None:
+def _create_resting_order(db, signal, rest_price: float, remaining_shares: float, signal_id=None) -> None:
     """Rest the unfilled remainder of a signal's intended entry at the limit price
     (the take+rest hybrid). Deduped: one open rest per (market, direction)."""
     m = signal.market
@@ -94,7 +94,7 @@ def _create_resting_order(db, signal, rest_price: float, remaining_shares: float
     if existing:
         return
     db.add(PaperRestingOrder(
-        signal_id=getattr(signal, "signal_id", None),
+        signal_id=signal_id if signal_id is not None else getattr(signal, "signal_id", None),
         market_ticker=m.market_id,
         platform=getattr(m, "platform", "polymarket"),
         event_slug=m.slug,
@@ -517,7 +517,16 @@ async def weather_scan_and_trade_job():
                     filled_sh = fill["filled_shares"] if fill else 0.0
                     remaining_sh = max(0.0, req_sh - filled_sh)
                     if remaining_sh * cap >= 0.5:            # skip dust rests
-                        _create_resting_order(db, signal, cap, remaining_sh)
+                        # Traceability (2026-07-21): stamp the originating DB signal
+                        # id onto the rest so the graduation ledger has a direct link
+                        # (read-only lookup; does NOT mark the signal executed).
+                        _rest_sig = db.query(Signal).filter(
+                            Signal.market_ticker == signal.market.market_id,
+                            Signal.market_type == "weather",
+                            Signal.executed == False,
+                        ).order_by(Signal.timestamp.desc()).first()
+                        _create_resting_order(db, signal, cap, remaining_sh,
+                                              signal_id=(_rest_sig.id if _rest_sig else None))
                     if fill is None:
                         log_event("info",
                             f"[rested] WX {signal.market.city_name}: {signal.direction.upper()} "
