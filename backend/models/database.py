@@ -277,10 +277,13 @@ class CryptoWindow(Base):
     pick_spot_drift = Column(String, nullable=True)     # LIVE lean rule's pick
     pick_momentum = Column(String, nullable=True)       # shadow rule (a)
     pick_depth = Column(String, nullable=True)          # shadow rule (b)
+    pick_late_recency = Column(String, nullable=True)   # shadow rule (c): spot move over the FINAL ~60s (rotation/recency thesis, 7/22 article)
     hit_spot_drift = Column(Integer, nullable=True)     # 1/0/None per window
     hit_momentum = Column(Integer, nullable=True)
     hit_depth = Column(Integer, nullable=True)
+    hit_late_recency = Column(Integer, nullable=True)
     spot_open = Column(Float, nullable=True)
+    spot_t60 = Column(Float, nullable=True)             # first spot sample inside the final ~60s (late-recency baseline)
     spot_close = Column(Float, nullable=True)
     resolution = Column(String, nullable=True)          # "up" | "down"
     resolution_source = Column(String, nullable=True)   # gamma | spot_fallback
@@ -380,6 +383,23 @@ def ensure_schema():
     # Realistic-fills resting-order table (2026-07-20): create if missing.
     try:
         Base.metadata.create_all(bind=engine, tables=[PaperRestingOrder.__table__])
+    except Exception:
+        pass
+
+    # crypto5050 late-recency shadow rule (2026-07-22 PM): back-fill the three
+    # new columns onto an existing crypto_windows table. NOTE: no per-poll spot
+    # history exists, so prior windows CANNOT be backfilled with picks — the
+    # late-recency series starts at deploy.
+    try:
+        cw_cols = [c["name"] for c in inspect(engine).get_columns("crypto_windows")]
+        with engine.connect() as conn:
+            with conn.begin():
+                if "pick_late_recency" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN pick_late_recency VARCHAR"))
+                if "hit_late_recency" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN hit_late_recency INTEGER"))
+                if "spot_t60" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN spot_t60 FLOAT"))
     except Exception:
         pass
 

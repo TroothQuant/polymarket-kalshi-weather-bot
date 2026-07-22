@@ -299,3 +299,20 @@ def test_choose_side_uses_configurable_fill_threshold():
     # 15-share fills: a 15-share imbalance triggers rebalance; 10 does not.
     assert choose_side(15, 0, 0.5, 0.5, fill_shares=15.0) == "down"
     assert choose_side(10, 0, 0.4, 0.6, fill_shares=15.0) == "up"   # cheaper side
+
+
+# ── fourth shadow rule: late-recency (2026-07-22 PM) ─────────────────────────
+def test_lean_pick_late_recency():
+    from backend.core.crypto5050 import lean_pick_late_recency
+    assert lean_pick_late_recency(66000.0, 66040.0) == "up"
+    assert lean_pick_late_recency(66040.0, 66000.0) == "down"
+    assert lean_pick_late_recency(66000.0, 66000.0) is None    # flat → no pick
+    assert lean_pick_late_recency(None, 66000.0) is None       # no final-minute sample
+    assert lean_pick_late_recency(66000.0, None) is None       # no close sample
+
+
+def test_late_recency_grades_like_other_rules():
+    assert grade_pick("up", "up") == 1 and grade_pick("down", "up") == 0
+    # windows predating the rule (pick NULL) are excluded from n — no backfill
+    # exists because per-poll spot history was never stored.
+    assert grade_pick(None, "down") is None

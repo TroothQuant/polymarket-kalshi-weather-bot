@@ -162,6 +162,16 @@ def lean_pick_momentum(up_mid_open, up_mid_now):
     return "up" if up_mid_now > up_mid_open else "down"
 
 
+def lean_pick_late_recency(spot_t60, spot_close):
+    """SHADOW rule (c), added 2026-07-22 PM: side of the BTC spot move over the
+    FINAL ~60s of the window (spot_t60 = first sample inside the last minute).
+    Tests the rotation/recency thesis (7/22 article) against the midpoint
+    rules. Recorded at window close, graded at resolution, NEVER traded."""
+    if spot_t60 is None or spot_close is None or spot_close == spot_t60:
+        return None
+    return "up" if spot_close > spot_t60 else "down"
+
+
 def lean_pick_depth(up_bid_depth, down_bid_depth):
     """SHADOW rule (b): book-depth imbalance — lean toward the side with the
     deeper top-N bid stack (stronger support)."""
@@ -394,6 +404,10 @@ class Crypto5050Runner:
                 d_bid, d_ask, d_depth = best_bid_ask(down_book)
                 if up_mid_open is None and u_bid is not None and u_ask is not None:
                     up_mid_open = (u_bid + u_ask) / 2.0
+                # late-recency baseline: first spot sample inside the final ~60s
+                if row.spot_t60 is None and spot_now is not None \
+                        and tick_start >= end_ts - 60:
+                    row.spot_t60 = spot_now
 
                 # -- maker-fill check on the standing quote (optimistic: queue
                 # position unmodeled — see module docstring) --
@@ -475,6 +489,7 @@ class Crypto5050Runner:
             # -- window over: snapshot + queue for resolution --
             row.fees_paid = round(fees, 6)
             row.spot_close = await self.fetch_spot()
+            row.pick_late_recency = lean_pick_late_recency(row.spot_t60, row.spot_close)
             pv = pair_vwap(row.up_cost or 0.0, row.up_shares or 0.0,
                            row.down_cost or 0.0, row.down_shares or 0.0)
             row.pair_vwap = pv
@@ -610,6 +625,7 @@ class Crypto5050Runner:
         row.hit_spot_drift = grade_pick(row.pick_spot_drift, winner)
         row.hit_momentum = grade_pick(row.pick_momentum, winner)
         row.hit_depth = grade_pick(row.pick_depth, winner)
+        row.hit_late_recency = grade_pick(row.pick_late_recency, winner)
         row.resolved_at = datetime.utcnow()
         row.status = "settled"
         db.commit()
@@ -617,7 +633,7 @@ class Crypto5050Runner:
             f"[c5050] SETTLED {winner.upper()} ({source}): locked {econ['locked_pnl']:+.2f} "
             f"unhedged {econ['unhedged_pnl']:+.2f} lean {econ['lean_pnl']:+.2f} "
             f"→ net {econ['net_pnl']:+.2f} | picks: spot={row.pick_spot_drift} "
-            f"mom={row.pick_momentum} depth={row.pick_depth}")
+            f"mom={row.pick_momentum} depth={row.pick_depth} late={row.pick_late_recency}")
         self._check_halt(db)
 
     async def _sleep_until(self, ts):

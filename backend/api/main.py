@@ -476,7 +476,8 @@ async def crypto5050_summary(db: Session = Depends(get_db)):
         "lean_pnl_total": round(float(lean or 0.0), 2),
         "hit_rates": {"spot_drift": _hit(CryptoWindow.hit_spot_drift),
                       "momentum": _hit(CryptoWindow.hit_momentum),
-                      "depth": _hit(CryptoWindow.hit_depth)},
+                      "depth": _hit(CryptoWindow.hit_depth),
+                      "late_recency": _hit(CryptoWindow.hit_late_recency)},
         "allocation_usd": settings.CRYPTO5050_ALLOCATION_USD,
         "halt_pnl_usd": settings.CRYPTO5050_HALT_PNL_USD,
     }
@@ -509,7 +510,7 @@ async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
             "lean": {"side": r.lean_side, "shares": r.lean_shares or 0.0,
                      "price": r.lean_price, "pnl": r.lean_pnl},
             "picks": {"spot_drift": r.pick_spot_drift, "momentum": r.pick_momentum,
-                      "depth": r.pick_depth},
+                      "depth": r.pick_depth, "late_recency": r.pick_late_recency},
             "resolution": r.resolution, "resolution_source": r.resolution_source,
             "fees_paid": r.fees_paid or 0.0, "net_pnl": r.net_pnl,
             "sides": [
