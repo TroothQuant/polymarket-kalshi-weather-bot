@@ -315,15 +315,20 @@ class Crypto5050Runner:
                                f"cap ${self.settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD:.0f}/window, "
                                f"halt at ${self.settings.CRYPTO5050_HALT_PNL_USD:.0f})")
         pending_resolution = []          # background resolution tasks
-        try:
-            pending_resolution.extend(await self._sweep_stale())
-        except Exception as e:
-            log.exception(f"[c5050] stale-window sweep failed (continuing): {e}")
         while True:
             try:
                 if self.halted:
                     await asyncio.sleep(60)
                     continue
+                # Stale sweep EVERY pass (2026-07-22 PM; was startup-only): a
+                # window orphaned "open" by a mid-window restart is skipped by
+                # the partial-join guard, so without a per-pass sweep it would
+                # strand until the NEXT restart. Cheap query; the in-flight
+                # window is excluded (its 5 minutes aren't over).
+                try:
+                    pending_resolution.extend(await self._sweep_stale())
+                except Exception as e:
+                    log.exception(f"[c5050] stale-window sweep failed (continuing): {e}")
                 epoch = window_epoch(datetime.utcnow().timestamp())
                 await self._trade_window(epoch, pending_resolution)
             except asyncio.CancelledError:
