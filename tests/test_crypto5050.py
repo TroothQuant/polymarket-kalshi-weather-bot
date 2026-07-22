@@ -241,3 +241,25 @@ def test_partial_join_guard():
     assert not is_partial_join(1784736000 + 30, 1784736000)    # boundary ok
     assert is_partial_join(1784736000 + 31, 1784736000)        # late → skip
     assert is_partial_join(1784736000 + 120, 1784736000)       # restart mid-window
+
+
+def test_sweep_stale_queues_ended_windows():
+    from datetime import timedelta
+    db = _db()
+    db.add(CryptoWindow(slug="old", status="closing",
+                        window_start=datetime.utcnow() - timedelta(minutes=20)))
+    db.add(CryptoWindow(slug="current", status="open",
+                        window_start=datetime.utcnow()))
+    db.commit()
+    r, events = _runner(db)
+
+    async def fake_resolve(window_id):
+        return None
+    r._resolve_window_by_id = fake_resolve
+
+    async def main():
+        return await r._sweep_stale()
+    tasks = asyncio.run(main())
+    assert len(tasks) == 1                                  # only the ended window
+    assert any("stale window old" in m for _, m in events)
+    assert db.query(CryptoWindow).filter_by(slug="current").first().status == "open"

@@ -465,6 +465,29 @@ class Crypto5050Runner:
         finally:
             db.close()
 
+    async def _sweep_stale(self):
+        """Startup sweep: any window left 'open'/'closing' by a restart whose
+        5 minutes are over gets queued for background resolution instead of
+        sitting stranded forever. Returns the spawned tasks."""
+        from backend.models.database import CryptoWindow
+        tasks = []
+        db = self.SessionLocal()
+        try:
+            cutoff = datetime.utcnow() - timedelta(seconds=WINDOW_SECONDS + 5)
+            stale = (db.query(CryptoWindow)
+                     .filter(CryptoWindow.status.in_(("open", "closing")),
+                             CryptoWindow.window_start < cutoff).all())
+            for r in stale:
+                r.status = "closing"
+                db.commit()
+                self.log_event("info",
+                    f"[c5050] stale window {r.slug} queued for resolution (restart sweep)")
+                tasks.append(asyncio.create_task(
+                    self._resolve_window_by_id(r.id), name=f"c5050-sweep-{r.slug}"))
+        finally:
+            db.close()
+        return tasks
+
     async def _resolve_window_by_id(self, window_id):
         """Background-task wrapper: resolve one window on its OWN session so it
         can outlive the window loop's session. Never raises."""
