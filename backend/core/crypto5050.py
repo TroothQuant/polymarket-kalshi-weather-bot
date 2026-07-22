@@ -34,14 +34,17 @@ HONESTY CAVEATS (stamped per spec):
     best ask crosses down to <= our resting bid (same conservative proxy as the
     weather rest sim) — but QUEUE POSITION IS UNMODELED, so real fills would be
     a subset. The maker-fill % on the dashboard doubles as the honesty meter.
-  * Fill count per window is bounded by the hedge budget and the venue's
-    5-share minimum order (~8-12 fills/window), BELOW the spec's ~15-25 target:
-    honoring the cap + the venue minimum beats hitting the fill-count target.
+  * Fill count per window is bounded by the hedge budget, the 12s fill
+    spacing (~25 slots/window) and the venue's 5-share minimum; at the $180
+    hedge budget with ~15-share fills this lands in the spec's 15-25 range.
 
-BUDGET SPLIT (Cowork revision, 2026-07-22 PM): window cap $40, of which $18 is
-RESERVED for the L2 lean (hedge budget = $22). The lean is fixed 20 shares; if
-20 shares of the picked side exceed the reserve (price > 0.90) the lean is
-SKIPPED that window — the three rule picks still record unconditionally.
+BUDGET (Cowork sizing revision, 2026-07-22 PM, supersedes the $40 split):
+window cap $200 — $20 RESERVED for the L2 lean (covers 20 shares at any price
+≤ 0.99; the skip-if-unaffordable guard remains as a safety no-op), hedge
+budget $180 with ~15-share fills (~25 12s-spaced slots ≈ the budget).
+Allocation $1,000; auto-halt −$400 (a FLOOR, not a tripwire: a fair-coin
+20-share lean swings ~$170/day over ~288 windows — a tighter halt would trip
+on pure noise before the 3-day review).
 """
 import asyncio
 import logging
@@ -126,7 +129,7 @@ def vwap_allows_fill(up_cost, up_shares, down_cost, down_shares,
 
 
 def choose_side(up_shares: float, down_shares: float,
-                up_ask, down_ask):
+                up_ask, down_ask, fill_shares: float = FILL_SHARES):
     """L1 accumulation side: balance first (shares differ by a fill or more →
     buy the lagging side), else buy whichever side is currently cheaper.
     Returns 'up' / 'down' / None (no usable ask)."""
@@ -136,9 +139,9 @@ def choose_side(up_shares: float, down_shares: float,
         return "up" if up_shares <= down_shares else None
     if up_ask is None:
         return "down" if down_shares <= up_shares else None
-    if up_shares - down_shares >= FILL_SHARES:
+    if up_shares - down_shares >= fill_shares:
         return "down"
-    if down_shares - up_shares >= FILL_SHARES:
+    if down_shares - up_shares >= fill_shares:
         return "up"
     return "up" if up_ask <= down_ask else "down"
 
@@ -365,8 +368,12 @@ class Crypto5050Runner:
             # RESERVED for the L2 lean; the L1 hedge gets the remainder ($22 at
             # the $40 cap). `spent` below tracks HEDGE spend only.
             cash_cap = st.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD
-            lean_reserve = getattr(st, "CRYPTO5050_LEAN_RESERVE_USD", 18.0)
+            lean_reserve = getattr(st, "CRYPTO5050_LEAN_RESERVE_USD", 20.0)
             hedge_cap = cash_cap - lean_reserve
+            # Fill size scales with the budget (sizing rev 2026-07-22): ~25
+            # 12s-spaced fill slots × fill_sh×~$0.5 must be able to SPEND the
+            # hedge budget; 5-share fills capped real spend at ~$60 of $180.
+            fill_sh = float(getattr(st, "CRYPTO5050_FILL_SHARES", 15.0))
             spent = 0.0
             fees = 0.0
             last_fill_at = 0.0
@@ -394,7 +401,7 @@ class Crypto5050Runner:
                     side, bid_px = resting
                     ask_now = u_ask if side == "up" else d_ask
                     if ask_now is not None and ask_now <= bid_px + 1e-9:
-                        ok = self._apply_fill(db, row, side, "maker", bid_px, FILL_SHARES,
+                        ok = self._apply_fill(db, row, side, "maker", bid_px, fill_sh,
                                               spent, hedge_cap, fees)
                         if ok:
                             spent, fees = ok
@@ -404,7 +411,7 @@ class Crypto5050Runner:
                 # -- new fill attempt (spacing + budget + VWAP hard rule) --
                 if tick_start - last_fill_at >= FILL_SPACING_SECONDS and resting is None:
                     side = choose_side(row.up_shares or 0.0, row.down_shares or 0.0,
-                                       u_ask, d_ask)
+                                       u_ask, d_ask, fill_shares=fill_sh)
                     if side is not None:
                         px = u_ask if side == "up" else d_ask
                         if next_kind == "maker":
@@ -412,18 +419,18 @@ class Crypto5050Runner:
                             if bid_px is not None and vwap_allows_fill(
                                     row.up_cost or 0.0, row.up_shares or 0.0,
                                     row.down_cost or 0.0, row.down_shares or 0.0,
-                                    side, bid_px, FILL_SHARES) \
-                                    and spent + bid_px * FILL_SHARES <= hedge_cap:
+                                    side, bid_px, fill_sh) \
+                                    and spent + bid_px * fill_sh <= hedge_cap:
                                 resting = (side, bid_px)
                                 next_kind = "taker"
                         else:
                             if px is not None and vwap_allows_fill(
                                     row.up_cost or 0.0, row.up_shares or 0.0,
                                     row.down_cost or 0.0, row.down_shares or 0.0,
-                                    side, px, FILL_SHARES) \
-                                    and spent + px * FILL_SHARES <= hedge_cap:
+                                    side, px, fill_sh) \
+                                    and spent + px * fill_sh <= hedge_cap:
                                 ok = self._apply_fill(db, row, side, "taker", px,
-                                                      FILL_SHARES, spent, hedge_cap, fees)
+                                                      fill_sh, spent, hedge_cap, fees)
                                 if ok:
                                     spent, fees = ok
                                     last_fill_at = tick_start

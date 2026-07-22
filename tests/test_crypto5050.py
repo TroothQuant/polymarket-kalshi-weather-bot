@@ -27,10 +27,11 @@ def _db():
 
 def _settings(**over):
     s = SimpleNamespace(
-        CRYPTO_5050_ENABLED=True, CRYPTO5050_ALLOCATION_USD=500.0,
-        CRYPTO5050_MAX_WINDOW_NOTIONAL_USD=40.0, CRYPTO5050_LEAN_RESERVE_USD=18.0,
-        CRYPTO5050_HALT_PNL_USD=-100.0,
+        CRYPTO_5050_ENABLED=True, CRYPTO5050_ALLOCATION_USD=1000.0,
+        CRYPTO5050_MAX_WINDOW_NOTIONAL_USD=200.0, CRYPTO5050_LEAN_RESERVE_USD=20.0,
+        CRYPTO5050_HALT_PNL_USD=-400.0,
         CRYPTO5050_POLL_SECONDS=4.0, CRYPTO5050_LEAN_SHARES=20.0,
+        CRYPTO5050_FILL_SHARES=15.0,
         CRYPTO5050_MAKER_FEE_RATE=0.0, CRYPTO5050_TAKER_FEE_RATE=0.0)
     s.__dict__.update(over)
     return s
@@ -141,8 +142,8 @@ def _runner(db, settings=None, events=None):
 
 def test_halt_triggers_at_cumulative_loss():
     db = _db()
-    db.add(CryptoWindow(slug="w1", status="settled", net_pnl=-60.0))
-    db.add(CryptoWindow(slug="w2", status="settled", net_pnl=-45.0))
+    db.add(CryptoWindow(slug="w1", status="settled", net_pnl=-250.0))
+    db.add(CryptoWindow(slug="w2", status="settled", net_pnl=-155.0))
     db.commit()
     r, events = _runner(db)
     assert r._check_halt(db) is True
@@ -151,8 +152,9 @@ def test_halt_triggers_at_cumulative_loss():
 
 
 def test_halt_not_triggered_above_threshold():
+    # −399 sits above the −400 FLOOR (fair-coin lean noise must not trip it)
     db = _db()
-    db.add(CryptoWindow(slug="w1", status="settled", net_pnl=-99.0))
+    db.add(CryptoWindow(slug="w1", status="settled", net_pnl=-399.0))
     db.commit()
     r, events = _runner(db)
     assert r._check_halt(db) is False
@@ -162,7 +164,7 @@ def test_halt_not_triggered_above_threshold():
 def test_halt_ignores_unsettled_rows():
     db = _db()
     db.add(CryptoWindow(slug="w1", status="open", net_pnl=None))
-    db.add(CryptoWindow(slug="w2", status="settled", net_pnl=-50.0))
+    db.add(CryptoWindow(slug="w2", status="settled", net_pnl=-350.0))
     db.commit()
     r, _ = _runner(db)
     assert r._check_halt(db) is False
@@ -269,23 +271,31 @@ def test_sweep_stale_queues_ended_windows():
 # ── budget split (Cowork 2026-07-22 PM): $18 lean reserve of the $40 cap ─────
 def test_lean_affordable_boundary():
     from backend.core.crypto5050 import lean_affordable
-    assert lean_affordable(0.90, 20, 18.0)          # 20 x 0.90 = $18.00 exactly → trades
-    assert not lean_affordable(0.91, 20, 18.0)      # $18.20 > reserve → SKIPPED
-    assert lean_affordable(0.10, 20, 18.0)
-    assert not lean_affordable(None, 20, 18.0)      # no ask → no lean
+    # sizing rev: $20 reserve covers the fixed 20-share lean at ANY valid price
+    # (0.99 max tick) — the guard is now a safety no-op except on missing asks.
+    assert lean_affordable(0.99, 20, 20.0)          # 20 x 0.99 = $19.80 → trades
+    assert lean_affordable(0.10, 20, 20.0)
+    assert not lean_affordable(None, 20, 20.0)      # no ask → no lean
+    assert not lean_affordable(1.05, 20, 20.0)      # degenerate price → guard holds
 
 
 def test_hedge_cap_is_cap_minus_reserve():
-    # _apply_fill against the $22 hedge budget: a fill that fits $40 but not
-    # $22 must be refused when the caller passes hedge_cap.
+    # _apply_fill against the $180 hedge budget: a fill that fits the $200
+    # window cap but not the $180 hedge budget must be refused.
     db = _db()
     row = CryptoWindow(slug="w1", status="open", up_shares=0.0, up_cost=0.0,
                        down_shares=0.0, down_cost=0.0)
     db.add(row); db.commit()
     r, _ = _runner(db)
-    hedge_cap = 40.0 - 18.0
-    assert r._apply_fill(db, row, "up", "taker", 0.50, 5.0,
-                         spent=20.0, cap=hedge_cap, fees=0.0) is None   # 22.5 > 22
-    ok = r._apply_fill(db, row, "up", "taker", 0.30, 5.0,
-                       spent=20.0, cap=hedge_cap, fees=0.0)             # 21.5 <= 22
-    assert ok == (pytest.approx(21.5), 0.0)
+    hedge_cap = 200.0 - 20.0
+    assert r._apply_fill(db, row, "up", "taker", 0.50, 15.0,
+                         spent=175.0, cap=hedge_cap, fees=0.0) is None  # 182.5 > 180
+    ok = r._apply_fill(db, row, "up", "taker", 0.30, 15.0,
+                       spent=175.0, cap=hedge_cap, fees=0.0)            # 179.5 <= 180
+    assert ok == (pytest.approx(179.5), 0.0)
+
+
+def test_choose_side_uses_configurable_fill_threshold():
+    # 15-share fills: a 15-share imbalance triggers rebalance; 10 does not.
+    assert choose_side(15, 0, 0.5, 0.5, fill_shares=15.0) == "down"
+    assert choose_side(10, 0, 0.4, 0.6, fill_shares=15.0) == "up"   # cheaper side
