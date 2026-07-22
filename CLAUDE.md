@@ -313,6 +313,10 @@ The weather bot is **LIVE on real money** as of 2026-07-01 (Stage 1, ~$200 walle
 - **How to STOP the live book:** set `WEATHER_LIVE_TRADING=false` in `weather-live-mac.env`, then `launchctl kickstart -k gui/$(id -u)/com.trooth.weather-live`; OR fully unload it with `launchctl bootout gui/$(id -u)/com.trooth.weather-live`. Reversible either way.
 - **First live scan** found 1 tradeable market (NYC 7/2 heat wave ~102.6°F) but placed **0 trades** (edge/conviction gate held) — the autonomous FAK path is unproven until the first actionable signal fires. Canonical: `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/session_log_2026-07-01.md`.
 
+## CRYPTO5050 is a SEPARATE project (2026-07-22)
+
+The 5-min BTC Up/Down paper book lives in **`~/Projects/trooth-crypto5050`** (own repo, own `crypto5050.db`, own service `trooth-crypto5050` on :8004, `crypto.troothquant.com`). It was split OUT of this repo on 2026-07-22 PM. **Crypto deploys must NEVER restart `trooth-weather-bot`, and weather deploys must never restart `trooth-crypto5050`** — zero runtime coupling; shared logic was copied, not imported.
+
 ## Today's open carryovers
 
 Current state is NOT restated here (it rots — this section used to and went stale). **Canonical handoff:** `~/Desktop/TROOTH/TROOTH - FINANCIAL/Polymarket/NAVIGATION.md` → the latest dated session log. **Code/state/infra map:** `REPO_RECORD_MAP.md` in the same folder.

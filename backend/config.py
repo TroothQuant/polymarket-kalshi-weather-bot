@@ -211,24 +211,6 @@ class Settings(BaseSettings):
     # to the realistic-fills era. See backend/core/execution_realism.py.
     WEATHER_PAPER_REALISTIC_FILLS: bool = False
 
-    # ── CRYPTO5050 paper book (2026-07-22) — 5-min BTC Up/Down two-layer sim ──
-    # PAPER ONLY, fully separate from the weather paths (own asyncio task, own
-    # crypto_windows/crypto_fills tables, never `trades`). See
-    # backend/core/crypto5050.py for the strategy + honesty caveats.
-    CRYPTO_5050_ENABLED: bool = False                 # master flag (flip in weather.env)
-    CRYPTO5050_ALLOCATION_USD: float = 1000.0         # separate paper allocation (500→1000 Cowork sizing rev 2026-07-22). NO halts/stops on this module (operator decision of record, 2026-07-22 PM): it stops ONLY when allocation + cumulative net can no longer fund a window; refill by raising this in weather.env + restart
-    CRYPTO5050_MAX_WINDOW_NOTIONAL_USD: float = 200.0 # hard cap per 5-min window (30→40→200 Cowork sizing rev)
-    CRYPTO5050_LEAN_RESERVE_USD: float = 20.0         # reserved for the L2 lean → L1 hedge budget = cap − this ($180)
-    CRYPTO5050_POLL_SECONDS: float = 4.0              # book+spot poll cadence
-    CRYPTO5050_LEAN_SHARES: float = 20.0              # L2 fixed lean size (measured discipline); the $20 reserve covers it at ANY price ≤0.99 — the skip-if-unaffordable guard remains as a safety no-op
-    CRYPTO5050_FILL_SHARES: float = 15.0              # L1 shares per hedge fill (5→15 with the $180 budget: ~25 fill slots at 12s spacing × ~$7.5 ≈ the budget; 5-share fills could only ever spend ~$60)
-    # FEES: gamma+CLOB base-fee fields read 1000/1000 bps (protocol MAX), but the
-    # real measured trade (DoggyStyIe 7/22, net $48.61 on $48.75 gross) shows
-    # ~0 effective drag → default 0.0. Formula rate×min(p,1−p)×sh is implemented,
-    # so a real fee is one env flip away. Do NOT copy the weather 5% rule.
-    CRYPTO5050_MAKER_FEE_RATE: float = 0.0
-    CRYPTO5050_TAKER_FEE_RATE: float = 0.0
-
     # API / dashboard hardening (added 2026-05-20 per audit CRITICAL #2).
     # The FastAPI app used to bind 0.0.0.0 with CORS=* and no auth on the
     # mutating endpoints (/api/bot/reset, /api/bot/start|stop, /api/simulate-

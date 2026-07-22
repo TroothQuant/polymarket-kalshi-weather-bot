@@ -1,0 +1,39 @@
+{
+  "_doc": "Config for the standalone next-book PAPER harness. Adding a city = one block. Never wires into the live weather service or tradingbot.db.",
+  "min_edge": 0.08,
+  "max_new_per_day": 5,
+  "max_alloc_usd": 1500,
+  "trade_size_usd": 50,
+  "state_db": "~/.local/state/trooth/nextbook_paper.db",
+  "ledger_csv": "~/.local/state/trooth/nextbook_paper_ledger.csv",
+  "cities": {
+    "austin": {
+      "enabled": true, "lat": 30.1975, "lon": -97.6664, "unit": "F", "bucket": 2,
+      "prepeak_utc": [11, 19], "iem": ["AUS", "TX_ASOS"],
+      "station": "Austin-Bergstrom Intl (KAUS)", "slug": "austin"
+    },
+    "dallas": {
+      "enabled": true, "lat": 32.8471, "lon": -96.8518, "unit": "F", "bucket": 2,
+      "prepeak_utc": [11, 19], "iem": ["DAL", "TX_ASOS"],
+      "station": "Dallas Love Field (KDAL, NOT DFW)", "slug": "dallas"
+    },
+    "london": {
+      "enabled": false, "lat": 51.5048, "lon": 0.0495, "unit": "C", "bucket": 1,
+      "prepeak_utc": [6, 13], "iem": ["EGLC", "GB__ASOS"],
+      "station": "London City Airport (EGLC)", "slug": "london",
+      "note": "switch on once the pre-peak filter is validated for the non-US-afternoon (UTC 06-13) window"
+    },
+    "paris": {
+      "enabled": false, "lat": 48.9694, "lon": 2.4414, "unit": "C", "bucket": 1,
+      "prepeak_utc": [5, 12], "iem": ["LFPB", "FR__ASOS"],
+      "station": "Paris-Le Bourget (LFPB)", "slug": "paris",
+      "note": "switch on once the pre-peak filter is validated for the UTC 05-12 window"
+    },
+    "buenos_aires": {
+      "enabled": false, "excluded": true, "lat": -34.8222, "lon": -58.5358, "unit": "C", "bucket": 1,
+      "prepeak_utc": [11, 18], "iem": ["SAEZ", "AR__ASOS"],
+      "station": "Min. Pistarini Intl (SAEZ)", "slug": "buenos-aires",
+      "note": "EXCLUDED — GATE 3 Southern-Hemisphere winter model overconfidence (model_p 0.81 vs GATE-2 exact-hit 40%). Re-evaluate outside winter."
+    }
+  }
+}
