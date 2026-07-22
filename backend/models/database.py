@@ -246,6 +246,66 @@ class PaperRestingOrder(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class CryptoWindow(Base):
+    """CRYPTO5050 paper book (2026-07-22) — one row per traded 5-min BTC
+    Up/Down window. COMPLETELY separate from the weather ledger: the module
+    never writes to `trades`, and nothing here feeds the graduation stats.
+    Maker fills use the optimistic crossed-bid proxy (queue unmodeled) — see
+    backend/core/crypto5050.py docstring."""
+    __tablename__ = "crypto_windows"
+    id = Column(Integer, primary_key=True, index=True)
+    slug = Column(String, unique=True, index=True)      # btc-updown-5m-<epoch>
+    window_start = Column(DateTime, index=True)
+    question = Column(String, nullable=True)
+    up_token = Column(String, nullable=True)
+    down_token = Column(String, nullable=True)
+    up_shares = Column(Float, default=0.0)
+    up_cost = Column(Float, default=0.0)                # ex-fee
+    down_shares = Column(Float, default=0.0)
+    down_cost = Column(Float, default=0.0)              # ex-fee
+    fills_count = Column(Integer, default=0)
+    maker_fills = Column(Integer, default=0)            # honesty meter numerator
+    taker_fills = Column(Integer, default=0)
+    pair_vwap = Column(Float, nullable=True)            # up VWAP + down VWAP
+    locked_pairs = Column(Float, nullable=True)
+    locked_pnl = Column(Float, nullable=True)
+    lean_side = Column(String, nullable=True)           # "up" | "down"
+    lean_shares = Column(Float, default=0.0)
+    lean_price = Column(Float, nullable=True)
+    lean_cost = Column(Float, default=0.0)              # ex-fee
+    lean_pnl = Column(Float, nullable=True)
+    pick_spot_drift = Column(String, nullable=True)     # LIVE lean rule's pick
+    pick_momentum = Column(String, nullable=True)       # shadow rule (a)
+    pick_depth = Column(String, nullable=True)          # shadow rule (b)
+    hit_spot_drift = Column(Integer, nullable=True)     # 1/0/None per window
+    hit_momentum = Column(Integer, nullable=True)
+    hit_depth = Column(Integer, nullable=True)
+    spot_open = Column(Float, nullable=True)
+    spot_close = Column(Float, nullable=True)
+    resolution = Column(String, nullable=True)          # "up" | "down"
+    resolution_source = Column(String, nullable=True)   # gamma | spot_fallback
+    resolved_at = Column(DateTime, nullable=True)
+    fees_paid = Column(Float, default=0.0)
+    net_pnl = Column(Float, nullable=True)
+    status = Column(String, default="open", index=True) # open|closing|settled|unresolved|skipped
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CryptoFill(Base):
+    """One simulated fill (hedge leg or lean) inside a CryptoWindow."""
+    __tablename__ = "crypto_fills"
+    id = Column(Integer, primary_key=True, index=True)
+    window_id = Column(Integer, index=True)
+    ts = Column(DateTime, default=datetime.utcnow)
+    side = Column(String)                                # "up" | "down"
+    fill_kind = Column(String)                           # "maker" | "taker"
+    price = Column(Float)
+    shares = Column(Float)
+    cost = Column(Float)                                 # ex-fee
+    fee = Column(Float, default=0.0)
+    note = Column(String, nullable=True)                 # e.g. "lean(spot_drift)"
+
+
 def init_db():
     """Initialize database tables."""
     Base.metadata.create_all(bind=engine)

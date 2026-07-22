@@ -347,6 +347,21 @@ async def startup():
     start_scheduler()
     log_event("success", "BTC 5-min trading bot initialized")
 
+    # CRYPTO5050 paper book (2026-07-22): its OWN asyncio task, entirely outside
+    # the weather scheduler. Double-wrapped: the runner catches its own loop
+    # errors, and this hook catches even a failed task CREATION — a crypto5050
+    # problem can never take down the weather path.
+    if getattr(settings, "CRYPTO_5050_ENABLED", False):
+        try:
+            from backend.core.crypto5050 import start_crypto5050
+            from backend.models.database import SessionLocal as _c5050_session
+            app.state.crypto5050_task = start_crypto5050(settings, _c5050_session, log_event)
+            print("  - CRYPTO5050 paper book: ENABLED (own task, paper-only)")
+        except Exception as _e:
+            log_event("error", f"[c5050] failed to start (weather unaffected): {_e}")
+    else:
+        print("  - CRYPTO5050 paper book: disabled")
+
     print("Bot is now running!")
     print(f"  - BTC scan: every {settings.SCAN_INTERVAL_SECONDS}s (edge >= {settings.MIN_EDGE_THRESHOLD:.0%})")
     print(f"  - Settlement check: every {settings.SETTLEMENT_INTERVAL_SECONDS}s")
@@ -425,6 +440,81 @@ async def get_stats(db: Session = Depends(get_db)):
         stop_loss_count=stop_loss_count,
         stop_loss_rate=stop_loss_rate,
     )
+
+
+# ── CRYPTO5050 paper book (2026-07-22) — read-only views for the dashboard ───
+@app.get("/api/crypto5050/summary")
+async def crypto5050_summary(db: Session = Depends(get_db)):
+    """Module totals for the dashboard panel. Read-only; separate book —
+    nothing here touches the weather stats."""
+    from backend.models.database import CryptoWindow
+    settled = db.query(CryptoWindow).filter(CryptoWindow.status == "settled")
+    n = settled.count()
+    sub_dollar = settled.filter(CryptoWindow.pair_vwap < 1.0).count()
+    sums = db.query(
+        func.coalesce(func.sum(CryptoWindow.net_pnl), 0.0),
+        func.coalesce(func.sum(CryptoWindow.locked_pnl), 0.0),
+        func.coalesce(func.sum(CryptoWindow.lean_pnl), 0.0),
+        func.coalesce(func.sum(CryptoWindow.maker_fills), 0),
+        func.coalesce(func.sum(CryptoWindow.taker_fills), 0),
+    ).filter(CryptoWindow.status == "settled").first()
+    net, locked, lean, mk, tk = sums
+
+    def _hit(col):
+        hits = settled.filter(col == 1).count()
+        graded = settled.filter(col.isnot(None)).count()
+        return {"hits": hits, "n": graded,
+                "rate": round(hits / graded, 3) if graded else None}
+
+    return {
+        "enabled": bool(getattr(settings, "CRYPTO_5050_ENABLED", False)),
+        "windows_settled": n,
+        "pct_pair_vwap_sub_dollar": round(sub_dollar / n, 3) if n else None,
+        "maker_fill_pct": round(mk / (mk + tk), 3) if (mk + tk) else None,
+        "cumulative_net": round(float(net), 2),
+        "locked_pnl_total": round(float(locked or 0.0), 2),
+        "lean_pnl_total": round(float(lean or 0.0), 2),
+        "hit_rates": {"spot_drift": _hit(CryptoWindow.hit_spot_drift),
+                      "momentum": _hit(CryptoWindow.hit_momentum),
+                      "depth": _hit(CryptoWindow.hit_depth)},
+        "allocation_usd": settings.CRYPTO5050_ALLOCATION_USD,
+        "halt_pnl_usd": settings.CRYPTO5050_HALT_PNL_USD,
+    }
+
+
+@app.get("/api/crypto5050/windows")
+async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
+    """Most recent windows, newest first, with both sides broken out per row
+    (the Polymarket-positions-style view the dashboard renders)."""
+    from backend.models.database import CryptoWindow
+    rows = (db.query(CryptoWindow).order_by(CryptoWindow.window_start.desc())
+            .limit(max(1, min(int(limit), 50))).all())
+    out = []
+    for r in rows:
+        res_price_up = (1.0 if r.resolution == "up" else 0.0) if r.resolution else None
+        out.append({
+            "slug": r.slug, "question": r.question, "status": r.status,
+            "window_start": r.window_start.isoformat() + "Z" if r.window_start else None,
+            "fills": r.fills_count or 0, "maker_fills": r.maker_fills or 0,
+            "taker_fills": r.taker_fills or 0,
+            "pair_vwap": r.pair_vwap, "locked_pairs": r.locked_pairs,
+            "locked_pnl": r.locked_pnl,
+            "lean": {"side": r.lean_side, "shares": r.lean_shares or 0.0,
+                     "price": r.lean_price, "pnl": r.lean_pnl},
+            "picks": {"spot_drift": r.pick_spot_drift, "momentum": r.pick_momentum,
+                      "depth": r.pick_depth},
+            "resolution": r.resolution, "resolution_source": r.resolution_source,
+            "fees_paid": r.fees_paid or 0.0, "net_pnl": r.net_pnl,
+            "sides": [
+                {"side": "Up", "shares": r.up_shares or 0.0,
+                 "avg_price": round((r.up_cost or 0.0) / r.up_shares, 4) if r.up_shares else None,
+                 "resolution_price": res_price_up},
+                {"side": "Down", "shares": r.down_shares or 0.0,
+                 "avg_price": round((r.down_cost or 0.0) / r.down_shares, 4) if r.down_shares else None,
+                 "resolution_price": (1.0 - res_price_up) if res_price_up is not None else None},
+            ],
+        })
+    return out
 
 
 # BTC-specific endpoints
