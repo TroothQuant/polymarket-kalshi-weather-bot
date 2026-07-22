@@ -111,27 +111,88 @@ def _create_resting_order(db, signal, rest_price: float, remaining_shares: float
     ))
 
 
+def _rest_local_day_passed(city_name: str, target_date_iso: str,
+                           now_utc: datetime = None) -> bool:
+    """True once the market's LOCAL settlement day has fully passed (city-local
+    date > target date). Rest-lifecycle fix 2026-07-22: the old rule expired a
+    rest the moment target_date <= UTC-today, which killed every same-day-target
+    rest at its first scan pass (~5 min after creation — rows 2-32 of the 7/21
+    Qingdao/SF churn) even though the market trades all day. City-local timezone
+    is approximated from CITY_CONFIG longitude (round(lon/15) hours — exact to
+    +/-1-2h for the political-tz drift, fine for a day-boundary check). Unknown
+    city or unparsable date falls back to UTC + one full safety day so we never
+    expire EARLY."""
+    if not target_date_iso:
+        return False
+    from datetime import date, timedelta
+    from backend.data.weather import CITY_CONFIG
+    now_utc = now_utc or datetime.utcnow()
+    try:
+        target = date.fromisoformat(str(target_date_iso)[:10])
+    except ValueError:
+        return False
+    lon = next((c["lon"] for c in CITY_CONFIG.values()
+                if c.get("name", "").lower() == (city_name or "").lower()), None)
+    if lon is None:
+        # City not in config: safe fallback — expire only when even the
+        # westernmost plausible local day (UTC-12) has certainly ended.
+        return now_utc.date() > target + timedelta(days=1)
+    local_date = (now_utc + timedelta(hours=round(lon / 15.0))).date()
+    return local_date > target
+
+
 def process_paper_resting_orders(db, state) -> None:
     """Every scan: fill open paper resting orders against the REAL book (best_ask
-    crossed down to <= our rest price) and expire rests whose settlement day has
-    arrived. APPROXIMATION: 'ask crossed our limit' proxies a seller hitting our
-    resting bid — conservative, same spirit as the live take+rest hybrid. Only
-    active when WEATHER_PAPER_REALISTIC_FILLS. Robust: never raises to the scan."""
+    crossed down to <= our rest price) and expire rests whose LOCAL settlement
+    day has passed. APPROXIMATION: 'ask crossed our limit' proxies a seller
+    hitting our resting bid — conservative, same spirit as the live take+rest
+    hybrid. Only active when WEATHER_PAPER_REALISTIC_FILLS. Robust: never raises
+    to the scan."""
     if not settings.WEATHER_PAPER_REALISTIC_FILLS:
         return
     from backend.core.execution_realism import resolve_token_id, fetch_book, realistic_fill
-    today = datetime.utcnow().date().isoformat()
     rests = db.query(PaperRestingOrder).filter(PaperRestingOrder.status == "resting").all()
     for ro in rests:
         try:
-            # Expire at settlement approach (the target day has arrived/passed).
-            if ro.target_date and ro.target_date <= today:
+            # Expire once the market's LOCAL settlement day has passed (2026-07-22
+            # fix — was `target_date <= UTC-today`, which expired same-day-target
+            # rests at creation; a same-day rest must live through its market day).
+            if _rest_local_day_passed(ro.city_name, ro.target_date):
                 ro.status = "expired"
                 ro.updated_at = datetime.utcnow()
                 log_event("info",
                     f"[rest_expired] WX {ro.city_name}: {ro.direction.upper()} "
-                    f"{ro.remaining_shares:.0f}sh @ {ro.rest_price:.3f} (settlement approach)",
+                    f"{ro.remaining_shares:.0f}sh @ {ro.rest_price:.3f} (local settlement day passed)",
                     {"reason": "rest_expired", "market": ro.market_ticker})
+                continue
+            # Lifetime per-ticker dedup re-check (2026-07-22, gap ii): a trade may
+            # have been opened on this ticker from a DIFFERENT signal after the
+            # rest was created (the 7/22 Jeddah case — instant trade #96 vs stale
+            # rest #33). Filling the rest would double the position, so cancel it.
+            # NOT a dupe: the remainder rest of a partial instant fill (same
+            # signal_id, created the same scan) — that fill is the designed
+            # take+rest completion. Legacy rests (signal_id NULL, pre-87ea2e9)
+            # fall back to a timestamp test: any trade opened >2 min after the
+            # rest came from a later scan, hence a different signal.
+            dupe = None
+            for t in db.query(Trade).filter(
+                    Trade.market_ticker == ro.market_ticker).all():
+                if ro.signal_id is not None and t.signal_id is not None:
+                    if t.signal_id != ro.signal_id:
+                        dupe = t
+                        break
+                elif (t.timestamp and ro.created_at
+                        and t.timestamp > ro.created_at + timedelta(minutes=2)):
+                    dupe = t
+                    break
+            if dupe is not None:
+                ro.status = "cancelled_dupe"
+                ro.updated_at = datetime.utcnow()
+                log_event("info",
+                    f"[rest_cancelled_dupe] WX {ro.city_name}: {ro.direction.upper()} "
+                    f"{ro.remaining_shares:.0f}sh @ {ro.rest_price:.3f} "
+                    f"(trade #{dupe.id} already holds {ro.market_ticker}; lifetime dedup)",
+                    {"reason": "rest_cancelled_dupe", "market": ro.market_ticker})
                 continue
             token = resolve_token_id(ro.condition_id, ro.direction)
             book = fetch_book(token) if token else None
@@ -512,6 +573,23 @@ async def weather_scan_and_trade_job():
                         _tag_signal(db, signal.market.market_id, "book_unavailable")
                         continue
                     fill = realistic_fill(book, cap_price=cap, size_usd=trade_size)
+                    # (2026-07-22, gap i) an instant entry supersedes any STALE
+                    # open rest on this ticker (older signal, older price — the
+                    # 7/22 Jeddah #96-vs-#33 double-position gap). Cancel before
+                    # creating the fresh remainder rest, which also un-blocks
+                    # _create_resting_order's one-open-rest dedupe.
+                    if fill is not None:
+                        for _old in db.query(PaperRestingOrder).filter(
+                                PaperRestingOrder.market_ticker == signal.market.market_id,
+                                PaperRestingOrder.status == "resting").all():
+                            _old.status = "cancelled_replaced"
+                            _old.updated_at = datetime.utcnow()
+                            log_event("info",
+                                f"[rest_cancelled_replaced] WX {_old.city_name}: "
+                                f"{_old.direction.upper()} {_old.remaining_shares:.0f}sh "
+                                f"@ {_old.rest_price:.3f} (superseded by instant entry)",
+                                {"reason": "rest_cancelled_replaced",
+                                 "market": _old.market_ticker})
                     # Rest the unfilled remainder (whole size if no instant fill).
                     req_sh = (fill["requested_shares"] if fill else trade_size / cap)
                     filled_sh = fill["filled_shares"] if fill else 0.0
