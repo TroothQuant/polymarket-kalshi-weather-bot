@@ -590,12 +590,14 @@ async def crypto5050_postmortem_md(window_id: int):
     """Serve one post-mortem .md read-only (reached via the dashboard's GET
     proxy). Path is built from the int id — no traversal surface."""
     import os
-    from fastapi.responses import PlainTextResponse
     path = os.path.join("data", "crypto5050_postmortems", f"window_{int(window_id)}.md")
     if not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="no post-mortem for that window")
     with open(path) as fh:
-        return PlainTextResponse(fh.read(), media_type="text/markdown")
+        # JSON envelope (not raw text): the dashboard's GET proxy JSON-wraps
+        # non-JSON upstreams, so raw markdown arrives mangled. The panel
+        # fetches this and renders the markdown inline.
+        return {"window_id": int(window_id), "markdown": fh.read()}
 
 
 # BTC-specific endpoints
