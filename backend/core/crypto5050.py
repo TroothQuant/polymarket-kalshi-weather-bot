@@ -172,6 +172,71 @@ def lean_pick_late_recency(spot_t60, spot_close):
     return "up" if spot_close > spot_t60 else "down"
 
 
+BROWNIAN_P_FLOOR = 0.80      # gengar gate 1: only pick when P(side) >= this
+BROWNIAN_PRICE_DISC = 0.85   # gengar gate 2: side's ask must be <= this x P
+BROWNIAN_MIN_SAMPLES = 10    # need a usable in-window vol estimate
+
+
+def brownian_p_up(spot_open, spot_now, samples, seconds_remaining):
+    """SHADOW rule (d) core, added 2026-07-22 PM: P(Up) via a simple Brownian
+    estimate — z = move-since-open / (realized per-sqrt-second vol x
+    sqrt(time remaining)), P = Phi(z). `samples` = [(ts, price), ...] in-window
+    spot polls (~4s cadence). None when the estimate isn't computable (missing
+    opens, < BROWNIAN_MIN_SAMPLES, degenerate timing). Zero realized vol with
+    nonzero drift → P saturates to 1.0/0.0; zero drift too → None."""
+    from math import erf, sqrt
+    if spot_open is None or spot_now is None or not samples             or len(samples) < BROWNIAN_MIN_SAMPLES or seconds_remaining <= 0:
+        return None
+    diffs, dts = [], []
+    for (t0, p0), (t1, p1) in zip(samples, samples[1:]):
+        if p0 is not None and p1 is not None and t1 > t0:
+            diffs.append(p1 - p0)
+            dts.append(t1 - t0)
+    if len(diffs) < BROWNIAN_MIN_SAMPLES - 1:
+        return None
+    mean_d = sum(diffs) / len(diffs)
+    var = sum((d - mean_d) ** 2 for d in diffs) / max(1, len(diffs) - 1)
+    mean_dt = sum(dts) / len(dts)
+    drift = spot_now - spot_open
+    if var <= 0 or mean_dt <= 0:
+        if drift > 0:
+            return 1.0
+        if drift < 0:
+            return 0.0
+        return None
+    sigma_per_sqrt_sec = sqrt(var) / sqrt(mean_dt)
+    z = drift / (sigma_per_sqrt_sec * sqrt(seconds_remaining))
+    return 0.5 * (1.0 + erf(z / sqrt(2.0)))
+
+
+def brownian_gated_pick(p_up, up_ask, down_ask,
+                        p_floor: float = BROWNIAN_P_FLOOR,
+                        price_disc: float = BROWNIAN_PRICE_DISC):
+    """SHADOW rule (d) gates (gengar_polymarket_bot's): record a side ONLY when
+    P(side) >= p_floor AND that side's market ask <= price_disc x P(side); else
+    'abstain'. None = estimate unavailable (distinct from a gated abstain)."""
+    if p_up is None:
+        return None
+    for side, p_side, ask in (("up", p_up, up_ask), ("down", 1.0 - p_up, down_ask)):
+        if p_side >= p_floor - 1e-9:
+            if ask is not None and ask <= price_disc * p_side + 1e-9:
+                return side
+            return "abstain"          # confident but the market is too rich
+    return "abstain"                  # no side clears the probability floor
+
+
+def arb_sum(up_ask, down_ask):
+    """INSTANT-ARB VISIBILITY (2026-07-22 PM, item 8 — NEVER traded): the
+    Jonmaa/Gabagool trigger is best_ask(Up) + best_ask(Down) < $1.00. Returns
+    the sum when both asks exist, else None. Counted per ~4s book poll to
+    measure whether same-second pair arb SURVIVES to 4s granularity or is a
+    pure millisecond game — calibrates required execution speed before anyone
+    dreams of a live version."""
+    if up_ask is None or down_ask is None:
+        return None
+    return up_ask + down_ask
+
+
 def lean_pick_depth(up_bid_depth, down_bid_depth):
     """SHADOW rule (b): book-depth imbalance — lean toward the side with the
     deeper top-N bid stack (stronger support)."""
@@ -396,12 +461,18 @@ class Crypto5050Runner:
             resting = None                          # (side, bid_price) maker quote
             lean_done = False
             end_ts = epoch + WINDOW_SECONDS
+            spot_samples = []            # in-window spot series (brownian rule)
+            arb_polls = 0                # instant-arb visibility (item 8)
+            arb_hits = 0
+            arb_best = None
 
             while datetime.utcnow().timestamp() < end_ts - 1:
                 tick_start = datetime.utcnow().timestamp()
                 up_book = await self.fetch_book(up_token)
                 down_book = await self.fetch_book(down_token)
                 spot_now = await self.fetch_spot()
+                if spot_now is not None:
+                    spot_samples.append((tick_start, spot_now))
                 if up_book is None or down_book is None:
                     await asyncio.sleep(st.CRYPTO5050_POLL_SECONDS)
                     continue
@@ -409,10 +480,22 @@ class Crypto5050Runner:
                 d_bid, d_ask, d_depth = best_bid_ask(down_book)
                 if up_mid_open is None and u_bid is not None and u_ask is not None:
                     up_mid_open = (u_bid + u_ask) / 2.0
-                # late-recency baseline: first spot sample inside the final ~60s
+                # instant-arb visibility tick (item 8 — never traded)
+                _asum = arb_sum(u_ask, d_ask)
+                if _asum is not None:
+                    arb_polls += 1
+                    if _asum < 1.0 - 1e-9:
+                        arb_hits += 1
+                    arb_best = _asum if arb_best is None else min(arb_best, _asum)
+                # late-recency baseline + brownian-gated pick, both at the first
+                # sample inside the final ~60s (T-60)
                 if row.spot_t60 is None and spot_now is not None \
                         and tick_start >= end_ts - 60:
                     row.spot_t60 = spot_now
+                    p_up = brownian_p_up(spot_open, spot_now, spot_samples,
+                                         max(1.0, end_ts - tick_start))
+                    row.p_up_brownian = p_up
+                    row.pick_brownian = brownian_gated_pick(p_up, u_ask, d_ask)
 
                 # -- maker-fill check on the standing quote (optimistic: queue
                 # position unmodeled — see module docstring) --
@@ -495,6 +578,9 @@ class Crypto5050Runner:
             row.fees_paid = round(fees, 6)
             row.spot_close = await self.fetch_spot()
             row.pick_late_recency = lean_pick_late_recency(row.spot_t60, row.spot_close)
+            row.arb_polls = arb_polls
+            row.arb_hits = arb_hits
+            row.arb_best_sum = arb_best
             pv = pair_vwap(row.up_cost or 0.0, row.up_shares or 0.0,
                            row.down_cost or 0.0, row.down_shares or 0.0)
             row.pair_vwap = pv
@@ -631,6 +717,8 @@ class Crypto5050Runner:
         row.hit_momentum = grade_pick(row.pick_momentum, winner)
         row.hit_depth = grade_pick(row.pick_depth, winner)
         row.hit_late_recency = grade_pick(row.pick_late_recency, winner)
+        row.hit_brownian = grade_pick(
+            row.pick_brownian if row.pick_brownian in ("up", "down") else None, winner)
         row.resolved_at = datetime.utcnow()
         row.status = "settled"
         db.commit()
@@ -638,7 +726,9 @@ class Crypto5050Runner:
             f"[c5050] SETTLED {winner.upper()} ({source}): locked {econ['locked_pnl']:+.2f} "
             f"unhedged {econ['unhedged_pnl']:+.2f} lean {econ['lean_pnl']:+.2f} "
             f"→ net {econ['net_pnl']:+.2f} | picks: spot={row.pick_spot_drift} "
-            f"mom={row.pick_momentum} depth={row.pick_depth} late={row.pick_late_recency}")
+            f"mom={row.pick_momentum} depth={row.pick_depth} late={row.pick_late_recency} "
+            f"brown={row.pick_brownian} | arb<\$1: {row.arb_hits or 0}/{row.arb_polls or 0} "
+            f"polls (best {row.arb_best_sum if row.arb_best_sum is not None else 'n/a'})")
         self._check_halt(db)
 
     async def _sleep_until(self, ts):

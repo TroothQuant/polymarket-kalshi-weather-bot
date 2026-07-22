@@ -316,3 +316,55 @@ def test_late_recency_grades_like_other_rules():
     # windows predating the rule (pick NULL) are excluded from n — no backfill
     # exists because per-poll spot history was never stored.
     assert grade_pick(None, "down") is None
+
+
+# ── fifth shadow rule: brownian-gated (2026-07-22 PM) + arb visibility ───────
+def _samples(prices, dt=4.0):
+    return [(i * dt, p) for i, p in enumerate(prices)]
+
+
+def test_brownian_p_up_math():
+    from backend.core.crypto5050 import brownian_p_up
+    # flat drift with real vol → P = 0.5
+    prices = [100.0, 100.1, 99.9, 100.05, 99.95, 100.0, 100.1, 99.9, 100.0, 100.05, 100.0]
+    assert brownian_p_up(100.0, 100.0, _samples(prices), 60) == pytest.approx(0.5, abs=0.01)
+    # strong up-drift vs tiny vol → P ≈ 1
+    p = brownian_p_up(100.0, 150.0, _samples(prices), 60)
+    assert p > 0.999
+    # insufficient samples / missing data → None
+    assert brownian_p_up(100.0, 101.0, _samples(prices[:5]), 60) is None
+    assert brownian_p_up(None, 101.0, _samples(prices), 60) is None
+    # zero vol: saturates with drift, None without
+    flat = [100.0] * 12
+    assert brownian_p_up(100.0, 101.0, _samples(flat), 60) == 1.0
+    assert brownian_p_up(100.0, 99.0, _samples(flat), 60) == 0.0
+    assert brownian_p_up(100.0, 100.0, _samples(flat), 60) is None
+
+
+def test_brownian_gates():
+    from backend.core.crypto5050 import brownian_gated_pick
+    # P(Up)=0.9, ask 0.70 <= 0.85*0.9=0.765 → pick up
+    assert brownian_gated_pick(0.90, 0.70, 0.35) == "up"
+    # confident but too rich (0.80 > 0.765) → abstain
+    assert brownian_gated_pick(0.90, 0.80, 0.35) == "abstain"
+    # P(Down)=0.85, down ask 0.70 <= 0.85*0.85=0.7225 → pick down
+    assert brownian_gated_pick(0.15, 0.90, 0.70) == "down"
+    # nobody clears the 0.80 floor → abstain
+    assert brownian_gated_pick(0.60, 0.50, 0.50) == "abstain"
+    # estimate unavailable → None (distinct from abstain)
+    assert brownian_gated_pick(None, 0.50, 0.50) is None
+    # missing ask on the confident side → abstain (can't price-gate)
+    assert brownian_gated_pick(0.90, None, 0.35) == "abstain"
+
+
+def test_brownian_abstain_excluded_from_grading():
+    # the runner passes None for abstain/no-data; only real sides grade
+    assert grade_pick(None, "up") is None
+    assert grade_pick("up", "up") == 1
+
+
+def test_arb_sum_trigger():
+    from backend.core.crypto5050 import arb_sum
+    assert arb_sum(0.48, 0.49) == pytest.approx(0.97)   # < $1.00 → a hit
+    assert arb_sum(0.52, 0.53) == pytest.approx(1.05)   # no hit
+    assert arb_sum(None, 0.5) is None                   # unpollable → not counted

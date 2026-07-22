@@ -278,10 +278,16 @@ class CryptoWindow(Base):
     pick_momentum = Column(String, nullable=True)       # shadow rule (a)
     pick_depth = Column(String, nullable=True)          # shadow rule (b)
     pick_late_recency = Column(String, nullable=True)   # shadow rule (c): spot move over the FINAL ~60s (rotation/recency thesis, 7/22 article)
+    pick_brownian = Column(String, nullable=True)       # shadow rule (d): brownian-gated (gengar gates) — up/down/abstain
+    p_up_brownian = Column(Float, nullable=True)        # the P(Up) estimate behind the pick (review audit)
     hit_spot_drift = Column(Integer, nullable=True)     # 1/0/None per window
     hit_momentum = Column(Integer, nullable=True)
     hit_depth = Column(Integer, nullable=True)
     hit_late_recency = Column(Integer, nullable=True)
+    hit_brownian = Column(Integer, nullable=True)       # abstain/no-data excluded from n
+    arb_polls = Column(Integer, nullable=True)          # instant-arb visibility (item 8): book polls with both asks
+    arb_hits = Column(Integer, nullable=True)           # polls where ask(Up)+ask(Down) < $1.00
+    arb_best_sum = Column(Float, nullable=True)         # lowest observed ask-sum
     spot_open = Column(Float, nullable=True)
     spot_t60 = Column(Float, nullable=True)             # first spot sample inside the final ~60s (late-recency baseline)
     spot_close = Column(Float, nullable=True)
@@ -400,6 +406,19 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN hit_late_recency INTEGER"))
                 if "spot_t60" not in cw_cols:
                     conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN spot_t60 FLOAT"))
+                # brownian rule + instant-arb visibility (2026-07-22 PM, items 7+8)
+                if "pick_brownian" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN pick_brownian VARCHAR"))
+                if "p_up_brownian" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN p_up_brownian FLOAT"))
+                if "hit_brownian" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN hit_brownian INTEGER"))
+                if "arb_polls" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN arb_polls INTEGER"))
+                if "arb_hits" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN arb_hits INTEGER"))
+                if "arb_best_sum" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN arb_best_sum FLOAT"))
     except Exception:
         pass
 

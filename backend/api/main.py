@@ -477,7 +477,19 @@ async def crypto5050_summary(db: Session = Depends(get_db)):
         "hit_rates": {"spot_drift": _hit(CryptoWindow.hit_spot_drift),
                       "momentum": _hit(CryptoWindow.hit_momentum),
                       "depth": _hit(CryptoWindow.hit_depth),
-                      "late_recency": _hit(CryptoWindow.hit_late_recency)},
+                      "late_recency": _hit(CryptoWindow.hit_late_recency),
+                      "brownian": _hit(CryptoWindow.hit_brownian)},
+        "brownian_abstain_rate": (lambda a, g: round(a / g, 3) if g else None)(
+            settled.filter(CryptoWindow.pick_brownian == "abstain").count(),
+            settled.filter(CryptoWindow.pick_brownian.isnot(None)).count()),
+        "arb": {
+            "windows_with_hit": settled.filter(CryptoWindow.arb_hits > 0).count(),
+            "total_hits": int(db.query(func.coalesce(func.sum(CryptoWindow.arb_hits), 0))
+                              .filter(CryptoWindow.status == "settled").scalar() or 0),
+            "total_polls": int(db.query(func.coalesce(func.sum(CryptoWindow.arb_polls), 0))
+                               .filter(CryptoWindow.status == "settled").scalar() or 0),
+            "best_sum": db.query(func.min(CryptoWindow.arb_best_sum))
+                          .filter(CryptoWindow.status == "settled").scalar()},
         "allocation_usd": settings.CRYPTO5050_ALLOCATION_USD,
         "halt_pnl_usd": settings.CRYPTO5050_HALT_PNL_USD,
     }
@@ -510,7 +522,10 @@ async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
             "lean": {"side": r.lean_side, "shares": r.lean_shares or 0.0,
                      "price": r.lean_price, "pnl": r.lean_pnl},
             "picks": {"spot_drift": r.pick_spot_drift, "momentum": r.pick_momentum,
-                      "depth": r.pick_depth, "late_recency": r.pick_late_recency},
+                      "depth": r.pick_depth, "late_recency": r.pick_late_recency,
+                      "brownian": r.pick_brownian, "p_up_brownian": r.p_up_brownian},
+            "arb": {"polls": r.arb_polls or 0, "hits": r.arb_hits or 0,
+                    "best_sum": r.arb_best_sum},
             "resolution": r.resolution, "resolution_source": r.resolution_source,
             "fees_paid": r.fees_paid or 0.0, "net_pnl": r.net_pnl,
             "sides": [
