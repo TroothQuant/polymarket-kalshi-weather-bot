@@ -67,6 +67,21 @@ def window_epoch(now_ts: float) -> int:
     return int(now_ts) - (int(now_ts) % WINDOW_SECONDS)
 
 
+MAX_JOIN_LAG_SECONDS = 30
+
+
+def is_partial_join(now_ts: float, epoch: int,
+                    max_lag: float = MAX_JOIN_LAG_SECONDS) -> bool:
+    """Clean-data guard (2026-07-22, learned from the first live windows): a
+    window joined more than max_lag after its start must NOT be traded. The
+    lean rules baseline on spot-at-join — mid-window that baseline is wrong
+    while the market prices off the TRUE open (observed: post-restart lean
+    picked UP @ 0.10 because spot had ticked up since the late join, while BTC
+    was $65 DOWN from the real window open). Partial windows also contaminate
+    the pair-VWAP series with truncated accumulation time."""
+    return (now_ts - epoch) > max_lag
+
+
 def window_slug(epoch: int) -> str:
     return f"btc-updown-5m-{epoch}"
 
@@ -271,7 +286,11 @@ class Crypto5050Runner:
                                f"(poll {self.settings.CRYPTO5050_POLL_SECONDS:.0f}s, "
                                f"cap ${self.settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD:.0f}/window, "
                                f"halt at ${self.settings.CRYPTO5050_HALT_PNL_USD:.0f})")
-        pending_resolution = []          # window ids awaiting gamma resolution
+        pending_resolution = []          # background resolution tasks
+        try:
+            pending_resolution.extend(await self._sweep_stale())
+        except Exception as e:
+            log.exception(f"[c5050] stale-window sweep failed (continuing): {e}")
         while True:
             try:
                 if self.halted:
@@ -294,6 +313,13 @@ class Crypto5050Runner:
             if self._check_halt(db):
                 return
             slug = window_slug(epoch)
+            now_ts = datetime.utcnow().timestamp()
+            if is_partial_join(now_ts, epoch):
+                self.log_event("info",
+                    f"[c5050] joined {slug} {now_ts - epoch:.0f}s late — skipping "
+                    f"partial window (clean-data guard); trading resumes next boundary")
+                await self._sleep_until(epoch + WINDOW_SECONDS)
+                return
             ev = await self.fetch_event(slug)
             if ev is None:
                 self.log_event("info", f"[c5050] no gamma event for {slug} — skipping window")

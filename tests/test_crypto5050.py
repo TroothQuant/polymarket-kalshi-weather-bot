@@ -232,3 +232,12 @@ def test_startup_hook_isolated(monkeypatch):
     except Exception:
         pytest.fail("exception escaped the startup guard")
     assert events == ["startup boom"]
+
+
+# ── clean-data guards (2026-07-22, post-first-live-windows) ──────────────────
+def test_partial_join_guard():
+    from backend.core.crypto5050 import is_partial_join
+    assert not is_partial_join(1784736000 + 5, 1784736000)     # on-time join
+    assert not is_partial_join(1784736000 + 30, 1784736000)    # boundary ok
+    assert is_partial_join(1784736000 + 31, 1784736000)        # late → skip
+    assert is_partial_join(1784736000 + 120, 1784736000)       # restart mid-window
