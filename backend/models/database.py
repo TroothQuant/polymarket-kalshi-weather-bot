@@ -290,6 +290,9 @@ class CryptoWindow(Base):
     arb_best_sum = Column(Float, nullable=True)         # lowest observed ask-sum
     up_mark = Column(Float, nullable=True)              # live mid of the Up book (open-window unrealized P&L)
     down_mark = Column(Float, nullable=True)            # live mid of the Down book
+    logic_version = Column(String, nullable=True)       # None/'v1' = pre-balance-discipline; 'v2' = 2026-07-22 PM balance discipline (Saturday reads the segments separately)
+    verdict = Column(String, nullable=True)             # loss post-mortem taxonomy: residue-loss | lean-wrong | hedge-overpaid | structural
+    cf_balanced_delta = Column(Float, nullable=True)    # counterfactual: net improvement if balanced-at-close (post-mortem arithmetic)
     spot_open = Column(Float, nullable=True)
     spot_t60 = Column(Float, nullable=True)             # first spot sample inside the final ~60s (late-recency baseline)
     spot_close = Column(Float, nullable=True)
@@ -300,6 +303,22 @@ class CryptoWindow(Base):
     net_pnl = Column(Float, nullable=True)
     status = Column(String, default="open", index=True) # open|closing|settled|unresolved|skipped
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class CryptoPoll(Base):
+    """One ~4s poll snapshot inside a CryptoWindow (2026-07-22 PM): the raw
+    timeline loss post-mortems reconstruct from. NOTE: windows BEFORE this
+    table existed have no poll history — their post-mortems are data-limited
+    (fills + spot snapshots + close marks) and say so. Pruned after ~3 days."""
+    __tablename__ = "crypto_polls"
+    id = Column(Integer, primary_key=True, index=True)
+    window_id = Column(Integer, index=True)
+    ts = Column(DateTime, default=datetime.utcnow, index=True)
+    spot = Column(Float, nullable=True)
+    up_bid = Column(Float, nullable=True)
+    up_ask = Column(Float, nullable=True)
+    down_bid = Column(Float, nullable=True)
+    down_ask = Column(Float, nullable=True)
 
 
 class CryptoFill(Base):
@@ -425,6 +444,13 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN up_mark FLOAT"))
                 if "down_mark" not in cw_cols:
                     conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN down_mark FLOAT"))
+                # balance discipline + post-mortems (2026-07-22 PM)
+                if "logic_version" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN logic_version VARCHAR"))
+                if "verdict" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN verdict VARCHAR"))
+                if "cf_balanced_delta" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN cf_balanced_delta FLOAT"))
     except Exception:
         pass
 

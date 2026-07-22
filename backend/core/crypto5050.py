@@ -151,6 +151,78 @@ def choose_side(up_shares: float, down_shares: float,
     return "up" if up_ask <= down_ask else "down"
 
 
+LOGIC_VERSION = "v2"          # balance discipline (2026-07-22 PM)
+BALANCE_ONLY_SECONDS = 60     # final-60s: no imbalance-increasing fills
+BALANCE_SWEEP_AT = 20         # one taker balancing sweep at ~T-20s
+BALANCE_SWEEP_MIN_SH = 5.0    # only sweep residues bigger than this
+BALANCE_SWEEP_MAX_ASK = 0.97  # past this, eating the residue beats a worse pair
+MARGINAL_PAIR_MAX = 0.99      # surplus-side fill needs an instantly-pairable bargain
+
+
+def residue(up_shares: float, down_shares: float):
+    """(side, shares) of the unhedged L1 excess; (None, 0.0) when balanced."""
+    if up_shares > down_shares:
+        return "up", up_shares - down_shares
+    if down_shares > up_shares:
+        return "down", down_shares - up_shares
+    return None, 0.0
+
+
+def choose_side_v2(up_shares: float, down_shares: float, up_ask, down_ask,
+                   fill_shares: float = FILL_SHARES):
+    """BALANCE DISCIPLINE (v2, 2026-07-22 PM — fixes the residue bleed; the
+    execution-quality objective, stated: end-of-window unhedged shares beyond
+    the traded lean ~ 0):
+      * Balanced book → buy the cheaper side (as v1).
+      * Imbalanced book → the DEFICIT side has priority whenever it's quoted.
+        The SURPLUS side may be added ONLY on an instantly-pairable bargain:
+        both sides quoted AND up_ask + down_ask < MARGINAL_PAIR_MAX ($0.99) —
+        a genuine sub-$0.99 marginal pair justifies temporary imbalance;
+        otherwise every fill reduces imbalance."""
+    if up_ask is None and down_ask is None:
+        return None
+    surplus, sh = residue(up_shares, down_shares)
+    deficit = ("down" if surplus == "up" else "up") if surplus else None
+    if sh == 0.0:
+        if up_ask is None:
+            return "down"
+        if down_ask is None:
+            return "up"
+        return "up" if up_ask <= down_ask else "down"
+    deficit_ask = up_ask if deficit == "up" else down_ask
+    if deficit_ask is not None:
+        # surplus bargain exception: instantly-pairable sub-$0.99 pair
+        if up_ask is not None and down_ask is not None                 and up_ask + down_ask < MARGINAL_PAIR_MAX - 1e-9:
+            surplus = "down" if deficit == "up" else "up"
+            surplus_ask = down_ask if deficit == "up" else up_ask
+            if surplus_ask < deficit_ask:
+                return surplus
+        return deficit
+    # deficit side unquoted: only the bargain exception may add surplus
+    return None
+
+
+def balance_only_allows(side: str, up_shares: float, down_shares: float) -> bool:
+    """Final-60s BALANCE-ONLY mode: a fill is allowed only if it REDUCES the
+    hedge imbalance (never increases it; balanced book → nothing allowed)."""
+    surplus, sh = residue(up_shares, down_shares)
+    return sh > 0 and side != surplus
+
+
+def balance_sweep_wanted(up_shares: float, down_shares: float, deficit_ask,
+                         min_sh: float = BALANCE_SWEEP_MIN_SH,
+                         max_ask: float = BALANCE_SWEEP_MAX_ASK):
+    """The ~T-20s one-shot taker balancing sweep: (side, shares) to buy, or
+    None. Fires only when |residue| > min_sh AND the balancing ask <= max_ask
+    (0.97) — past that, eating the residue beats locking a worse pair."""
+    surplus, sh = residue(up_shares, down_shares)
+    if surplus is None or sh <= min_sh:
+        return None
+    if deficit_ask is None or deficit_ask > max_ask + 1e-9:
+        return None
+    return ("down" if surplus == "up" else "up"), sh
+
+
 def lean_pick_spot_drift(spot_open, spot_now):
     """LIVE lean rule: lean toward the side confirmed by spot movement since
     window open. None = no signal (flat / missing data) → no lean placed."""
@@ -313,6 +385,180 @@ def best_bid_ask(book: dict):
     return best_bid, best_ask, depth
 
 
+# ── loss post-mortems (2026-07-22 PM) — arithmetic, not prose ────────────────
+
+POSTMORTEM_DIR = "data/crypto5050_postmortems"
+
+
+def postmortem_decompose(row) -> dict:
+    """P&L decomposition + counterfactual arithmetic for one settled window.
+    Pure given the row (+ optional .polls list of CryptoPoll-like objects).
+    Approximations are LABELED: pre-crypto_polls windows have no book history,
+    so opposite-side prices fall back to the 1-price complement."""
+    up_sh, dn_sh = row.up_shares or 0.0, row.down_shares or 0.0
+    up_c, dn_c = row.up_cost or 0.0, row.down_cost or 0.0
+    winner = row.resolution
+    pairs = min(up_sh, dn_sh)
+    pv = pair_vwap(up_c, up_sh, dn_c, dn_sh)
+    locked = pairs * (1.0 - pv) if (pairs > 0 and pv is not None) else 0.0
+    surplus, res_sh = residue(up_sh, dn_sh)
+    res_vwap = side_vwap(up_c, up_sh) if surplus == "up" else side_vwap(dn_c, dn_sh)
+    if res_sh > 0 and res_vwap is not None:
+        residue_pnl = res_sh * (1.0 - res_vwap) if surplus == winner else -(res_sh * res_vwap)
+    else:
+        residue_pnl = 0.0
+    lean_pnl = row.lean_pnl or 0.0
+    fees = row.fees_paid or 0.0
+    net = row.net_pnl if row.net_pnl is not None else (locked + residue_pnl + lean_pnl - fees)
+
+    polls = getattr(row, "polls", None) or []
+    last_poll = polls[-1] if polls else None
+
+    # counterfactual 1: balanced at close — buy res_sh of the deficit side at
+    # the last known deficit ask (poll → close mark → complement approximation)
+    cf = {}
+    approx_notes = []
+    if res_sh > 0:
+        deficit = "down" if surplus == "up" else "up"
+        close_ask = None
+        src = None
+        if last_poll is not None:
+            close_ask = last_poll.up_ask if deficit == "up" else last_poll.down_ask
+            src = "last poll"
+        if close_ask is None:
+            close_ask = row.up_mark if deficit == "up" else row.down_mark
+            src = "close mark"
+        if close_ask is None and res_vwap is not None:
+            close_ask = max(0.01, min(0.99, 1.0 - res_vwap))
+            src = "complement approx"
+        if close_ask is not None:
+            # new pairs redeem $1 each; delta vs the actual residue outcome
+            delta = (res_sh * (1.0 - (res_vwap + close_ask))) - residue_pnl
+            cf["balanced_at_close"] = round(net + delta, 2)
+            cf["balanced_delta"] = round(delta, 2)
+            approx_notes.append(f"balancing ask from {src} ({close_ask:.2f})")
+    if "balanced_at_close" not in cf:
+        cf["balanced_at_close"] = round(net, 2)
+        cf["balanced_delta"] = 0.0
+
+    # counterfactual 2: no lean
+    cf["no_lean"] = round(net - lean_pnl, 2)
+
+    # counterfactual 3: opposite lean (opposite ask at lean time: polls if
+    # available, else 1 - lean_price complement, labeled)
+    if row.lean_side and (row.lean_shares or 0) > 0 and row.lean_price is not None:
+        opp = "down" if row.lean_side == "up" else "up"
+        opp_ask = None
+        if polls:
+            # nearest poll to the lean fill: first poll after midpoint works —
+            # keep simple: median poll of the window's second half
+            half = [q for q in polls][len(polls) // 2:]
+            for q in half:
+                opp_ask = q.up_ask if opp == "up" else q.down_ask
+                if opp_ask is not None:
+                    break
+        if opp_ask is None:
+            opp_ask = max(0.01, min(0.99, 1.0 - row.lean_price))
+            approx_notes.append("opposite-lean price = 1 − lean price (no polls)")
+        opp_cost = opp_ask * row.lean_shares
+        opp_pnl = (row.lean_shares - opp_cost) if opp == winner else -opp_cost
+        cf["opposite_lean"] = round(net - lean_pnl + opp_pnl, 2)
+    else:
+        cf["opposite_lean"] = None
+
+    # counterfactual 4: each rule's pick traded as the lean
+    rule_cf = {}
+    for rule, pick in (("spot_drift", row.pick_spot_drift),
+                       ("momentum", row.pick_momentum),
+                       ("depth", row.pick_depth),
+                       ("late_recency", row.pick_late_recency),
+                       ("brownian", row.pick_brownian)):
+        if pick not in ("up", "down"):
+            rule_cf[rule] = None
+            continue
+        if row.lean_side and pick == row.lean_side:
+            rule_cf[rule] = round(net, 2)      # identical to what was traded
+            continue
+        px = None
+        if polls:
+            half = [q for q in polls][len(polls) // 2:]
+            for q in half:
+                px = q.up_ask if pick == "up" else q.down_ask
+                if px is not None:
+                    break
+        if px is None and row.lean_price is not None:
+            px = max(0.01, min(0.99, 1.0 - row.lean_price))
+        if px is None:
+            rule_cf[rule] = None
+            continue
+        sh = row.lean_shares or 20.0
+        pk_pnl = (sh - px * sh) if pick == winner else -(px * sh)
+        rule_cf[rule] = round(net - lean_pnl + pk_pnl, 2)
+
+    # verdict by arithmetic: the most negative component names the loss
+    components = {"residue-loss": residue_pnl, "lean-wrong": lean_pnl,
+                  "hedge-overpaid": locked, "structural": -fees}
+    negs = {k: v for k, v in components.items() if v < -0.005}
+    verdict = min(negs, key=negs.get) if negs else "structural"
+
+    return {"locked": round(locked, 2), "residue_pnl": round(residue_pnl, 2),
+            "residue_side": surplus, "residue_shares": round(res_sh, 1),
+            "lean_pnl": round(lean_pnl, 2), "fees": round(fees, 2),
+            "net": round(net, 2), "cf": cf, "rule_cf": rule_cf,
+            "verdict": verdict, "approx_notes": approx_notes}
+
+
+def postmortem_markdown(row, decomp, fills, polls_n: int) -> str:
+    """Render the post-mortem .md from the arithmetic (no prose speculation)."""
+    d = decomp
+    lines = [
+        f"# Post-mortem — window {row.id} ({row.question or row.slug})",
+        "",
+        f"- **Net: {d['net']:+.2f}** | resolution: **{(row.resolution or '?').upper()}**"
+        f" ({row.resolution_source or '?'}) | logic: {row.logic_version or 'v1'}",
+        f"- **VERDICT: `{d['verdict']}`** (most-negative component, by arithmetic)",
+        "",
+        "## (a) P&L decomposition",
+        f"| locked | residue | lean | fees | net |",
+        f"|---|---|---|---|---|",
+        f"| {d['locked']:+.2f} | {d['residue_pnl']:+.2f}"
+        f" ({d['residue_shares']:.0f}sh {d['residue_side'] or '—'})"
+        f" | {d['lean_pnl']:+.2f} | {d['fees']:.2f} | **{d['net']:+.2f}** |",
+        "",
+        "## (b) Timeline (fills vs spot)",
+        f"spot: open {row.spot_open} → T-60 {row.spot_t60} → close {row.spot_close}"
+        f" · poll snapshots stored: {polls_n}"
+        + ("" if polls_n else " ⚠ pre-crypto_polls window — book timeline unavailable"),
+        "",
+        "| t | side | kind | px | sh | note |", "|---|---|---|---|---|---|",
+    ]
+    for f in fills:
+        lines.append(f"| {str(f.ts)[11:19]} | {f.side} | {f.fill_kind} "
+                     f"| {f.price:.2f} | {f.shares:.0f} | {f.note or ''} |")
+    lines += [
+        "",
+        "## (c) Rule table (pick vs outcome)",
+        "| rule | pick | hit |", "|---|---|---|",
+        f"| spot_drift | {row.pick_spot_drift} | {row.hit_spot_drift} |",
+        f"| momentum | {row.pick_momentum} | {row.hit_momentum} |",
+        f"| depth | {row.pick_depth} | {row.hit_depth} |",
+        f"| late_recency | {row.pick_late_recency} | {row.hit_late_recency} |",
+        f"| brownian | {row.pick_brownian} | {row.hit_brownian} |",
+        "",
+        "## (d) Computed counterfactual nets",
+        f"- balanced-at-close: **{d['cf']['balanced_at_close']:+.2f}**"
+        f" (Δ {d['cf']['balanced_delta']:+.2f})",
+        f"- no lean: {d['cf']['no_lean']:+.2f}",
+        f"- opposite lean: {d['cf']['opposite_lean'] if d['cf']['opposite_lean'] is not None else 'n/a'}",
+        "- rule-as-lean: " + ", ".join(
+            f"{k}={v if v is not None else 'n/a'}" for k, v in d["rule_cf"].items()),
+    ]
+    if d["approx_notes"]:
+        lines += ["", "*Approximations: " + "; ".join(d["approx_notes"]) + "*"]
+    lines += ["", f"## (e) Verdict", f"`{d['verdict']}` — chosen by the arithmetic above."]
+    return "\n".join(lines) + "\n"
+
+
 # ── the async runner (all I/O lives here) ────────────────────────────────────
 
 class Crypto5050Runner:
@@ -393,6 +639,10 @@ class Crypto5050Runner:
                                f"cap ${self.settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD:.0f}/window, "
                                f"allocation ${self.settings.CRYPTO5050_ALLOCATION_USD:.0f}, NO halts)")
         pending_resolution = []          # background resolution tasks
+        try:
+            await self._backfill_postmortems()
+        except Exception as e:
+            log.exception(f"[c5050] post-mortem backfill failed (continuing): {e}")
         while True:
             try:
                 # Stale sweep EVERY pass (2026-07-22 PM; was startup-only): a
@@ -447,7 +697,7 @@ class Crypto5050Runner:
                 return
             row = CryptoWindow(slug=slug, window_start=datetime.utcfromtimestamp(epoch),
                                question=question, up_token=up_token, down_token=down_token,
-                               status="open")
+                               status="open", logic_version=LOGIC_VERSION)
             db.add(row)
             db.commit()
             self.log_event("info", f"[c5050] window OPEN: {question}")
@@ -473,6 +723,7 @@ class Crypto5050Runner:
             lean_done = False
             end_ts = epoch + WINDOW_SECONDS
             spot_samples = []            # in-window spot series (brownian rule)
+            balance_swept = False        # the one-shot ~T-20s balancing taker
             arb_polls = 0                # instant-arb visibility (item 8)
             arb_hits = 0
             arb_best = None
@@ -491,6 +742,14 @@ class Crypto5050Runner:
                 d_bid, d_ask, d_depth = best_bid_ask(down_book)
                 if up_mid_open is None and u_bid is not None and u_ask is not None:
                     up_mid_open = (u_bid + u_ask) / 2.0
+                # poll snapshot (post-mortem timeline; pruned after ~3 days)
+                try:
+                    from backend.models.database import CryptoPoll
+                    db.add(CryptoPoll(window_id=row.id, spot=spot_now,
+                                      up_bid=u_bid, up_ask=u_ask,
+                                      down_bid=d_bid, down_ask=d_ask))
+                except Exception:
+                    pass
                 # live marks for the dashboard's open-window unrealized P&L
                 row.up_mark = ((u_bid + u_ask) / 2.0
                                if (u_bid is not None and u_ask is not None) else u_ask or u_bid)
@@ -535,10 +794,35 @@ class Crypto5050Runner:
                         resting = None
                         next_kind = "taker"
 
+                # -- BALANCE DISCIPLINE (v2): final-60s balance-only mode +
+                # the one-shot ~T-20s taker balancing sweep --
+                in_final_60 = tick_start >= end_ts - BALANCE_ONLY_SECONDS
+                if in_final_60 and not balance_swept and tick_start >= end_ts - BALANCE_SWEEP_AT:
+                    balance_swept = True
+                    surplus_side, _sh = residue(row.up_shares or 0.0, row.down_shares or 0.0)
+                    d_side_ask = (u_ask if surplus_side == "down" else d_ask) if surplus_side else None
+                    sweep = balance_sweep_wanted(row.up_shares or 0.0, row.down_shares or 0.0, d_side_ask)
+                    if sweep is not None:
+                        sw_side, sw_sh = sweep
+                        sw_px = u_ask if sw_side == "up" else d_ask
+                        # balancing REDUCES risk → allowed up to the full window
+                        # cap (hedge budget + unused lean reserve), never beyond
+                        if sw_px is not None and spent + (row.lean_cost or 0.0)                                 + sw_px * sw_sh <= cash_cap:
+                            ok = self._apply_fill(db, row, sw_side, "taker", sw_px,
+                                                  sw_sh, spent, cash_cap, fees)
+                            if ok:
+                                spent, fees = ok
+                                last_fill_at = tick_start
+                                self.log_event("info",
+                                    f"[c5050] BALANCE SWEEP {sw_side.upper()} {sw_sh:.0f}sh "
+                                    f"@ {sw_px:.2f} (residue worked off at T-20)")
                 # -- new fill attempt (spacing + budget + VWAP hard rule) --
                 if tick_start - last_fill_at >= FILL_SPACING_SECONDS and resting is None:
-                    side = choose_side(row.up_shares or 0.0, row.down_shares or 0.0,
-                                       u_ask, d_ask, fill_shares=fill_sh)
+                    side = choose_side_v2(row.up_shares or 0.0, row.down_shares or 0.0,
+                                          u_ask, d_ask, fill_shares=fill_sh)
+                    if side is not None and in_final_60 and not balance_only_allows(
+                            side, row.up_shares or 0.0, row.down_shares or 0.0):
+                        side = None      # final-60s: no imbalance-increasing fills
                     if side is not None:
                         px = u_ask if side == "up" else d_ask
                         if next_kind == "maker":
@@ -627,6 +911,52 @@ class Crypto5050Runner:
         finally:
             db.close()
 
+    def _write_postmortem(self, db, row) -> None:
+        """Generate data/crypto5050_postmortems/window_<id>.md for a settled
+        LOSING window; stamps row.verdict + row.cf_balanced_delta. Idempotent
+        (existing file → still recomputes the row fields; file overwritten with
+        the same arithmetic). Never raises."""
+        import os
+        try:
+            from backend.models.database import CryptoFill, CryptoPoll
+            fills = (db.query(CryptoFill).filter(CryptoFill.window_id == row.id)
+                     .order_by(CryptoFill.id).all())
+            polls = (db.query(CryptoPoll).filter(CryptoPoll.window_id == row.id)
+                     .order_by(CryptoPoll.id).all())
+            row.polls = polls
+            decomp = postmortem_decompose(row)
+            row.verdict = decomp["verdict"]
+            row.cf_balanced_delta = decomp["cf"]["balanced_delta"]
+            md = postmortem_markdown(row, decomp, fills, len(polls))
+            os.makedirs(POSTMORTEM_DIR, exist_ok=True)
+            path = os.path.join(POSTMORTEM_DIR, f"window_{row.id}.md")
+            with open(path, "w") as fh:
+                fh.write(md)
+            db.commit()
+            self.log_event("info",
+                f"[c5050] post-mortem written: window {row.id} → `{decomp['verdict']}` "
+                f"(net {decomp['net']:+.2f}, balanced-close Δ {decomp['cf']['balanced_delta']:+.2f})")
+        except Exception as e:
+            log.exception(f"[c5050] post-mortem failed for window {row.id}: {e}")
+
+    async def _backfill_postmortems(self):
+        """Startup backfill (item 6): every settled net<0 window without a
+        verdict gets a post-mortem. Idempotent — verdict-stamped rows skipped.
+        Pre-crypto_polls windows are data-limited and their .md says so."""
+        from backend.models.database import CryptoWindow
+        db = self.SessionLocal()
+        try:
+            rows = (db.query(CryptoWindow)
+                    .filter(CryptoWindow.status == "settled",
+                            CryptoWindow.net_pnl < 0,
+                            CryptoWindow.verdict.is_(None)).all())
+            for r in rows:
+                self._write_postmortem(db, r)
+            if rows:
+                self.log_event("info", f"[c5050] post-mortem backfill: {len(rows)} window(s)")
+        finally:
+            db.close()
+
     async def _sweep_stale(self):
         """Startup sweep: any window left 'open'/'closing' by a restart whose
         5 minutes are over gets queued for background resolution instead of
@@ -646,6 +976,15 @@ class Crypto5050Runner:
                     f"[c5050] stale window {r.slug} queued for resolution (restart sweep)")
                 tasks.append(asyncio.create_task(
                     self._resolve_window_by_id(r.id), name=f"c5050-sweep-{r.slug}"))
+            # prune poll snapshots older than ~3 days (post-mortems long written)
+            try:
+                from backend.models.database import CryptoPoll
+                db.query(CryptoPoll).filter(
+                    CryptoPoll.ts < datetime.utcnow() - timedelta(days=3)
+                ).delete(synchronize_session=False)
+                db.commit()
+            except Exception:
+                pass
         finally:
             db.close()
         return tasks
@@ -747,6 +1086,8 @@ class Crypto5050Runner:
         row.resolved_at = datetime.utcnow()
         row.status = "settled"
         db.commit()
+        if (row.net_pnl or 0.0) < 0:
+            self._write_postmortem(db, row)
         self.log_event("success",
             f"[c5050] SETTLED {winner.upper()} ({source}): locked {econ['locked_pnl']:+.2f} "
             f"unhedged {econ['unhedged_pnl']:+.2f} lean {econ['lean_pnl']:+.2f} "

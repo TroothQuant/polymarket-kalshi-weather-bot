@@ -490,6 +490,31 @@ async def crypto5050_summary(db: Session = Depends(get_db)):
                                .filter(CryptoWindow.status == "settled").scalar() or 0),
             "best_sum": db.query(func.min(CryptoWindow.arb_best_sum))
                           .filter(CryptoWindow.status == "settled").scalar()},
+        # v1/v2 segment split (balance discipline 2026-07-22 PM) — Saturday
+        # reads the segments separately
+        "by_version": {
+            ver: {
+                "windows": q.count(),
+                "net": round(float(db.query(func.coalesce(func.sum(CryptoWindow.net_pnl), 0.0))
+                             .filter(CryptoWindow.status == "settled", vf).scalar() or 0.0), 2),
+                "pair_lt_1": q.filter(CryptoWindow.pair_vwap < 1.0).count(),
+            }
+            for ver, vf, q in (
+                ("v1", CryptoWindow.logic_version.is_(None),
+                 settled.filter(CryptoWindow.logic_version.is_(None))),
+                ("v2", CryptoWindow.logic_version == "v2",
+                 settled.filter(CryptoWindow.logic_version == "v2")),
+            )
+        },
+        # counterfactual aggregate (item 7): what balanced-at-close would have
+        # saved across losing windows — Saturday reads this directly
+        "balanced_close_saved": {
+            "amount": round(float(db.query(func.coalesce(func.sum(CryptoWindow.cf_balanced_delta), 0.0))
+                            .filter(CryptoWindow.status == "settled",
+                                    CryptoWindow.net_pnl < 0,
+                                    CryptoWindow.cf_balanced_delta > 0).scalar() or 0.0), 2),
+            "n_losses": settled.filter(CryptoWindow.net_pnl < 0).count(),
+        },
         "allocation_usd": settings.CRYPTO5050_ALLOCATION_USD,
         "allocation_available": round(settings.CRYPTO5050_ALLOCATION_USD + float(net), 2),
         "window_cap_usd": settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD,
@@ -514,6 +539,8 @@ async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
                    else None)
         out.append({
             "l1_residue": residue,
+            "logic_version": r.logic_version or "v1",
+            "verdict": r.verdict,
             "slug": r.slug, "question": r.question, "status": r.status,
             "window_start": r.window_start.isoformat() + "Z" if r.window_start else None,
             "fills": r.fills_count or 0, "maker_fills": r.maker_fills or 0,
@@ -542,6 +569,33 @@ async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
             ],
         })
     return out
+
+
+@app.get("/api/crypto5050/postmortems")
+async def crypto5050_postmortems(limit: int = 10, db: Session = Depends(get_db)):
+    """Recent loss post-mortems (window, verdict, net) for the dashboard list."""
+    from backend.models.database import CryptoWindow
+    rows = (db.query(CryptoWindow)
+            .filter(CryptoWindow.status == "settled", CryptoWindow.verdict.isnot(None))
+            .order_by(CryptoWindow.window_start.desc())
+            .limit(max(1, min(int(limit), 50))).all())
+    return [{"window_id": r.id, "question": r.question, "slug": r.slug,
+             "verdict": r.verdict, "net_pnl": r.net_pnl,
+             "cf_balanced_delta": r.cf_balanced_delta,
+             "md": f"/api/crypto5050/postmortem/{r.id}"} for r in rows]
+
+
+@app.get("/api/crypto5050/postmortem/{window_id}")
+async def crypto5050_postmortem_md(window_id: int):
+    """Serve one post-mortem .md read-only (reached via the dashboard's GET
+    proxy). Path is built from the int id — no traversal surface."""
+    import os
+    from fastapi.responses import PlainTextResponse
+    path = os.path.join("data", "crypto5050_postmortems", f"window_{int(window_id)}.md")
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="no post-mortem for that window")
+    with open(path) as fh:
+        return PlainTextResponse(fh.read(), media_type="text/markdown")
 
 
 # BTC-specific endpoints

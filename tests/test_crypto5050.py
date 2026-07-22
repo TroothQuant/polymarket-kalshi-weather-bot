@@ -372,3 +372,107 @@ def test_arb_sum_trigger():
     assert arb_sum(0.48, 0.49) == pytest.approx(0.97)   # < $1.00 → a hit
     assert arb_sum(0.52, 0.53) == pytest.approx(1.05)   # no hit
     assert arb_sum(None, 0.5) is None                   # unpollable → not counted
+
+
+# ── balance discipline v2 (2026-07-22 PM) ────────────────────────────────────
+def test_choose_side_v2_deficit_priority():
+    from backend.core.crypto5050 import choose_side_v2
+    # down lags → deficit priority even though up is cheaper
+    assert choose_side_v2(30, 15, 0.30, 0.70) == "down"
+    assert choose_side_v2(15, 30, 0.70, 0.30) == "up"
+    # balanced → cheaper side (v1 behavior)
+    assert choose_side_v2(15, 15, 0.40, 0.55) == "up"
+    # deficit unquoted, no bargain → WAIT (never deepen imbalance)
+    assert choose_side_v2(30, 15, 0.30, None) is None
+
+
+def test_choose_side_v2_surplus_bargain_exception():
+    from backend.core.crypto5050 import choose_side_v2
+    # up is surplus, but up_ask+down_ask = 0.30+0.55 = 0.85 < 0.99 AND surplus
+    # is cheaper → the instantly-pairable bargain justifies temporary imbalance
+    assert choose_side_v2(30, 15, 0.30, 0.55) == "up"
+    # sub-0.99 pair but surplus NOT cheaper → still deficit
+    assert choose_side_v2(30, 15, 0.55, 0.30) == "down"
+    # pair >= 0.99 → no exception, deficit only
+    assert choose_side_v2(30, 15, 0.44, 0.56) == "down"
+
+
+def test_balance_only_mode():
+    from backend.core.crypto5050 import balance_only_allows
+    assert balance_only_allows("down", 30, 15)        # reduces imbalance
+    assert not balance_only_allows("up", 30, 15)      # deepens → forbidden
+    assert not balance_only_allows("up", 15, 15)      # balanced → nothing allowed
+    assert not balance_only_allows("down", 15, 15)
+
+
+def test_balance_sweep_guard():
+    from backend.core.crypto5050 import balance_sweep_wanted
+    assert balance_sweep_wanted(30, 15, 0.60) == ("down", 15.0)   # residue>5, ask ok
+    assert balance_sweep_wanted(30, 15, 0.98) is None             # ask > 0.97 → eat it
+    assert balance_sweep_wanted(18, 15, 0.60) is None             # residue 3 <= 5
+    assert balance_sweep_wanted(15, 15, 0.60) is None             # balanced
+    assert balance_sweep_wanted(15, 30, 0.97) == ("up", 15.0)     # boundary ask ok
+
+
+# ── post-mortem arithmetic on a fixture window ───────────────────────────────
+def _fixture_row(**kw):
+    d = dict(id=99, slug="btc-updown-5m-1", question="fixture", status="settled",
+             up_shares=60.0, up_cost=60 * 0.5575, down_shares=45.0, down_cost=45 * 0.3967,
+             lean_side="up", lean_shares=20.0, lean_price=0.76, lean_cost=15.2,
+             lean_pnl=-15.2, fees_paid=0.0, net_pnl=-21.5, resolution="down",
+             resolution_source="gamma", logic_version="v1",
+             pick_spot_drift="up", pick_momentum="up", pick_depth="up",
+             pick_late_recency="down", pick_brownian="abstain",
+             hit_spot_drift=0, hit_momentum=0, hit_depth=0, hit_late_recency=1,
+             hit_brownian=None, spot_open=66136.0, spot_t60=66200.0, spot_close=66150.0,
+             up_mark=0.01, down_mark=0.99)
+    d.update(kw)
+    return SimpleNamespace(polls=[], **d)
+
+
+def test_postmortem_decomposition_window10_fixture():
+    from backend.core.crypto5050 import postmortem_decompose
+    d = postmortem_decompose(_fixture_row())
+    # window-10 arithmetic: locked +2.07, residue −8.36 (15sh up), lean −15.20
+    assert d["locked"] == pytest.approx(2.07, abs=0.02)
+    assert d["residue_pnl"] == pytest.approx(-8.36, abs=0.02)
+    assert d["residue_side"] == "up" and d["residue_shares"] == pytest.approx(15.0)
+    assert d["lean_pnl"] == pytest.approx(-15.2)
+    # verdict = most negative component → lean-wrong
+    assert d["verdict"] == "lean-wrong"
+    # counterfactuals: no-lean removes the lean loss exactly
+    assert d["cf"]["no_lean"] == pytest.approx(-21.5 + 15.2, abs=0.01)
+    # balanced-at-close: buy 15 down @ close mark 0.99 → pair cost 0.5575+0.99
+    # = 1.5475 → delta = 15*(1-1.5475) − (−8.36) = +0.15
+    assert d["cf"]["balanced_delta"] == pytest.approx(0.15, abs=0.03)
+    # late-recency traded instead (down, winner) at 1−0.76=0.24 → +15.2 swing
+    # to a winning 20sh lean: net −21.5 +15.2 + (20 − 0.24*20) = +8.9
+    assert d["rule_cf"]["late_recency"] == pytest.approx(8.9, abs=0.1)
+    assert d["rule_cf"]["brownian"] is None      # abstain → no counterfactual
+    assert d["rule_cf"]["spot_drift"] == pytest.approx(-21.5)   # same as traded
+
+
+def test_postmortem_verdict_residue_loss():
+    from backend.core.crypto5050 import postmortem_decompose
+    # no lean, big losing residue → residue-loss
+    d = postmortem_decompose(_fixture_row(lean_side=None, lean_shares=0.0,
+                                          lean_price=None, lean_cost=0.0, lean_pnl=0.0,
+                                          net_pnl=-6.29))
+    assert d["verdict"] == "residue-loss"
+
+
+def test_postmortem_backfill_idempotent(tmp_path, monkeypatch):
+    import backend.core.crypto5050 as c5mod
+    monkeypatch.setattr(c5mod, "POSTMORTEM_DIR", str(tmp_path))
+    db = _db()
+    w = CryptoWindow(slug="w1", status="settled", net_pnl=-5.0, up_shares=15.0,
+                     up_cost=7.5, down_shares=0.0, down_cost=0.0, resolution="down",
+                     lean_shares=0.0, lean_cost=0.0, fees_paid=0.0)
+    db.add(w); db.commit()
+    r, events = _runner(db)
+    asyncio.run(r._backfill_postmortems())
+    assert w.verdict == "residue-loss"
+    assert (tmp_path / f"window_{w.id}.md").exists()
+    n_events = len(events)
+    asyncio.run(r._backfill_postmortems())      # second run: verdict set → skipped
+    assert len(events) == n_events
