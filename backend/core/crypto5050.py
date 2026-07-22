@@ -48,7 +48,11 @@ WINDOW_SECONDS = 300
 FILL_SHARES = 5.0            # venue minimum order size on this series
 LEAN_AT_SECONDS = 150        # lean decided at/after window midpoint
 FILL_SPACING_SECONDS = 12.0  # min gap between simulated hedge fills
-RESOLVE_GRACE_SECONDS = 240  # gamma polling budget before spot fallback
+RESOLVE_GRACE_SECONDS = 600  # gamma polling budget before spot fallback
+                             # (resolution runs as a BACKGROUND task — observed
+                             # 2026-07-22: gamma still 0.965/0.035 two minutes
+                             # after close, so blocking on it would eat the head
+                             # of every next window; long grace is free async)
 DEPTH_LEVELS = 5             # book-depth imbalance: sum of top-N bid sizes
 
 SPOT_URL = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
@@ -424,9 +428,31 @@ class Crypto5050Runner:
                 f"({int(row.maker_fills or 0)}M/{int(row.taker_fills or 0)}T), "
                 f"pair VWAP {('%.3f' % pv) if pv is not None else 'n/a'}, "
                 f"lean {row.lean_side or 'none'}")
-            await self._resolve_window(db, row)
+            # Resolution runs as a BACKGROUND task (own DB session) so the main
+            # loop opens the NEXT window immediately — gamma takes minutes to
+            # flip past the strict 0.99 threshold, and awaiting it inline was
+            # eating the head of every following window (2026-07-22 fix).
+            task = asyncio.create_task(self._resolve_window_by_id(row.id),
+                                       name=f"c5050-resolve-{row.slug}")
+            pending_resolution.append(task)
+            pending_resolution[:] = [t for t in pending_resolution if not t.done()]
         finally:
             db.close()
+
+    async def _resolve_window_by_id(self, window_id):
+        """Background-task wrapper: resolve one window on its OWN session so it
+        can outlive the window loop's session. Never raises."""
+        from backend.models.database import CryptoWindow
+        try:
+            db = self.SessionLocal()
+            try:
+                row = db.query(CryptoWindow).filter(CryptoWindow.id == window_id).first()
+                if row is not None and row.status == "closing":
+                    await self._resolve_window(db, row)
+            finally:
+                db.close()
+        except Exception as e:
+            log.exception(f"[c5050] background resolution failed for window {window_id}: {e}")
 
     def _apply_fill(self, db, row, side, kind, price, shares, spent, cap, fees):
         """Book one simulated hedge fill onto the window row. Returns the new
