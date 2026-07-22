@@ -216,10 +216,9 @@ class Settings(BaseSettings):
     # crypto_windows/crypto_fills tables, never `trades`). See
     # backend/core/crypto5050.py for the strategy + honesty caveats.
     CRYPTO_5050_ENABLED: bool = False                 # master flag (flip in weather.env)
-    CRYPTO5050_ALLOCATION_USD: float = 1000.0         # separate paper allocation (500→1000 Cowork sizing rev 2026-07-22)
+    CRYPTO5050_ALLOCATION_USD: float = 1000.0         # separate paper allocation (500→1000 Cowork sizing rev 2026-07-22). NO halts/stops on this module (operator decision of record, 2026-07-22 PM): it stops ONLY when allocation + cumulative net can no longer fund a window; refill by raising this in weather.env + restart
     CRYPTO5050_MAX_WINDOW_NOTIONAL_USD: float = 200.0 # hard cap per 5-min window (30→40→200 Cowork sizing rev)
     CRYPTO5050_LEAN_RESERVE_USD: float = 20.0         # reserved for the L2 lean → L1 hedge budget = cap − this ($180)
-    CRYPTO5050_HALT_PNL_USD: float = -400.0           # auto-halt FLOOR (−100→−400: a fair-coin 20-share lean swings ~$170/day over ~288 windows — the old halt would trip on pure noise before the 3-day review)
     CRYPTO5050_POLL_SECONDS: float = 4.0              # book+spot poll cadence
     CRYPTO5050_LEAN_SHARES: float = 20.0              # L2 fixed lean size (measured discipline); the $20 reserve covers it at ANY price ≤0.99 — the skip-if-unaffordable guard remains as a safety no-op
     CRYPTO5050_FILL_SHARES: float = 15.0              # L1 shares per hedge fill (5→15 with the $180 budget: ~25 fill slots at 12s spacing × ~$7.5 ≈ the budget; 5-share fills could only ever spend ~$60)

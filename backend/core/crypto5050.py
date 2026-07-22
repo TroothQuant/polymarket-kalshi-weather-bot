@@ -42,9 +42,10 @@ BUDGET (Cowork sizing revision, 2026-07-22 PM, supersedes the $40 split):
 window cap $200 — $20 RESERVED for the L2 lean (covers 20 shares at any price
 ≤ 0.99; the skip-if-unaffordable guard remains as a safety no-op), hedge
 budget $180 with ~15-share fills (~25 12s-spaced slots ≈ the budget).
-Allocation $1,000; auto-halt −$400 (a FLOOR, not a tripwire: a fair-coin
-20-share lean swings ~$170/day over ~288 windows — a tighter halt would trip
-on pure noise before the 3-day review).
+Allocation $1,000; NO halts/stops (operator decision of record, 2026-07-22
+PM) — the module pauses ONLY when allocation + cumulative net cannot fund a
+window, resumes if settlements re-fund it, and is refillable via
+CRYPTO5050_ALLOCATION_USD in weather.env.
 """
 import asyncio
 import logging
@@ -319,7 +320,7 @@ class Crypto5050Runner:
         self.settings = settings
         self.SessionLocal = session_factory
         self.log_event = log_event
-        self.halted = False
+        self._exhausted_logged = False
         self._client = None
 
     # -- I/O helpers (each returns None on any failure — never raises) --------
@@ -353,38 +354,43 @@ class Crypto5050Runner:
         except (TypeError, IndexError):
             return None
 
-    # -- module halt --------------------------------------------------------
+    # -- allocation funding (NO halts/stops: operator decision of record,
+    # 2026-07-22 PM — the module pauses ONLY when the allocation can no longer
+    # fund a window, and resumes if settlements re-fund it; refill = raise
+    # CRYPTO5050_ALLOCATION_USD in weather.env + restart) --------------------
     def _cumulative_net(self, db) -> float:
         from sqlalchemy import func
         from backend.models.database import CryptoWindow
         return float(db.query(func.coalesce(func.sum(CryptoWindow.net_pnl), 0.0))
                      .filter(CryptoWindow.status == "settled").scalar() or 0.0)
 
-    def _check_halt(self, db) -> bool:
-        if self.halted:
-            return True
-        net = self._cumulative_net(db)
-        if net <= self.settings.CRYPTO5050_HALT_PNL_USD:
-            self.halted = True
-            self.log_event("warning",
-                f"[c5050] 🛑 MODULE AUTO-HALT: cumulative net ${net:.2f} <= "
-                f"${self.settings.CRYPTO5050_HALT_PNL_USD:.0f}. No further windows will be "
-                f"traded until operator review + restart.")
-            return True
-        return False
+    def _cannot_fund_window(self, db) -> bool:
+        """True when allocation + cumulative net < one window's cap. Non-latching
+        — a pending window settling as a win can re-fund the module."""
+        available = self.settings.CRYPTO5050_ALLOCATION_USD + self._cumulative_net(db)
+        exhausted = available < self.settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD
+        if exhausted != self._exhausted_logged:
+            self._exhausted_logged = exhausted
+            if exhausted:
+                self.log_event("warning",
+                    f"[c5050] 💸 ALLOCATION EXHAUSTED: ${available:.2f} available < "
+                    f"${self.settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD:.0f} window cap — pausing new "
+                    f"windows (picks/arb metrics pause too). Refill: raise "
+                    f"CRYPTO5050_ALLOCATION_USD in weather.env + restart.")
+            else:
+                self.log_event("success",
+                    f"[c5050] allocation re-funded (${available:.2f} available) — resuming windows")
+        return exhausted
 
     # -- main loop ----------------------------------------------------------
     async def run(self):
         self.log_event("info", "[c5050] CRYPTO5050 paper runner started "
                                f"(poll {self.settings.CRYPTO5050_POLL_SECONDS:.0f}s, "
                                f"cap ${self.settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD:.0f}/window, "
-                               f"halt at ${self.settings.CRYPTO5050_HALT_PNL_USD:.0f})")
+                               f"allocation ${self.settings.CRYPTO5050_ALLOCATION_USD:.0f}, NO halts)")
         pending_resolution = []          # background resolution tasks
         while True:
             try:
-                if self.halted:
-                    await asyncio.sleep(60)
-                    continue
                 # Stale sweep EVERY pass (2026-07-22 PM; was startup-only): a
                 # window orphaned "open" by a mid-window restart is skipped by
                 # the partial-join guard, so without a per-pass sweep it would
@@ -408,7 +414,8 @@ class Crypto5050Runner:
         st = self.settings
         db = self.SessionLocal()
         try:
-            if self._check_halt(db):
+            if self._cannot_fund_window(db):
+                await self._sleep_until(epoch + WINDOW_SECONDS)
                 return
             slug = window_slug(epoch)
             now_ts = datetime.utcnow().timestamp()
@@ -729,7 +736,6 @@ class Crypto5050Runner:
             f"mom={row.pick_momentum} depth={row.pick_depth} late={row.pick_late_recency} "
             f"brown={row.pick_brownian} | arb<\$1: {row.arb_hits or 0}/{row.arb_polls or 0} "
             f"polls (best {row.arb_best_sum if row.arb_best_sum is not None else 'n/a'})")
-        self._check_halt(db)
 
     async def _sleep_until(self, ts):
         delta = ts - datetime.utcnow().timestamp()

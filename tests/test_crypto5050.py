@@ -29,7 +29,6 @@ def _settings(**over):
     s = SimpleNamespace(
         CRYPTO_5050_ENABLED=True, CRYPTO5050_ALLOCATION_USD=1000.0,
         CRYPTO5050_MAX_WINDOW_NOTIONAL_USD=200.0, CRYPTO5050_LEAN_RESERVE_USD=20.0,
-        CRYPTO5050_HALT_PNL_USD=-400.0,
         CRYPTO5050_POLL_SECONDS=4.0, CRYPTO5050_LEAN_SHARES=20.0,
         CRYPTO5050_FILL_SHARES=15.0,
         CRYPTO5050_MAKER_FEE_RATE=0.0, CRYPTO5050_TAKER_FEE_RATE=0.0)
@@ -140,34 +139,39 @@ def _runner(db, settings=None, events=None):
     return r, events
 
 
-def test_halt_triggers_at_cumulative_loss():
+def test_no_halt_allocation_funds_through_deep_loss():
+    # NO halts (operator decision of record): a −$850 cumulative net still
+    # funds windows ($1,000 + −850 = $150 < $200 cap? no — use −700 → $300 ≥ cap).
     db = _db()
-    db.add(CryptoWindow(slug="w1", status="settled", net_pnl=-250.0))
-    db.add(CryptoWindow(slug="w2", status="settled", net_pnl=-155.0))
+    db.add(CryptoWindow(slug="w1", status="settled", net_pnl=-700.0))
     db.commit()
     r, events = _runner(db)
-    assert r._check_halt(db) is True
-    assert r.halted is True
-    assert any("AUTO-HALT" in m for _, m in events)
+    assert r._cannot_fund_window(db) is False
+    assert not any("EXHAUSTED" in m for _, m in events)
 
 
-def test_halt_not_triggered_above_threshold():
-    # −399 sits above the −400 FLOOR (fair-coin lean noise must not trip it)
+def test_allocation_exhausted_pauses_and_refunds():
+    # $1,000 − $850 = $150 < $200 window cap → paused with a loud log …
     db = _db()
-    db.add(CryptoWindow(slug="w1", status="settled", net_pnl=-399.0))
-    db.commit()
+    w = CryptoWindow(slug="w1", status="settled", net_pnl=-850.0)
+    db.add(w); db.commit()
     r, events = _runner(db)
-    assert r._check_halt(db) is False
-    assert r.halted is False
+    assert r._cannot_fund_window(db) is True
+    assert any("ALLOCATION EXHAUSTED" in m for _, m in events)
+    # … and NON-LATCHING: a settlement improving net re-funds the module.
+    w.net_pnl = -700.0
+    db.commit()
+    assert r._cannot_fund_window(db) is False
+    assert any("re-funded" in m for _, m in events)
 
 
-def test_halt_ignores_unsettled_rows():
+def test_allocation_check_ignores_unsettled_rows():
     db = _db()
     db.add(CryptoWindow(slug="w1", status="open", net_pnl=None))
-    db.add(CryptoWindow(slug="w2", status="settled", net_pnl=-350.0))
+    db.add(CryptoWindow(slug="w2", status="settled", net_pnl=-750.0))
     db.commit()
     r, _ = _runner(db)
-    assert r._check_halt(db) is False
+    assert r._cannot_fund_window(db) is False   # $250 available ≥ $200 cap
 
 
 # ── fill application: caps + accounting + never touches trades ───────────────

@@ -491,7 +491,8 @@ async def crypto5050_summary(db: Session = Depends(get_db)):
             "best_sum": db.query(func.min(CryptoWindow.arb_best_sum))
                           .filter(CryptoWindow.status == "settled").scalar()},
         "allocation_usd": settings.CRYPTO5050_ALLOCATION_USD,
-        "halt_pnl_usd": settings.CRYPTO5050_HALT_PNL_USD,
+        "allocation_available": round(settings.CRYPTO5050_ALLOCATION_USD + float(net), 2),
+        "window_cap_usd": settings.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD,
     }
 
 
