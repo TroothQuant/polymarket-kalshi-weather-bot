@@ -459,6 +459,10 @@ async def crypto5050_summary(db: Session = Depends(get_db)):
         func.coalesce(func.sum(CryptoWindow.taker_fills), 0),
     ).filter(CryptoWindow.status == "settled").first()
     net, locked, lean, mk, tk = sums
+    fees_total = float(db.query(func.coalesce(func.sum(CryptoWindow.fees_paid), 0.0))
+                       .filter(CryptoWindow.status == "settled").scalar() or 0.0)
+    # the fourth P&L stream, derived: net = locked + residue + lean − fees
+    residue_total = round(float(net) - float(locked or 0) - float(lean or 0) + fees_total, 2)
 
     def _hit(col):
         hits = settled.filter(col == 1).count()
@@ -474,6 +478,8 @@ async def crypto5050_summary(db: Session = Depends(get_db)):
         "cumulative_net": round(float(net), 2),
         "locked_pnl_total": round(float(locked or 0.0), 2),
         "lean_pnl_total": round(float(lean or 0.0), 2),
+        "residue_pnl_total": residue_total,
+        "fees_total": round(fees_total, 2),
         "hit_rates": {"spot_drift": _hit(CryptoWindow.hit_spot_drift),
                       "momentum": _hit(CryptoWindow.hit_momentum),
                       "depth": _hit(CryptoWindow.hit_depth),
