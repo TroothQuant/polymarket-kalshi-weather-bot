@@ -57,6 +57,10 @@ WINDOW_SECONDS = 300
 FILL_SHARES = 5.0            # venue minimum order size on this series
 LEAN_AT_SECONDS = 150        # lean decided at/after window midpoint
 FILL_SPACING_SECONDS = 12.0  # min gap between simulated hedge fills
+MAKER_QUOTE_TTL_SECONDS = 36.0  # unfilled sim maker quote expires → next attempt
+                                # is a TAKER (fix 2026-07-22 PM: a never-crossed
+                                # maker bid used to block the alternation for the
+                                # whole window — window 11 sat 0-fill for 4.8 min)
 RESOLVE_GRACE_SECONDS = 600  # gamma polling budget before spot fallback
                              # (resolution runs as a BACKGROUND task — observed
                              # 2026-07-22: gamma still 0.965/0.035 two minutes
@@ -465,7 +469,7 @@ class Crypto5050Runner:
             fees = 0.0
             last_fill_at = 0.0
             next_kind = "maker"                     # alternate → ~50/50 target
-            resting = None                          # (side, bid_price) maker quote
+            resting = None                          # (side, bid_price, posted_ts) maker quote
             lean_done = False
             end_ts = epoch + WINDOW_SECONDS
             spot_samples = []            # in-window spot series (brownian rule)
@@ -507,7 +511,7 @@ class Crypto5050Runner:
                 # -- maker-fill check on the standing quote (optimistic: queue
                 # position unmodeled — see module docstring) --
                 if resting is not None:
-                    side, bid_px = resting
+                    side, bid_px, posted_ts = resting
                     ask_now = u_ask if side == "up" else d_ask
                     if ask_now is not None and ask_now <= bid_px + 1e-9:
                         ok = self._apply_fill(db, row, side, "maker", bid_px, fill_sh,
@@ -516,6 +520,13 @@ class Crypto5050Runner:
                             spent, fees = ok
                             last_fill_at = tick_start
                         resting = None
+                    elif tick_start - posted_ts >= MAKER_QUOTE_TTL_SECONDS:
+                        # quote expired unfilled → free the slot, go taker next
+                        # (the maker-deadlock fix; keeps the ~50/50 mix honest —
+                        # quiet markets naturally shift toward takers, exactly
+                        # like a real wallet that stops waiting)
+                        resting = None
+                        next_kind = "taker"
 
                 # -- new fill attempt (spacing + budget + VWAP hard rule) --
                 if tick_start - last_fill_at >= FILL_SPACING_SECONDS and resting is None:
@@ -530,7 +541,7 @@ class Crypto5050Runner:
                                     row.down_cost or 0.0, row.down_shares or 0.0,
                                     side, bid_px, fill_sh) \
                                     and spent + bid_px * fill_sh <= hedge_cap:
-                                resting = (side, bid_px)
+                                resting = (side, bid_px, tick_start)
                                 next_kind = "taker"
                         else:
                             if px is not None and vwap_allows_fill(
