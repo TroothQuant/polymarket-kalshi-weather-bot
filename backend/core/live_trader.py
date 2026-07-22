@@ -263,14 +263,15 @@ class WeatherLiveTrader:
         return {"action": "reprice", "new_price": new_price}
 
     # ── LADDER WIRING (2026-07-22) — census-param simultaneous rungs ──────────
-    # Cowork decision (session_log_2026-07-22): up to 3 maker rungs at
-    # model_p_side − offsets (0.05/0.09/0.13), budget split 40/30/30 of the
-    # per-trade cap. Supersedes the BUILD-2 time-stepped single-order design;
+    # Cowork decision (session_log_2026-07-22, 2-rung revision same day): up to
+    # 2 maker rungs at model_p_side − offsets (0.05/0.10), budget split 60/40 of
+    # the per-trade cap (3-rung 40/30/30 was infeasible under the 15-share min
+    # across the 0.30–0.50 entry band). Supersedes the BUILD-2 time-stepped single-order design;
     # the BUILD-2 statics above stay as the protective/rewards primitives.
 
     @staticmethod
     def ladder_plan(model_p_side: float, best_ask: Optional[float], size_usd: float,
-                    offsets=(0.05, 0.09, 0.13), split=(0.40, 0.30, 0.30),
+                    offsets=(0.05, 0.10), split=(0.60, 0.40),
                     tick_size: str = "0.01", min_shares: int = 15) -> list:
         """Pure rung planner → [{price, shares, amount_usd}] shallowest-first.
 
@@ -396,7 +397,7 @@ class WeatherLiveTrader:
             return None
 
     def execute_ladder(self, token_id: str, size_usd: float, model_p_side: float,
-                       offsets=(0.05, 0.09, 0.13), split=(0.40, 0.30, 0.30)) -> Optional[dict]:
+                       offsets=(0.05, 0.10), split=(0.60, 0.40)) -> Optional[dict]:
         """LADDER live BUY (2026-07-22). Take-first sweep UNCHANGED: if the book
         has fillable asks at/below model_p_side − offsets[0] (the aggressive
         limit), delegate the FULL budget to execute_aggressive_hybrid exactly as

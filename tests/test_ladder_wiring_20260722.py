@@ -1,9 +1,9 @@
 """Ladder WIRING tests (2026-07-22) — census params armed.
 
 Covers the five wiring behaviors added on top of the BUILD-2 core:
-  1. ladder_plan     — rung prices/sizes from census params (offsets 5/9/13c,
-                       split 40/30/30), 15-share fold-into-rung-1 collapse,
-                       maker-only drop, degenerate cases
+  1. ladder_plan     — rung prices/sizes from census params (2-RUNG revision:
+                       offsets 5/10c, split 60/40), 15-share fold-into-rung-1
+                       collapse, maker-only drop, degenerate cases
   2. execute_ladder  — take-first delegation when the book has fillable asks;
                        maker rungs posted when it doesn't; fail-closed on an
                        unreadable book
@@ -37,22 +37,22 @@ def _db():
 
 
 # ── 1. ladder_plan ────────────────────────────────────────────────────────────
-def test_plan_three_rungs_all_feasible_at_low_prices():
-    # p_side 0.30 → rungs 0.25/0.21/0.17; $6/$4.50/$4.50 all clear 15 sh.
-    plan = WLT.ladder_plan(0.30, best_ask=0.40, size_usd=15.0)
-    assert [r["price"] for r in plan] == [pytest.approx(0.25), pytest.approx(0.21), pytest.approx(0.17)]
+def test_plan_two_rungs_all_feasible_in_entry_band():
+    # 2-RUNG REVISION (Cowork, 2026-07-22): p_side 0.45 → rungs 0.40/0.35;
+    # $9/$6 both clear 15 sh ($9/0.40=22.5, $6/0.35=17.1) — the 0.30–0.50
+    # entry band stays fully feasible, which the 3-rung 40/30/30 was not.
+    plan = WLT.ladder_plan(0.45, best_ask=0.55, size_usd=15.0)
+    assert [r["price"] for r in plan] == [pytest.approx(0.40), pytest.approx(0.35)]
     assert all(r["shares"] >= 15 for r in plan)
-    # split honored: 40/30/30 of $15
-    assert plan[0]["amount_usd"] == pytest.approx(6.0, abs=0.25)
-    assert plan[1]["amount_usd"] == pytest.approx(4.5, abs=0.25)
-    assert plan[2]["amount_usd"] == pytest.approx(4.5, abs=0.25)
+    # split honored: 60/40 of $15
+    assert plan[0]["amount_usd"] == pytest.approx(9.0, abs=0.4)
+    assert plan[1]["amount_usd"] == pytest.approx(6.0, abs=0.4)
 
 
-def test_plan_collapses_to_single_full_rung_at_typical_prices():
-    # p_side 0.60 → rungs 0.55/0.51/0.47. $6 @ 0.55 is only 10.9 sh (<15), so
-    # everything folds into rung 1: ONE full-budget rung at −offsets[0] — the
-    # proven hybrid shape (this is the documented 15-share-minimum deviation
-    # from the literal 40/30/30 split).
+def test_plan_collapses_to_single_full_rung_at_high_prices():
+    # p_side 0.60 → rungs 0.55/0.50. $6 @ 0.50 is only 12 sh (<15), so the deep
+    # rung folds into rung 1: ONE full-budget rung at −offsets[0] — the proven
+    # hybrid shape (the documented 15-share fold).
     plan = WLT.ladder_plan(0.60, best_ask=0.70, size_usd=15.0)
     assert len(plan) == 1
     assert plan[0]["price"] == pytest.approx(0.55)
@@ -60,28 +60,34 @@ def test_plan_collapses_to_single_full_rung_at_typical_prices():
     assert plan[0]["amount_usd"] == pytest.approx(15.0, abs=0.5)
 
 
-def test_plan_partial_collapse_keeps_deep_feasible_rung():
-    # p_side 0.40 → rungs 0.35/0.31/0.27 with $6/$4.50/$4.50.
-    # rung1: $6/0.35 = 17.1 sh OK; rung2: $4.5/0.31 = 14.5 sh < 15 → folds into
-    # rung1; rung3: $4.5/0.27 = 16.6 sh OK → survives. Two rungs.
-    plan = WLT.ladder_plan(0.40, best_ask=0.50, size_usd=15.0)
-    assert [r["price"] for r in plan] == [pytest.approx(0.35), pytest.approx(0.27)]
-    assert plan[0]["amount_usd"] == pytest.approx(10.5, abs=0.5)   # $6 + folded $4.5
+def test_plan_band_edge_exactly_feasible():
+    # Top of the entry band: p_side 0.50 → rungs 0.45/0.40; $6/0.40 = 15.0 sh
+    # EXACTLY — the deep rung survives at the boundary. Both rungs post.
+    plan = WLT.ladder_plan(0.50, best_ask=0.60, size_usd=15.0)
+    assert [r["price"] for r in plan] == [pytest.approx(0.45), pytest.approx(0.40)]
     assert all(r["shares"] >= 15 for r in plan)
 
 
+def test_plan_just_past_band_folds_deep_rung():
+    # p_side 0.52 → rungs 0.47/0.42; $6/0.42 = 14.3 sh < 15 → folds into rung 1.
+    plan = WLT.ladder_plan(0.52, best_ask=0.60, size_usd=15.0)
+    assert len(plan) == 1
+    assert plan[0]["price"] == pytest.approx(0.47)
+    assert plan[0]["amount_usd"] == pytest.approx(15.0, abs=0.5)
+
+
 def test_plan_maker_only_drops_crossed_rungs_folds_deeper():
-    # best_ask 0.33 sits below rung1 (0.35): rung1 is dropped (would be
-    # marketable) and its budget folds DEEPER; every surviving rung < best_ask.
-    plan = WLT.ladder_plan(0.40, best_ask=0.33, size_usd=15.0)
-    assert plan, "deeper maker rungs must survive"
-    assert all(r["price"] < 0.33 for r in plan)
-    assert sum(r["amount_usd"] for r in plan) >= 10.0   # folded budget retained
+    # best_ask 0.42 sits below rung1 (0.45): rung1 is dropped (would be
+    # marketable) and its budget folds DEEPER; the surviving rung < best_ask.
+    plan = WLT.ladder_plan(0.50, best_ask=0.42, size_usd=15.0)
+    assert plan, "deeper maker rung must survive"
+    assert all(r["price"] < 0.42 for r in plan)
+    assert sum(r["amount_usd"] for r in plan) >= 14.0   # folded budget retained
 
 
 def test_plan_empty_book_posts_all_rungs():
-    plan_none = WLT.ladder_plan(0.30, best_ask=None, size_usd=15.0)
-    assert [r["price"] for r in plan_none] == [pytest.approx(0.25), pytest.approx(0.21), pytest.approx(0.17)]
+    plan_none = WLT.ladder_plan(0.45, best_ask=None, size_usd=15.0)
+    assert [r["price"] for r in plan_none] == [pytest.approx(0.40), pytest.approx(0.35)]
 
 
 def test_plan_no_legal_rung_returns_empty():
@@ -91,9 +97,9 @@ def test_plan_no_legal_rung_returns_empty():
 
 
 def test_plan_tick_floor_drops_negative_rungs():
-    # p_side 0.10 → rungs 0.05/0.01/−0.03; the negative rung's budget folds
-    # into rung 1. All survivors are valid maker prices ≥ 1 tick.
-    plan = WLT.ladder_plan(0.10, best_ask=0.20, size_usd=15.0)
+    # p_side 0.08 → rungs 0.03/−0.02; the negative rung's budget folds into
+    # rung 1. All survivors are valid maker prices ≥ 1 tick.
+    plan = WLT.ladder_plan(0.08, best_ask=0.20, size_usd=15.0)
     assert all(r["price"] >= 0.01 for r in plan)
     assert all(r["shares"] >= 15 for r in plan)
 
@@ -114,32 +120,32 @@ def test_execute_ladder_takes_first_when_book_fillable(monkeypatch):
     # asks at/below the aggressive limit → FULL budget delegated to the hybrid
     # (take-first sweep unchanged), no maker rungs posted.
     posted, hybrid_calls = [], []
-    t = _ladder_trader(asks=[(0.24, 40.0)], posted=posted)
+    t = _ladder_trader(asks=[(0.39, 40.0)], posted=posted)
     t.execute_aggressive_hybrid = lambda tok, usd, lim: (
         hybrid_calls.append((usd, lim)) or {"order_id": "H", "price": lim,
         "filled_shares": 20.0, "filled_cost": usd, "fill_price": lim,
         "resting_shares": 0.0, "status": "matched"})
-    out = t.execute_ladder("TOK", 15.0, 0.30)
-    assert hybrid_calls == [(15.0, pytest.approx(0.25))]
+    out = t.execute_ladder("TOK", 15.0, 0.45)
+    assert hybrid_calls == [(15.0, pytest.approx(0.40))]
     assert posted == []
     assert out["filled_shares"] == 20.0
 
 
 def test_execute_ladder_posts_maker_rungs_when_no_fillable():
     posted = []
-    t = _ladder_trader(asks=[(0.40, 100.0)], posted=posted)   # best_ask above all rungs
-    out = t.execute_ladder("TOK", 15.0, 0.30)
-    assert [p for p, _ in posted] == [pytest.approx(0.25), pytest.approx(0.21), pytest.approx(0.17)]
+    t = _ladder_trader(asks=[(0.55, 100.0)], posted=posted)   # best_ask above all rungs
+    out = t.execute_ladder("TOK", 15.0, 0.45)
+    assert [p for p, _ in posted] == [pytest.approx(0.40), pytest.approx(0.35)]
     assert out["status"] == "rested_ladder"
     assert out["filled_shares"] == 0.0
-    assert len(out["ladder_order_ids"]) == 3
+    assert len(out["ladder_order_ids"]) == 2
     assert out["order_id"] == "OID1"
 
 
 def test_execute_ladder_fail_closed_on_unreadable_book():
     posted = []
     t = _ladder_trader(asks=None, posted=posted)
-    assert t.execute_ladder("TOK", 15.0, 0.30) is None
+    assert t.execute_ladder("TOK", 15.0, 0.45) is None
     assert posted == []
 
 
@@ -172,11 +178,11 @@ def test_resolve_routes_to_ladder_when_flag_on():
                     "ladder_order_ids": ["L1", "L2"]}
         return SimpleNamespace(execute_ladder=execute_ladder)
     st = _settings(WEATHER_LIVE_LADDER=True,
-                   WEATHER_LIVE_LADDER_OFFSETS="0.05,0.09,0.13",
-                   WEATHER_LIVE_LADDER_SPLIT="0.40,0.30,0.30")
+                   WEATHER_LIVE_LADDER_OFFSETS="0.05,0.10",
+                   WEATHER_LIVE_LADDER_SPLIT="0.60,0.40")
     d = resolve_weather_live(_signal(), 15.0, 0.40, _db(), st, factory)
     assert d.action == "rested"
-    assert calls == [("NO", 15.0, pytest.approx(0.40), (0.05, 0.09, 0.13), (0.40, 0.30, 0.30))]
+    assert calls == [("NO", 15.0, pytest.approx(0.40), (0.05, 0.10), (0.60, 0.40))]
 
 
 def test_resolve_flag_off_uses_hybrid_unchanged():

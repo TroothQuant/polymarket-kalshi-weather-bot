@@ -444,15 +444,16 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
             > settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD):
         return LiveDecision("halt", entry_price, trade_size, None)
 
-    # LADDER (2026-07-22, census params): up to 3 simultaneous maker rungs at
+    # LADDER (2026-07-22, census params; 2-rung revision same day): up to 2
+    # simultaneous maker rungs at
     # model_p_side − offsets, budget split of the cap; take-first sweep at
     # −offsets[0] unchanged (execute_ladder delegates to the hybrid when the
     # book has fillable asks). Flag off → the proven single-order hybrid.
     if getattr(settings, "WEATHER_LIVE_LADDER", False):
         offsets = tuple(float(x) for x in
-                        str(getattr(settings, "WEATHER_LIVE_LADDER_OFFSETS", "0.05,0.09,0.13")).split(","))
+                        str(getattr(settings, "WEATHER_LIVE_LADDER_OFFSETS", "0.05,0.10")).split(","))
         split = tuple(float(x) for x in
-                      str(getattr(settings, "WEATHER_LIVE_LADDER_SPLIT", "0.40,0.30,0.30")).split(","))
+                      str(getattr(settings, "WEATHER_LIVE_LADDER_SPLIT", "0.60,0.40")).split(","))
         fill = live_trader_factory().execute_ladder(
             token_id, live_size, model_p_side, offsets=offsets, split=split)
     else:

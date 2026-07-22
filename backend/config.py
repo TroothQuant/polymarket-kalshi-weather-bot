@@ -34,14 +34,18 @@ class Settings(BaseSettings):
     # Flag-gated; decision core lives in live_trader.py (pure static methods,
     # fully unit-tested). Wired into resolve_weather_live 2026-07-22 with the
     # census-derived params below (Cowork decision, session_log_2026-07-22):
-    # up to 3 simultaneous maker rungs at model_p_side − OFFSETS, budget SPLIT
+    # up to 2 simultaneous maker rungs at model_p_side − OFFSETS, budget SPLIT
     # of the per-trade cap; take-first sweep at −OFFSETS[0] is unchanged. Rungs
     # whose budget can't clear the 15-share CLOB minimum fold into rung 1
     # (shallowest), so the ladder degrades toward the proven single-rest hybrid.
+    # 2-RUNG REVISION (Cowork, later 2026-07-22): the original 3-rung 40/30/30
+    # split was analytically infeasible across the 0.30–0.50 entry band under
+    # the 15-share minimum ($4.50 rungs need price ≤ 0.30) — 60/40 keeps both
+    # rungs feasible through p_side ≤ ~0.50 ($6 rung clears 15 sh to 0.40).
     # While WEATHER_LIVE_LADDER is False the live path is UNCHANGED.
     WEATHER_LIVE_LADDER: bool = False
-    WEATHER_LIVE_LADDER_OFFSETS: str = "0.05,0.09,0.13"  # rung prices = model_p_side − these (census 2026-07-22: ask drops ≥3¢/5¢/10¢ w/in 12h = 52/43/30%)
-    WEATHER_LIVE_LADDER_SPLIT: str = "0.40,0.30,0.30"    # budget split of WEATHER_LIVE_MAX_TRADE_USD across the rungs
+    WEATHER_LIVE_LADDER_OFFSETS: str = "0.05,0.10"       # rung prices = model_p_side − these (census 2026-07-22 fill curve: ask drops ≥5¢/10¢ w/in 12h = 43/30%)
+    WEATHER_LIVE_LADDER_SPLIT: str = "0.60,0.40"         # budget split of WEATHER_LIVE_MAX_TRADE_USD across the rungs ($9/$6 at the $15 cap)
     # BUILD-2 time-stepped params — superseded by the simultaneous-rung wiring
     # above (kept for a future dwell-time variant; NOT read by the v1 wiring):
     WEATHER_LIVE_LADDER_STEPS: int = 3                  # rungs from near-mid to the aggressive target
