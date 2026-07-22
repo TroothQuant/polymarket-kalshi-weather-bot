@@ -229,3 +229,57 @@ def test_instant_entry_cancels_stale_rest(monkeypatch):
     assert db2.query(PaperRestingOrder).get(stale.id).status == "cancelled_replaced"
     t = db2.query(Trade).filter(Trade.fill_type == "instant").all()
     assert len(t) == 1 and t[0].market_ticker == "m1"
+
+
+# ── Edge-flip cancel (2026-07-22, live parity port) ──────────────────────────
+def _fresh(actionable=True, direction="no", model_yes=0.10):
+    # NO-side p_side = 1 - model_yes = 0.90 by default (rest 0.60 clears floor)
+    return {"m1": {"actionable": actionable, "direction": direction,
+                   "model_probability": model_yes}}
+
+
+# 13. refreshed signal no longer actionable → cancelled_edge_flip
+def test_edge_flip_cancels_not_actionable(monkeypatch):
+    _enable(monkeypatch); db = _mem_db(); state = _state(db); _rest(db)
+    _mock_book(monkeypatch, {"asks": [{"price": 0.10, "size": 100}]})  # fillable!
+    sched.process_paper_resting_orders(db, state, fresh_signals=_fresh(actionable=False))
+    assert db.query(PaperRestingOrder).first().status == "cancelled_edge_flip"
+    assert db.query(Trade).count() == 0    # cancel wins over the would-be fill
+
+
+# 14. refreshed signal flipped direction → cancelled_edge_flip
+def test_edge_flip_cancels_direction_flip(monkeypatch):
+    _enable(monkeypatch); db = _mem_db(); state = _state(db); _rest(db)   # rest is NO
+    _mock_book(monkeypatch, {"asks": [{"price": 0.65, "size": 100}]})
+    sched.process_paper_resting_orders(
+        db, state, fresh_signals=_fresh(direction="yes", model_yes=0.90))
+    assert db.query(PaperRestingOrder).first().status == "cancelled_edge_flip"
+
+
+# 15. still actionable but the rest price no longer clears the edge floor
+# (refreshed NO p_side 0.62 − 0.05 = 0.57 < rest 0.60) → cancelled_edge_flip
+def test_edge_flip_cancels_price_fails_floor(monkeypatch):
+    _enable(monkeypatch); db = _mem_db(); state = _state(db); _rest(db)   # rest @ 0.60
+    _mock_book(monkeypatch, {"asks": [{"price": 0.65, "size": 100}]})
+    sched.process_paper_resting_orders(
+        db, state, fresh_signals=_fresh(model_yes=0.38))   # NO p_side 0.62
+    assert db.query(PaperRestingOrder).first().status == "cancelled_edge_flip"
+
+
+# 16. actionable + clears floor → HELD (and still fillable on the same pass)
+def test_edge_flip_holds_and_fill_proceeds(monkeypatch):
+    _enable(monkeypatch); db = _mem_db(); state = _state(db); _rest(db)
+    _mock_book(monkeypatch, {"asks": [{"price": 0.58, "size": 100}]})
+    sched.process_paper_resting_orders(db, state, fresh_signals=_fresh())  # p_side 0.90
+    assert db.query(PaperRestingOrder).first().status == "filled"
+    assert db.query(Trade).count() == 1
+
+
+# 17. market ABSENT from fresh_signals → untouched (no fresh info, live rule)
+def test_edge_flip_absent_market_untouched(monkeypatch):
+    _enable(monkeypatch); db = _mem_db(); state = _state(db); _rest(db)
+    _mock_book(monkeypatch, {"asks": [{"price": 0.65, "size": 100}]})
+    sched.process_paper_resting_orders(
+        db, state, fresh_signals={"OTHER": {"actionable": False, "direction": "no",
+                                            "model_probability": 0.5}})
+    assert db.query(PaperRestingOrder).first().status == "resting"

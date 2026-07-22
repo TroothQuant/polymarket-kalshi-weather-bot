@@ -141,16 +141,30 @@ def _rest_local_day_passed(city_name: str, target_date_iso: str,
     return local_date > target
 
 
-def process_paper_resting_orders(db, state) -> None:
+def process_paper_resting_orders(db, state, fresh_signals: dict = None) -> None:
     """Every scan: fill open paper resting orders against the REAL book (best_ask
     crossed down to <= our rest price) and expire rests whose LOCAL settlement
     day has passed. APPROXIMATION: 'ask crossed our limit' proxies a seller
     hitting our resting bid — conservative, same spirit as the live take+rest
     hybrid. Only active when WEATHER_PAPER_REALISTIC_FILLS. Robust: never raises
-    to the scan."""
+    to the scan.
+
+    fresh_signals (2026-07-22, edge-flip port from live): THIS scan's refreshed
+    view per market_ticker — {"actionable": bool, "direction": str,
+    "model_probability": float (ensemble YES prob)}. When present for a rest's
+    market, the rest is cancelled ('cancelled_edge_flip') if the refreshed
+    signal no longer wants the rest's side (not actionable, or direction
+    flipped) or the rest price no longer clears the min-edge floor against the
+    refreshed model (a stale high bid is adverse-selection bait). Cancel-not-
+    reprice, mirroring live: the entry block reposts at the fresh price on the
+    same scan if the signal is still actionable. A market ABSENT from
+    fresh_signals is left untouched (no fresh information — the live rule)."""
     if not settings.WEATHER_PAPER_REALISTIC_FILLS:
         return
     from backend.core.execution_realism import resolve_token_id, fetch_book, realistic_fill
+    # Same floor as live's WEATHER_LIVE_MIN_EDGE_FLOOR default (paper config
+    # has no such knob; keep the two books' protective legs numerically equal).
+    edge_floor = getattr(settings, "WEATHER_LIVE_MIN_EDGE_FLOOR", 0.05)
     rests = db.query(PaperRestingOrder).filter(PaperRestingOrder.status == "resting").all()
     for ro in rests:
         try:
@@ -194,6 +208,29 @@ def process_paper_resting_orders(db, state) -> None:
                     f"(trade #{dupe.id} already holds {ro.market_ticker}; lifetime dedup)",
                     {"reason": "rest_cancelled_dupe", "market": ro.market_ticker})
                 continue
+            # Edge-flip / adverse-selection cancel (2026-07-22, live parity):
+            # acts ONLY on markets refreshed THIS scan (fresh_signals).
+            fresh = (fresh_signals or {}).get(ro.market_ticker)
+            if fresh is not None:
+                wanted = bool(fresh.get("actionable")) and fresh.get("direction") == ro.direction
+                p_yes = fresh.get("model_probability")
+                rest_p_side = (p_yes if ro.direction == "yes" else 1.0 - p_yes) \
+                    if p_yes is not None else None
+                clears_floor = (rest_p_side is not None
+                                and ro.rest_price <= rest_p_side - edge_floor + 1e-9)
+                if not wanted or not clears_floor:
+                    why = ("side no longer wanted (not actionable / direction flipped)"
+                           if not wanted else
+                           f"price {ro.rest_price:.3f} no longer clears the edge floor "
+                           f"(refreshed p_side {rest_p_side:.3f})")
+                    ro.status = "cancelled_edge_flip"
+                    ro.updated_at = datetime.utcnow()
+                    log_event("info",
+                        f"[rest_cancelled_edge_flip] WX {ro.city_name}: "
+                        f"{ro.direction.upper()} {ro.remaining_shares:.0f}sh "
+                        f"@ {ro.rest_price:.3f} — {why}",
+                        {"reason": "rest_cancelled_edge_flip", "market": ro.market_ticker})
+                    continue
             token = resolve_token_id(ro.condition_id, ro.direction)
             book = fetch_book(token) if token else None
             if book is None:
@@ -393,7 +430,18 @@ async def weather_scan_and_trade_job():
             # Realistic-fills hybrid (2026-07-20): fill/expire paper resting orders
             # against the real book EVERY scan — must run even when there are no new
             # actionable signals this cycle (that's when a rest usually fills).
-            process_paper_resting_orders(db, state)
+            # fresh_signals (2026-07-22): this scan's refreshed per-market view —
+            # built from ALL signals (not just actionable) so the edge-flip cancel
+            # sees markets whose signal went non-actionable or flipped direction.
+            fresh_signals = {
+                s.market.market_id: {
+                    "actionable": bool(getattr(s, "passes_threshold", False)),
+                    "direction": s.direction,
+                    "model_probability": s.model_probability,
+                }
+                for s in signals
+            }
+            process_paper_resting_orders(db, state, fresh_signals=fresh_signals)
 
             if not actionable:
                 log_event("info", "No actionable weather signals (resting orders processed)")
