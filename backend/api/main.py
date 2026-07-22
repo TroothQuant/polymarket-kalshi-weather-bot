@@ -521,7 +521,9 @@ async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
             "pair_vwap": r.pair_vwap, "locked_pairs": r.locked_pairs,
             "locked_pnl": r.locked_pnl,
             "lean": {"side": r.lean_side, "shares": r.lean_shares or 0.0,
-                     "price": r.lean_price, "pnl": r.lean_pnl},
+                     "price": r.lean_price, "pnl": r.lean_pnl,
+                     "mark": (r.up_mark if r.lean_side == "up" else r.down_mark)
+                             if r.lean_side else None},
             "picks": {"spot_drift": r.pick_spot_drift, "momentum": r.pick_momentum,
                       "depth": r.pick_depth, "late_recency": r.pick_late_recency,
                       "brownian": r.pick_brownian, "p_up_brownian": r.p_up_brownian},
@@ -532,10 +534,11 @@ async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
             "sides": [
                 {"side": "Up", "shares": r.up_shares or 0.0,
                  "avg_price": round((r.up_cost or 0.0) / r.up_shares, 4) if r.up_shares else None,
-                 "resolution_price": res_price_up},
+                 "resolution_price": res_price_up, "mark": r.up_mark},
                 {"side": "Down", "shares": r.down_shares or 0.0,
                  "avg_price": round((r.down_cost or 0.0) / r.down_shares, 4) if r.down_shares else None,
-                 "resolution_price": (1.0 - res_price_up) if res_price_up is not None else None},
+                 "resolution_price": (1.0 - res_price_up) if res_price_up is not None else None,
+                 "mark": r.down_mark},
             ],
         })
     return out

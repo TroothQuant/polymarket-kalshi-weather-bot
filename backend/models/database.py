@@ -288,6 +288,8 @@ class CryptoWindow(Base):
     arb_polls = Column(Integer, nullable=True)          # instant-arb visibility (item 8): book polls with both asks
     arb_hits = Column(Integer, nullable=True)           # polls where ask(Up)+ask(Down) < $1.00
     arb_best_sum = Column(Float, nullable=True)         # lowest observed ask-sum
+    up_mark = Column(Float, nullable=True)              # live mid of the Up book (open-window unrealized P&L)
+    down_mark = Column(Float, nullable=True)            # live mid of the Down book
     spot_open = Column(Float, nullable=True)
     spot_t60 = Column(Float, nullable=True)             # first spot sample inside the final ~60s (late-recency baseline)
     spot_close = Column(Float, nullable=True)
@@ -419,6 +421,10 @@ def ensure_schema():
                     conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN arb_hits INTEGER"))
                 if "arb_best_sum" not in cw_cols:
                     conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN arb_best_sum FLOAT"))
+                if "up_mark" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN up_mark FLOAT"))
+                if "down_mark" not in cw_cols:
+                    conn.execute(text("ALTER TABLE crypto_windows ADD COLUMN down_mark FLOAT"))
     except Exception:
         pass
 

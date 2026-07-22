@@ -491,6 +491,13 @@ class Crypto5050Runner:
                 d_bid, d_ask, d_depth = best_bid_ask(down_book)
                 if up_mid_open is None and u_bid is not None and u_ask is not None:
                     up_mid_open = (u_bid + u_ask) / 2.0
+                # live marks for the dashboard's open-window unrealized P&L
+                row.up_mark = ((u_bid + u_ask) / 2.0
+                               if (u_bid is not None and u_ask is not None) else u_ask or u_bid)
+                row.down_mark = ((d_bid + d_ask) / 2.0
+                                 if (d_bid is not None and d_ask is not None) else d_ask or d_bid)
+                if int(tick_start) % 20 < st.CRYPTO5050_POLL_SECONDS:
+                    db.commit()          # flush marks ~every 20s even with no fills
                 # instant-arb visibility tick (item 8 — never traded)
                 _asum = arb_sum(u_ask, d_ask)
                 if _asum is not None:
