@@ -34,9 +34,14 @@ HONESTY CAVEATS (stamped per spec):
     best ask crosses down to <= our resting bid (same conservative proxy as the
     weather rest sim) — but QUEUE POSITION IS UNMODELED, so real fills would be
     a subset. The maker-fill % on the dashboard doubles as the honesty meter.
-  * Fill count per window is bounded by the $30 notional cap and the venue's
+  * Fill count per window is bounded by the hedge budget and the venue's
     5-share minimum order (~8-12 fills/window), BELOW the spec's ~15-25 target:
     honoring the cap + the venue minimum beats hitting the fill-count target.
+
+BUDGET SPLIT (Cowork revision, 2026-07-22 PM): window cap $40, of which $18 is
+RESERVED for the L2 lean (hedge budget = $22). The lean is fixed 20 shares; if
+20 shares of the picked side exceed the reserve (price > 0.90) the lean is
+SKIPPED that window — the three rule picks still record unconditionally.
 """
 import asyncio
 import logging
@@ -160,6 +165,16 @@ def lean_pick_depth(up_bid_depth, down_bid_depth):
     if up_bid_depth is None or down_bid_depth is None or up_bid_depth == down_bid_depth:
         return None
     return "up" if up_bid_depth > down_bid_depth else "down"
+
+
+def lean_affordable(price, shares: float, reserve: float) -> bool:
+    """Budget split (Cowork 2026-07-22 PM): the lean has its OWN reserved budget
+    ($18 of the $40 window cap). 20 shares above price 0.90 exceeds it → the
+    lean is SKIPPED that window (picks still record — the hit-rate series is
+    unconditional)."""
+    if price is None:
+        return False
+    return price * shares <= reserve + 1e-9
 
 
 def grade_pick(pick, winner):
@@ -346,7 +361,12 @@ class Crypto5050Runner:
             spot_open = await self.fetch_spot()
             row.spot_open = spot_open
             up_mid_open = None
+            # Budget split (Cowork 2026-07-22 PM): $18 of the window cap is
+            # RESERVED for the L2 lean; the L1 hedge gets the remainder ($22 at
+            # the $40 cap). `spent` below tracks HEDGE spend only.
             cash_cap = st.CRYPTO5050_MAX_WINDOW_NOTIONAL_USD
+            lean_reserve = getattr(st, "CRYPTO5050_LEAN_RESERVE_USD", 18.0)
+            hedge_cap = cash_cap - lean_reserve
             spent = 0.0
             fees = 0.0
             last_fill_at = 0.0
@@ -375,7 +395,7 @@ class Crypto5050Runner:
                     ask_now = u_ask if side == "up" else d_ask
                     if ask_now is not None and ask_now <= bid_px + 1e-9:
                         ok = self._apply_fill(db, row, side, "maker", bid_px, FILL_SHARES,
-                                              spent, cash_cap, fees)
+                                              spent, hedge_cap, fees)
                         if ok:
                             spent, fees = ok
                             last_fill_at = tick_start
@@ -393,7 +413,7 @@ class Crypto5050Runner:
                                     row.up_cost or 0.0, row.up_shares or 0.0,
                                     row.down_cost or 0.0, row.down_shares or 0.0,
                                     side, bid_px, FILL_SHARES) \
-                                    and spent + bid_px * FILL_SHARES <= cash_cap:
+                                    and spent + bid_px * FILL_SHARES <= hedge_cap:
                                 resting = (side, bid_px)
                                 next_kind = "taker"
                         else:
@@ -401,9 +421,9 @@ class Crypto5050Runner:
                                     row.up_cost or 0.0, row.up_shares or 0.0,
                                     row.down_cost or 0.0, row.down_shares or 0.0,
                                     side, px, FILL_SHARES) \
-                                    and spent + px * FILL_SHARES <= cash_cap:
+                                    and spent + px * FILL_SHARES <= hedge_cap:
                                 ok = self._apply_fill(db, row, side, "taker", px,
-                                                      FILL_SHARES, spent, cash_cap, fees)
+                                                      FILL_SHARES, spent, hedge_cap, fees)
                                 if ok:
                                     spent, fees = ok
                                     last_fill_at = tick_start
@@ -420,13 +440,17 @@ class Crypto5050Runner:
                     if pick_spot is not None:
                         lean_px = u_ask if pick_spot == "up" else d_ask
                         lean_sh = st.CRYPTO5050_LEAN_SHARES
-                        if lean_px is not None and spent + lean_px * lean_sh <= cash_cap:
+                        if not lean_affordable(lean_px, lean_sh, lean_reserve):
+                            self.log_event("info",
+                                f"[c5050] LEAN SKIPPED: {lean_sh:.0f}sh {pick_spot.upper()} "
+                                f"@ {lean_px if lean_px is not None else 'n/a'} exceeds the "
+                                f"${lean_reserve:.0f} reserve (px > 0.90) — picks still recorded")
+                        else:
                             fee = fee_for(lean_px, lean_sh, st.CRYPTO5050_TAKER_FEE_RATE)
                             row.lean_side = pick_spot
                             row.lean_shares = lean_sh
                             row.lean_price = lean_px
                             row.lean_cost = round(lean_px * lean_sh, 6)
-                            spent += row.lean_cost
                             fees += fee
                             db.add(CryptoFill(window_id=row.id, side=pick_spot,
                                               fill_kind="taker", price=lean_px,

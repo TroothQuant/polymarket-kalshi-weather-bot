@@ -492,7 +492,14 @@ async def crypto5050_windows(limit: int = 5, db: Session = Depends(get_db)):
     out = []
     for r in rows:
         res_price_up = (1.0 if r.resolution == "up" else 0.0) if r.resolution else None
+        # L1 residue = hedge-leg imbalance. Broken out so accidental-imbalance
+        # P&L is never read as lean performance (the lean is its own fields).
+        u_sh, d_sh = r.up_shares or 0.0, r.down_shares or 0.0
+        residue = ({"side": "up", "shares": u_sh - d_sh} if u_sh > d_sh
+                   else {"side": "down", "shares": d_sh - u_sh} if d_sh > u_sh
+                   else None)
         out.append({
+            "l1_residue": residue,
             "slug": r.slug, "question": r.question, "status": r.status,
             "window_start": r.window_start.isoformat() + "Z" if r.window_start else None,
             "fills": r.fills_count or 0, "maker_fills": r.maker_fills or 0,

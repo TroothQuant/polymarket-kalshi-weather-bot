@@ -217,10 +217,11 @@ class Settings(BaseSettings):
     # backend/core/crypto5050.py for the strategy + honesty caveats.
     CRYPTO_5050_ENABLED: bool = False                 # master flag (flip in weather.env)
     CRYPTO5050_ALLOCATION_USD: float = 500.0          # separate paper allocation
-    CRYPTO5050_MAX_WINDOW_NOTIONAL_USD: float = 30.0  # hard cap per 5-min window
+    CRYPTO5050_MAX_WINDOW_NOTIONAL_USD: float = 40.0  # hard cap per 5-min window (30→40 Cowork 2026-07-22 PM)
+    CRYPTO5050_LEAN_RESERVE_USD: float = 18.0         # reserved for the L2 lean → L1 hedge budget = cap − this ($22)
     CRYPTO5050_HALT_PNL_USD: float = -100.0           # auto-halt at cumulative net
     CRYPTO5050_POLL_SECONDS: float = 4.0              # book+spot poll cadence
-    CRYPTO5050_LEAN_SHARES: float = 20.0              # L2 fixed lean size
+    CRYPTO5050_LEAN_SHARES: float = 20.0              # L2 fixed lean size; if 20sh of the picked side > the reserve (price > 0.90) the lean is SKIPPED that window (picks still recorded)
     # FEES: gamma+CLOB base-fee fields read 1000/1000 bps (protocol MAX), but the
     # real measured trade (DoggyStyIe 7/22, net $48.61 on $48.75 gross) shows
     # ~0 effective drag → default 0.0. Formula rate×min(p,1−p)×sh is implemented,

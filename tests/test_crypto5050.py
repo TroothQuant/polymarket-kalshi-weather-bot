@@ -28,7 +28,8 @@ def _db():
 def _settings(**over):
     s = SimpleNamespace(
         CRYPTO_5050_ENABLED=True, CRYPTO5050_ALLOCATION_USD=500.0,
-        CRYPTO5050_MAX_WINDOW_NOTIONAL_USD=30.0, CRYPTO5050_HALT_PNL_USD=-100.0,
+        CRYPTO5050_MAX_WINDOW_NOTIONAL_USD=40.0, CRYPTO5050_LEAN_RESERVE_USD=18.0,
+        CRYPTO5050_HALT_PNL_USD=-100.0,
         CRYPTO5050_POLL_SECONDS=4.0, CRYPTO5050_LEAN_SHARES=20.0,
         CRYPTO5050_MAKER_FEE_RATE=0.0, CRYPTO5050_TAKER_FEE_RATE=0.0)
     s.__dict__.update(over)
@@ -263,3 +264,28 @@ def test_sweep_stale_queues_ended_windows():
     assert len(tasks) == 1                                  # only the ended window
     assert any("stale window old" in m for _, m in events)
     assert db.query(CryptoWindow).filter_by(slug="current").first().status == "open"
+
+
+# ── budget split (Cowork 2026-07-22 PM): $18 lean reserve of the $40 cap ─────
+def test_lean_affordable_boundary():
+    from backend.core.crypto5050 import lean_affordable
+    assert lean_affordable(0.90, 20, 18.0)          # 20 x 0.90 = $18.00 exactly → trades
+    assert not lean_affordable(0.91, 20, 18.0)      # $18.20 > reserve → SKIPPED
+    assert lean_affordable(0.10, 20, 18.0)
+    assert not lean_affordable(None, 20, 18.0)      # no ask → no lean
+
+
+def test_hedge_cap_is_cap_minus_reserve():
+    # _apply_fill against the $22 hedge budget: a fill that fits $40 but not
+    # $22 must be refused when the caller passes hedge_cap.
+    db = _db()
+    row = CryptoWindow(slug="w1", status="open", up_shares=0.0, up_cost=0.0,
+                       down_shares=0.0, down_cost=0.0)
+    db.add(row); db.commit()
+    r, _ = _runner(db)
+    hedge_cap = 40.0 - 18.0
+    assert r._apply_fill(db, row, "up", "taker", 0.50, 5.0,
+                         spent=20.0, cap=hedge_cap, fees=0.0) is None   # 22.5 > 22
+    ok = r._apply_fill(db, row, "up", "taker", 0.30, 5.0,
+                       spent=20.0, cap=hedge_cap, fees=0.0)             # 21.5 <= 22
+    assert ok == (pytest.approx(21.5), 0.0)
