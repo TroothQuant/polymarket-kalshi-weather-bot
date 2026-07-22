@@ -444,7 +444,19 @@ def resolve_weather_live(signal, trade_size, entry_price, db, settings, live_tra
             > settings.WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD):
         return LiveDecision("halt", entry_price, trade_size, None)
 
-    fill = live_trader_factory().execute_aggressive_hybrid(token_id, live_size, limit_price)
+    # LADDER (2026-07-22, census params): up to 3 simultaneous maker rungs at
+    # model_p_side − offsets, budget split of the cap; take-first sweep at
+    # −offsets[0] unchanged (execute_ladder delegates to the hybrid when the
+    # book has fillable asks). Flag off → the proven single-order hybrid.
+    if getattr(settings, "WEATHER_LIVE_LADDER", False):
+        offsets = tuple(float(x) for x in
+                        str(getattr(settings, "WEATHER_LIVE_LADDER_OFFSETS", "0.05,0.09,0.13")).split(","))
+        split = tuple(float(x) for x in
+                      str(getattr(settings, "WEATHER_LIVE_LADDER_SPLIT", "0.40,0.30,0.30")).split(","))
+        fill = live_trader_factory().execute_ladder(
+            token_id, live_size, model_p_side, offsets=offsets, split=split)
+    else:
+        fill = live_trader_factory().execute_aggressive_hybrid(token_id, live_size, limit_price)
     if fill is None:
         return LiveDecision("skip", limit_price, trade_size, None)  # hard failure → NO row
 
@@ -554,6 +566,34 @@ def manage_live_resting_orders(trader, db, market_by_token, settings):
                               f"[live] cancelled resting {str(order_id)[:10]}… on "
                               f"{meta['market_id']} @ settlement approach")
                 continue  # cancelled → not a live resting token anymore
+
+            # Edge-flip / adverse-selection cancel (2026-07-22, ladder-arming
+            # requirement). Acts ONLY on FRESH meta (this scan's refreshed
+            # signal — the DB-fallback meta above carries stale entry-time
+            # numbers and must never trigger a cancel). Cancels when:
+            #   (a) the refreshed signal no longer wants this side (not
+            #       actionable, or the direction flipped — the both-token
+            #       keying above makes a flip land here as actionable=False); or
+            #   (b) protective_action says the resting price no longer clears
+            #       the min-edge floor against the refreshed model (a stale
+            #       high bid is adverse-selection bait). We cancel rather than
+            #       reprice: strictly safer, and the next scan reposts at the
+            #       fresh price if the signal is still actionable.
+            if meta is not None and meta.get("fresh") and price > 0:
+                floor = getattr(settings, "WEATHER_LIVE_MIN_EDGE_FLOOR", 0.05)
+                pa = trader.protective_action(price, meta.get("model_p_side", 0.0), floor)
+                if (not meta.get("actionable", True)) or pa["action"] != "hold":
+                    why = ("signal no longer actionable for this side"
+                           if not meta.get("actionable", True)
+                           else f"price {price:.3f} no longer clears the edge floor "
+                                f"(refreshed p_side {meta.get('model_p_side', 0):.3f}, "
+                                f"protective={pa['action']})")
+                    if trader.cancel(order_id):
+                        log_event("info",
+                                  f"[live] cancelled resting {str(order_id)[:10]}… on "
+                                  f"{meta['market_id']} — edge-flip guard: {why}")
+                        continue  # cancelled → not a live resting token anymore
+                    # cancel failed → fall through: keep counting its exposure
 
             resting_tokens.add(token)
             # BUG 1: this order's remaining notional counts toward the exposure cap.
@@ -718,15 +758,28 @@ async def weather_scan_and_trade_job():
                 market_by_token = {}
                 for s in signals:
                     m = s.market
-                    tok = (m.token_id_yes if s.direction == "yes" else m.token_id_no)
-                    if tok:
+                    # Key BOTH side tokens (2026-07-22): a refreshed signal that
+                    # flips direction changes which token the signal points at —
+                    # keying only the signal side let a stale OTHER-side rest
+                    # escape the edge-flip guard below. "actionable"/"fresh"
+                    # feed manage_live_resting_orders' adverse-selection cancel.
+                    p_yes = s.model_probability
+                    for side, tok in (("yes", m.token_id_yes), ("no", m.token_id_no)):
+                        if not tok:
+                            continue
                         market_by_token[str(tok)] = {
                             "market_id": m.market_id, "slug": getattr(m, "slug", None),
-                            "direction": s.direction,
-                            "model_probability": s.model_probability,
+                            "direction": side,
+                            "model_probability": p_yes,
                             "market_probability": getattr(s, "market_probability", None),
                             "edge": s.edge,
                             "target_date": getattr(m, "target_date", None),
+                            "model_p_side": (p_yes if side == "yes" else 1.0 - p_yes),
+                            # this side is only "still wanted" if the refreshed
+                            # signal is actionable AND still points at this side
+                            "actionable": bool(getattr(s, "passes_threshold", False)
+                                               and s.direction == side),
+                            "fresh": True,
                         }
                 try:
                     resting_tokens, resting_notional, resting_ok = manage_live_resting_orders(

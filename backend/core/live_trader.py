@@ -262,6 +262,191 @@ class WeatherLiveTrader:
             return {"action": "cancel", "new_price": None}
         return {"action": "reprice", "new_price": new_price}
 
+    # ── LADDER WIRING (2026-07-22) — census-param simultaneous rungs ──────────
+    # Cowork decision (session_log_2026-07-22): up to 3 maker rungs at
+    # model_p_side − offsets (0.05/0.09/0.13), budget split 40/30/30 of the
+    # per-trade cap. Supersedes the BUILD-2 time-stepped single-order design;
+    # the BUILD-2 statics above stay as the protective/rewards primitives.
+
+    @staticmethod
+    def ladder_plan(model_p_side: float, best_ask: Optional[float], size_usd: float,
+                    offsets=(0.05, 0.09, 0.13), split=(0.40, 0.30, 0.30),
+                    tick_size: str = "0.01", min_shares: int = 15) -> list:
+        """Pure rung planner → [{price, shares, amount_usd}] shallowest-first.
+
+        Constraints, in order:
+          1. Rung price = model_p_side − offset, rounded DOWN to tick, must sit in
+             [tick, 1−tick]; an invalid-price rung is dropped, budget folds into
+             the shallowest surviving rung.
+          2. MAKER-ONLY: a rung must price BELOW best_ask (never marketable). A
+             crossed rung is dropped and its budget folds into the next DEEPER
+             maker rung (folding up would cross too). best_ask=None (empty book)
+             → vacuously maker.
+          3. 15-share CLOB minimum: any rung whose budget < min_shares×price
+             folds into rung 1 (shallowest — matches the shallow-weighted split;
+             worst case the ladder degrades to ONE full-size rung at −offsets[0],
+             i.e. the proven single-rest hybrid shape). NOTE the deliberate
+             deviation from the literal 40/30/30 spec: at typical NO prices
+             ≥ ~0.40 a $6/$4.50 rung is < 15 shares, so the literal split would
+             post NOTHING — folding preserves the ladder's intent instead.
+        Returns [] only when no legal rung exists (caller falls back / skips)."""
+        if model_p_side <= 0 or size_usd <= 0 or not offsets or not split:
+            return []
+        price_dp, taker_dp = _MK_ROUND.get(str(tick_size), (2, 4))
+        tick = float(tick_size)
+        hi = _round_down(1 - tick, price_dp)
+        n = min(len(offsets), len(split))
+        # 1. price validity — invalid rungs fold into the shallowest survivor.
+        rungs = []          # [ [price, budget], ... ] shallowest-first
+        orphan_budget = 0.0
+        for i in range(n):
+            # +1e-9 before flooring so an exact-tick target (0.60-0.05 =
+            # 0.5999…4 in binary float) lands on 0.55, not a spurious tick
+            # lower — same guard as protective_action.
+            p = _round_down(float(model_p_side) - float(offsets[i]) + 1e-9, price_dp)
+            b = float(size_usd) * float(split[i])
+            if tick <= p <= hi:
+                rungs.append([p, b])
+            else:
+                orphan_budget += b
+        if not rungs:
+            return []
+        rungs[0][1] += orphan_budget
+        # 2. maker-only — crossed rungs fold DEEPER (shallower would cross too).
+        if best_ask is not None:
+            maker, crossed_budget = [], 0.0
+            for p, b in rungs:
+                if p < float(best_ask) - 1e-9:
+                    if crossed_budget:
+                        b += crossed_budget
+                        crossed_budget = 0.0
+                    maker.append([p, b])
+                else:
+                    crossed_budget += b
+            if not maker:
+                return []
+            rungs = maker
+        # 3. 15-share minimum — infeasible rungs fold into the shallowest.
+        keep = [rungs[0]]
+        for p, b in rungs[1:]:
+            if b + 1e-9 >= min_shares * p:
+                keep.append([p, b])
+            else:
+                keep[0][1] += b
+        if keep[0][1] + 1e-9 < min_shares * keep[0][0]:
+            # shallowest can't clear 15 shares on its own → single full-budget rung
+            total = sum(b for _, b in keep)
+            keep = [[keep[0][0], total]]
+            if total + 1e-9 < min_shares * keep[0][0]:
+                return []
+        out = []
+        for p, b in keep:
+            shares = _round_down(b / p, taker_dp)
+            if shares < min_shares:      # post-rounding re-check (belt+suspenders)
+                continue
+            out.append({"price": p, "shares": shares,
+                        "amount_usd": _round_down(shares * p, 2)})
+        return out
+
+    def post_resting_limit(self, token_id: str, size_usd: float,
+                           price: float, tick_size: str = "0.01") -> Optional[dict]:
+        """Post ONE pure-maker GTC LIMIT BUY at `price` (caller has verified
+        price < best_ask, so there is no immediate take to poll for). Returns
+        {order_id, price, shares, amount_usd, status} or None on any failure."""
+        from py_clob_client_v2.clob_types import (
+            OrderArgs, OrderType, PartialCreateOrderOptions)
+        from py_clob_client_v2.order_builder.constants import BUY
+        try:
+            args = self.build_limit_order_args(token_id, size_usd, price, tick_size)
+            order_args = OrderArgs(token_id=args["token_id"], price=args["price"],
+                                   size=args["size"], side=BUY)
+            signed = self.client.create_order(
+                order_args, options=PartialCreateOrderOptions(tick_size=tick_size))
+            resp = self.client.post_order(signed, OrderType.GTC)
+            order_id = (resp.get("orderID") or resp.get("id")) if isinstance(resp, dict) else None
+            status = resp.get("status") if isinstance(resp, dict) else None
+            if order_id is None:
+                log.error("Weather live LADDER rung post returned no order id")
+                return None
+            log.info(f"Weather live LADDER rung posted: {str(order_id)[:12]}… "
+                     f"{args['size']} sh @ {args['price']} (${args['amount_usd']:.2f}, "
+                     f"status={status})")
+            return {"order_id": order_id, "price": args["price"],
+                    "shares": args["size"], "amount_usd": args["amount_usd"],
+                    "status": status}
+        except Exception as e:
+            log.error(f"Weather live LADDER rung post failed @ {price}: {e}")
+            return None
+
+    def _book_asks(self, token_id) -> Optional[list]:
+        """[(price, size), ...] of current asks; None if the book can't be read
+        (distinct from a readable-but-empty book, which returns [])."""
+        try:
+            ob = self.client.get_order_book(token_id)
+            asks = (ob.get("asks") or []) if isinstance(ob, dict) else []
+            levels = []
+            for a in asks:
+                try:
+                    levels.append((float(a["price"]), float(a["size"])))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            return levels
+        except Exception as e:
+            log.warning(f"Weather live book read failed for ladder: {e}")
+            return None
+
+    def execute_ladder(self, token_id: str, size_usd: float, model_p_side: float,
+                       offsets=(0.05, 0.09, 0.13), split=(0.40, 0.30, 0.30)) -> Optional[dict]:
+        """LADDER live BUY (2026-07-22). Take-first sweep UNCHANGED: if the book
+        has fillable asks at/below model_p_side − offsets[0] (the aggressive
+        limit), delegate the FULL budget to execute_aggressive_hybrid exactly as
+        before. Otherwise post up to len(offsets) simultaneous pure-maker GTC
+        rungs per ladder_plan; they are managed cross-cycle by
+        manage_live_resting_orders like any resting order (late-fill recording,
+        settlement-approach cancel, edge-flip cancel, exposure accounting).
+
+        Returns the same lifecycle dict shape as execute_aggressive_hybrid
+        (filled_shares 0.0 → 'rested'), plus ladder_order_ids. None = nothing
+        placed (hard failure / unreadable book / no legal rung)."""
+        try:
+            tick_size = str(self.client.get_tick_size(token_id))
+        except Exception:
+            tick_size = "0.01"
+        limit_price = float(model_p_side) - float(offsets[0])
+        asks = self._book_asks(token_id)
+        if asks is None:
+            log.warning("Weather live LADDER: book unreadable — not placing (fail closed)")
+            return None
+        best_ask = min((p for p, _ in asks), default=None)
+        fillable = sum(s for p, s in asks if p <= limit_price)
+        if fillable > 0:
+            log.info(f"Weather live LADDER: {fillable:.1f} sh fillable <= {limit_price:.3f} "
+                     f"— taking first (sweep unchanged, full budget)")
+            return self.execute_aggressive_hybrid(token_id, size_usd, limit_price)
+        plan = self.ladder_plan(model_p_side, best_ask, size_usd,
+                                offsets=offsets, split=split, tick_size=tick_size)
+        if not plan:
+            log.info(f"Weather live LADDER: no legal rung (p_side={model_p_side:.3f}, "
+                     f"best_ask={best_ask}) — nothing placed")
+            return None
+        posted = []
+        for rung in plan:
+            r = self.post_resting_limit(token_id, rung["amount_usd"] + 0.05,
+                                        rung["price"], tick_size)
+            if r is not None:
+                posted.append(r)
+        if not posted:
+            return None
+        log.info(f"Weather live LADDER rested: {len(posted)} rung(s) "
+                 f"{[(r['price'], r['shares']) for r in posted]} "
+                 f"(${sum(r['amount_usd'] for r in posted):.2f} total)")
+        return {"order_id": posted[0]["order_id"], "price": posted[0]["price"],
+                "tick": tick_size, "filled_shares": 0.0, "filled_cost": 0.0,
+                "fill_price": None,
+                "resting_shares": sum(r["shares"] for r in posted),
+                "status": "rested_ladder",
+                "ladder_order_ids": [r["order_id"] for r in posted]}
+
     @staticmethod
     def _matched_shares(rec: dict) -> float:
         """AUTHORITATIVE filled-share count from an order record (get_order /

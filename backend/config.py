@@ -30,14 +30,20 @@ class Settings(BaseSettings):
     WEATHER_LIVE_MAX_TOTAL_EXPOSURE_USD: float = 25.0  # OI1: hard cap on summed OPEN live exposure (> per-trade so 1 order fits); set <= funded wallet balance at G1
     WEATHER_LIVE_CITIES: str = "nyc"                    # OI1: live path restricted to these cities (defense-in-depth on WEATHER_CITIES)
     WEATHER_LIVE_MIN_EDGE_FLOOR: float = 0.05           # min gross edge to rest/take (model_p_side - price); the ladder target = model_p_side - this
-    # ── REST-PRICE LADDER (BUILD 2, 2026-07-19) — STAGED, DEFAULT OFF ──────────
+    # ── REST-PRICE LADDER (BUILD 2, 2026-07-19; WIRED + ARMED 2026-07-22) ──────
     # Flag-gated; decision core lives in live_trader.py (pure static methods,
-    # fully unit-tested). NOT wired into the scheduler hot path yet — while
-    # WEATHER_LIVE_LADDER is False the live path is UNCHANGED (AGGRESSIVE-HYBRID).
-    # Ladder PARAMS get set from the liquidity census (Cowork, Wed 2026-07-22);
-    # these are placeholders until then. Do NOT flip this flag without census
-    # params + a soak — it changes real-money execution.
+    # fully unit-tested). Wired into resolve_weather_live 2026-07-22 with the
+    # census-derived params below (Cowork decision, session_log_2026-07-22):
+    # up to 3 simultaneous maker rungs at model_p_side − OFFSETS, budget SPLIT
+    # of the per-trade cap; take-first sweep at −OFFSETS[0] is unchanged. Rungs
+    # whose budget can't clear the 15-share CLOB minimum fold into rung 1
+    # (shallowest), so the ladder degrades toward the proven single-rest hybrid.
+    # While WEATHER_LIVE_LADDER is False the live path is UNCHANGED.
     WEATHER_LIVE_LADDER: bool = False
+    WEATHER_LIVE_LADDER_OFFSETS: str = "0.05,0.09,0.13"  # rung prices = model_p_side − these (census 2026-07-22: ask drops ≥3¢/5¢/10¢ w/in 12h = 52/43/30%)
+    WEATHER_LIVE_LADDER_SPLIT: str = "0.40,0.30,0.30"    # budget split of WEATHER_LIVE_MAX_TRADE_USD across the rungs
+    # BUILD-2 time-stepped params — superseded by the simultaneous-rung wiring
+    # above (kept for a future dwell-time variant; NOT read by the v1 wiring):
     WEATHER_LIVE_LADDER_STEPS: int = 3                  # rungs from near-mid to the aggressive target
     WEATHER_LIVE_LADDER_STEP_SECONDS: int = 60          # dwell time per rung while unfilled
     WEATHER_LIVE_LADDER_BAND: float = 0.045             # 4.5c LP-rewards zone (must match rewardsMaxSpread)
