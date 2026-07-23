@@ -10,18 +10,26 @@ from backend.models.database import init_db
 # Audit 2026-05-19 CRITICAL #1, hardened on 2026-05-20 after a Claude bot
 # zombie (PID 74431) was discovered: refuse to launch if another weather
 # bot copy is alive. Closes the race-condition loop at the source.
-_SELF_SIGNATURE = r"python.*run\.py($| )"
+# 2026-07-23: signature is now anchored to THIS repo's directory — the
+# crypto5050 split put a second, unrelated `run.py` service on the same
+# box, and the old bare `python.*run\.py` pattern matched it, crash-looping
+# the weather bot on a false duplicate (found live during the fee deploy).
+_REPO_DIR = os.path.basename(os.path.dirname(os.path.abspath(__file__)))
+_SELF_SIGNATURE = rf"python.*{_REPO_DIR}/run\.py($| )|python run\.py"
 
 
 def _refuse_if_another_bot_alive() -> None:
-    """Exit if another weather bot is already running.
+    """Exit if another WEATHER bot copy is already running.
 
-    Matches `python run.py` (the run_backend.sh invocation). Returns silently
-    when this process is the only match. Skipped if pgrep is unavailable.
+    Matches `run.py` invocations only when the command line ties them to
+    this repo (absolute path) or is a bare `python run.py` launched from an
+    unknown cwd — in the bare case the working directory is checked too.
+    Other projects' run.py services (e.g. trooth-crypto5050) never match.
+    Skipped if pgrep is unavailable.
     """
     try:
         result = subprocess.run(
-            ["pgrep", "-f", _SELF_SIGNATURE],
+            ["pgrep", "-af", r"python.*run\.py($| )"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -30,7 +38,28 @@ def _refuse_if_another_bot_alive() -> None:
         return
 
     own = str(os.getpid())
-    others = [p for p in result.stdout.split() if p.strip() and p.strip() != own]
+    repo = os.path.dirname(os.path.abspath(__file__))
+    others = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if not parts or parts[0] == own:
+            continue
+        pid, cmd = parts[0], (parts[1] if len(parts) > 1 else "")
+        if "run.py" not in cmd:
+            continue
+        # absolute-path invocations: only OUR repo's run.py counts
+        if "/run.py" in cmd or "/.venv/" in cmd:
+            if repo not in cmd:
+                continue
+        else:
+            # bare `python run.py`: check the process cwd where possible
+            try:
+                cwd = os.readlink(f"/proc/{pid}/cwd")
+                if cwd != repo:
+                    continue
+            except OSError:
+                pass  # no /proc (macOS) → conservative: treat as a match
+        others.append(pid)
     if not others:
         return
 
