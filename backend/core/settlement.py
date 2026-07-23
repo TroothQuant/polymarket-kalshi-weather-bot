@@ -189,6 +189,17 @@ def calculate_pnl(trade: Trade, settlement_value: float) -> float:
         my_side_value = 1.0 - settlement_value
 
     pnl = shares * (my_side_value - trade.entry_price)
+
+    # Taker entry fee (2026-07-23, measured live): 5% x p x (1-p) x shares,
+    # charged by Polymarket at entry but invisible to the fill response —
+    # only the activity ledger / wallet balance show it. All weather entries
+    # are FAK takers. Subtracted here so booked P&L matches the wallet.
+    # POLYMARKET ONLY — Kalshi has its own separate fee schedule.
+    if getattr(trade, "platform", "polymarket") in (None, "polymarket"):
+        from backend.config import settings
+        fee = settings.WEATHER_TAKER_FEE_RATE * trade.entry_price \
+            * (1.0 - trade.entry_price) * shares
+        pnl -= fee
     return round(pnl, 2)
 
 

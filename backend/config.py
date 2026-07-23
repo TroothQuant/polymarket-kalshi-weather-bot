@@ -130,6 +130,13 @@ class Settings(BaseSettings):
     # not just Kalshi. The cap is per-direction: a $0.05 NO buy and a
     # $0.05 YES buy are equally suspect.
     WEATHER_MIN_ENTRY_PRICE: float = 0.10
+    # WEATHER_TAKER_FEE_RATE (added 2026-07-23): Polymarket charges takers a
+    # REAL, API-invisible fee = rate x p x (1-p) x shares on regular markets
+    # — measured EXACT (5.00%) on every live weather fill via the activity
+    # ledger during the crypto5050 live micro-test (the POST response's
+    # makingAmount and get_trades' fee_rate_bps=0 both omit it). All weather
+    # entries are FAK takers, so calculate_pnl subtracts this on settlement.
+    WEATHER_TAKER_FEE_RATE: float = 0.05
     # WEATHER_MAX_CLIPPED_EDGE (added 2026-05-22): edge magnitude cap that
     # applies ONLY when the model probability has been clipped to the 0.05
     # floor or 0.95 ceiling in weather_signals.py (~line 152). When the
